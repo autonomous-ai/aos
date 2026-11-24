@@ -1,0 +1,919 @@
+package device
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"slices"
+	"strings"
+	"time"
+
+	"golang.org/x/crypto/bcrypt"
+
+	"go.autonomous.ai/os/system/domain"
+	"go.autonomous.ai/os/system/lib/hal"
+	"go.autonomous.ai/os/system/lib/i18n"
+	"go.autonomous.ai/os/system/lib/urlnorm"
+	"go.autonomous.ai/os/system/server/config"
+)
+
+// GetPublicConfig returns the config with secrets replaced by `Has*` presence
+// flags, so plaintext tokens never reach the browser.
+func (s *Service) GetPublicConfig() domain.ConfigPublicResponse {
+	disableThinking := false
+	if s.config.LLMDisableThinking != nil {
+		disableThinking = *s.config.LLMDisableThinking
+	}
+	deviceID := s.config.DeviceID
+	if deviceID == "" {
+		deviceID = GetDeviceMac()
+	}
+	agentName := i18n.DeviceName()
+	deviceType := s.config.DeviceTypeOrDefault()
+	return domain.ConfigPublicResponse{
+		LLMConfigMode:            s.config.LLMMode(),
+		Environment:              s.config.EnvironmentSettings(),
+		Channel:                  s.config.Channel,
+		TelegramUserID:           s.config.TelegramUserID,
+		SlackUserID:              s.config.SlackUserID,
+		DiscordGuildID:           s.config.DiscordGuildID,
+		DiscordUserID:            s.config.DiscordUserID,
+		DiscordOpenChannels:      s.config.DiscordOpenChannels,
+		DiscordGuestUserIDs:      s.config.DiscordGuestUserIDs,
+		WhatsappUserID:           s.config.WhatsappUserID,
+		BluebubblesServerURL:     s.config.BluebubblesServerURL,
+		BluebubblesUserAddress:   s.config.BluebubblesUserAddress,
+		BluebubblesCallerContext: s.config.BluebubblesCallerContext,
+		LLMModel:                 s.config.LLMModel,
+		LLMBaseURL:               s.config.LLMBaseURL,
+		LLMDisableThinking:       disableThinking,
+		STTBaseURL:               s.config.STTBaseURL,
+		TTSBaseURL:               s.config.TTSBaseURL,
+		STTLanguage:              s.config.STTLanguage,
+		STTModel:                 s.config.STTModel,
+		TTSProvider:              s.config.TTSProvider,
+		TTSVoice:                 s.config.TTSVoice,
+		TTSSpeed:                 s.config.GetTTSSpeed(),
+		WakeWord:                 s.config.WakeWordEnabled(),
+		CloudPerception:          s.config.CloudPerceptionSettings(),
+		VoiceInputMode:           s.config.GetVoiceInputMode(),
+		AgentName:                agentName,
+		WakePhrases:              effectiveWakePhrases(s.config, agentName, deviceType),
+		WakePhrasesCustom:        len(s.config.WakePhrases) > 0,
+		WakePhrasesDefault:       i18n.BuildSupportedVoiceWakeWords(agentName, deviceType),
+		WakeNameAnywhere:         i18n.WakesOnNameAnywhere(deviceType),
+		WakeChime:                s.config.WakeChimeEnabled(),
+		WakeFollowupS:            s.config.WakeFollowupS,
+		WakeLight:                s.config.WakeLight,
+		WakeLightEnabled:         s.config.WakeLightEnabled(),
+		TapChime:                 s.config.TapChimeEnabled(),
+		TapLight:                 s.config.TapLight,
+		TapLightEnabled:          s.config.TapLightEnabled(),
+		SleepMode:                s.config.SleepModeEnabled(),
+		DeviceID:                 deviceID,
+		Mac:                      GetDeviceMac(),
+		NetworkSSID:              s.config.NetworkSSID,
+		MQTTEndpoint:             s.config.MQTTEndpoint,
+		MQTTUsername:             s.config.MQTTUsername,
+		MQTTPort:                 s.config.MQTTPort,
+		FAChannel:                s.config.FAChannel,
+		FDChannel:                s.config.FDChannel,
+
+		HasTelegramBotToken:      s.config.TelegramBotToken != "",
+		HasSlackBotToken:         s.config.SlackBotToken != "",
+		HasSlackAppToken:         s.config.SlackAppToken != "",
+		HasBluebubblesPassword:   s.config.BluebubblesPassword != "",
+		HasLLMAPIKey:             s.config.LLMAPIKey != "",
+		HasDeepgramAPIKey:        s.config.DeepgramAPIKey != "",
+		HasSTTAPIKey:             s.config.STTAPIKey != "",
+		HasTTSAPIKey:             s.config.TTSAPIKey != "",
+		HasAutonomousDefaults:    s.config.AutonomousDefaults != nil,
+		AutonomousDefaultBaseURL: autonomousDefaultBaseURL(s.config),
+		AutonomousDefaultModel:   autonomousDefaultModel(s.config),
+		HasNetworkPassword:       s.config.NetworkPassword != "",
+		HasMQTTPassword:          s.config.MQTTPassword != "",
+		HasAdminPassword:         s.config.AdminPasswordHash != "",
+		Realtime:                 s.RealtimePublic(),
+	}
+}
+
+// RealtimePublic is the realtime config for read-back (web and MQTT); the key appears only as HasAPIKey.
+func (s *Service) RealtimePublic() domain.RealtimePublic {
+	return domain.RealtimePublic{
+		Enabled:   s.config.RealtimeEnabled(),
+		Provider:  s.config.RealtimeProvider(),
+		Model:     s.config.RealtimeModel(),
+		Voice:     s.config.RealtimeVoice(),
+		Reasoning: s.config.RealtimeReasoning(),
+		// Only the explicit override: re-persisting a derived URL breaks /ws/gemini.
+		BaseURL:                 s.config.RealtimeBaseURLOverride(),
+		HasAPIKey:               s.config.RealtimeHasAPIKey(),
+		WebSearch:               s.config.RealtimeWebSearch(),
+		FastVoice:               s.config.RealtimeFastVoice(),
+		FastVoicePauseS:         s.config.RealtimeFastVoicePauseS(),
+		FastVoiceSilentTimeoutS: s.config.RealtimeFastVoiceSilentTimeoutS(),
+	}
+}
+
+// VerifyAdminPassword returns nil when password matches the stored bcrypt hash.
+// Callers must not surface the specific error to clients.
+func (s *Service) VerifyAdminPassword(password string) error {
+	if s.config.AdminPasswordHash == "" {
+		return fmt.Errorf("admin password not configured")
+	}
+	return bcrypt.CompareHashAndPassword([]byte(s.config.AdminPasswordHash), []byte(password))
+}
+
+// updateChanges records which field clusters a save changed plus post-save
+// values; computed inside WithLockSave so it never sees a torn snapshot.
+type updateChanges struct {
+	llmMode  bool // explicit ownership apply, including retries of the same choice
+	model    bool // llm_model changed → sync primary into the gateway
+	thinking bool // llm_disable_thinking changed → RefreshModelsConfig
+	baseURL  bool // llm_base_url changed → RefreshModelsConfig
+	apiKey   bool // llm_api_key rotated → RefreshModelsConfig (openclaw.json holds its OWN apiKey copy)
+	wifi     bool // ssid changed → reconnect WiFi
+	lang     bool // stt_language changed → new agent session + hal restart
+	halBoot  bool // a field hal reads at boot changed → hal restart
+	tts      bool // voice/provider changed → pushed into the running hal
+	realtime bool // realtime block sent → hal restart
+	channel  bool // messaging channel/tokens changed → re-push into gateway
+	wake     bool // owner wake phrases changed → pushed into the running hal
+	sleepOff bool // sleep mode turned off → hal wakes a sleeping device
+
+	newModel    string
+	newSSID     string
+	newPassword string
+	prevLang    string
+	newLang     string
+	chanReq     domain.AddChannelRequest
+}
+
+// bootSnapshot is the comparable set of fields HAL reads only at boot; a
+// before/after difference gates the HAL restart.
+type bootSnapshot struct {
+	llmAPIKey      string
+	llmBaseURL     string
+	deepgramAPIKey string
+	sttAPIKey      string
+	sttBaseURL     string
+	sttModel       string
+}
+
+func bootFields(c *config.Config) bootSnapshot {
+	return bootSnapshot{
+		llmAPIKey:      c.LLMAPIKey,
+		llmBaseURL:     c.LLMBaseURL,
+		deepgramAPIKey: c.DeepgramAPIKey,
+		sttAPIKey:      c.STTAPIKey,
+		sttBaseURL:     c.STTBaseURL,
+		sttModel:       c.STTModel,
+	}
+}
+
+// ttsSnapshot is the TTS config HAL accepts live (POST /voice/tts/config),
+// avoiding a 10-15s deaf restart.
+type ttsSnapshot struct {
+	ttsProvider string
+	ttsSpeed    float64
+	ttsVoice    string
+	ttsAPIKey   string
+	ttsBaseURL  string
+}
+
+func ttsFields(c *config.Config) ttsSnapshot {
+	return ttsSnapshot{
+		ttsProvider: c.TTSProvider,
+		ttsVoice:    c.TTSVoice,
+		ttsSpeed:    c.GetTTSSpeed(),
+		ttsAPIKey:   c.TTSAPIKey,
+		ttsBaseURL:  c.TTSBaseURL,
+	}
+}
+
+// realtimeFingerprint renders the realtime block as JSON for before/after comparison.
+func realtimeFingerprint(c *config.Config) string {
+	if c.Realtime == nil {
+		return ""
+	}
+	b, err := json.Marshal(c.Realtime)
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+// channelSnapshot is the channel identity + tokens; a difference means the
+// change must be re-pushed into the gateway's own config.
+type channelSnapshot struct {
+	channel                  string
+	telegramBotToken         string
+	telegramUserID           string
+	slackBotToken            string
+	slackAppToken            string
+	slackUserID              string
+	discordGuildID           string
+	discordUserID            string
+	bluebubblesServerURL     string
+	bluebubblesPassword      string
+	bluebubblesUserAddress   string
+	bluebubblesCallerContext string
+}
+
+func channelFields(c *config.Config) channelSnapshot {
+	return channelSnapshot{
+		channel:                  c.Channel,
+		telegramBotToken:         c.TelegramBotToken,
+		telegramUserID:           c.TelegramUserID,
+		slackBotToken:            c.SlackBotToken,
+		slackAppToken:            c.SlackAppToken,
+		slackUserID:              c.SlackUserID,
+		discordGuildID:           c.DiscordGuildID,
+		discordUserID:            c.DiscordUserID,
+		bluebubblesServerURL:     c.BluebubblesServerURL,
+		bluebubblesPassword:      c.BluebubblesPassword,
+		bluebubblesUserAddress:   c.BluebubblesUserAddress,
+		bluebubblesCallerContext: c.BluebubblesCallerContext,
+	}
+}
+
+// applyUpdate mutates c per the PATCH request and reports what changed (no I/O).
+// Must run inside WithLockSave; adminHash is precomputed outside the lock.
+func applyUpdate(c *config.Config, data domain.UpdateConfigRequest, adminHash string) updateChanges {
+	var ch updateChanges
+	prevBoot := bootFields(c)
+	prevTTS := ttsFields(c)
+	prevWakeWord := c.WakeWordEnabled()
+	prevChannel := channelFields(c)
+	ch.prevLang = c.STTLanguage
+
+	// Must run before any field is overwritten.
+	if data.LLMConfigMode != nil || requestChangesCredentials(data) {
+		captureAutonomousDefaults(c)
+	}
+	applyLLMFields(c, data, &ch)
+	applyVoicePipelineFields(c, data, &ch)
+
+	if data.SleepMode != nil {
+		ch.sleepOff = !*data.SleepMode
+		on := *data.SleepMode
+		c.SleepMode = &on
+	}
+	if data.DeviceID != "" {
+		c.DeviceID = data.DeviceID
+	}
+	applyNetworkFields(c, data, &ch)
+	applyChannelPatch(c, data)
+	applyMQTTFields(c, data)
+	if data.Environment != nil {
+		settings := data.Environment.Clone()
+		c.Environment = &settings
+	}
+
+	if adminHash != "" {
+		c.AdminPasswordHash = adminHash
+	}
+
+	ch.halBoot = bootFields(c) != prevBoot || c.WakeWordEnabled() != prevWakeWord
+	ch.tts = ttsFields(c) != prevTTS
+	ch.channel = channelFields(c) != prevChannel
+	// Use full post-save values, not just the delta.
+	ch.chanReq = domain.AddChannelRequest{
+		Channel:          c.Channel,
+		TelegramBotToken: c.TelegramBotToken, TelegramUserID: c.TelegramUserID,
+		SlackBotToken: c.SlackBotToken, SlackAppToken: c.SlackAppToken, SlackUserID: c.SlackUserID,
+		DiscordManaged: c.DiscordManaged, DiscordGuildID: c.DiscordGuildID, DiscordUserID: c.DiscordUserID,
+		BluebubblesServerURL:     c.BluebubblesServerURL,
+		BluebubblesPassword:      c.BluebubblesPassword,
+		BluebubblesUserAddress:   c.BluebubblesUserAddress,
+		BluebubblesCallerContext: c.BluebubblesCallerContext,
+	}
+	return ch
+}
+
+// requestChangesCredentials reports whether the save carries a credential key,
+// URL or model.
+func requestChangesCredentials(d domain.UpdateConfigRequest) bool {
+	if d.LLMAPIKey != "" || d.LLMBaseURL != "" || d.LLMModel != "" ||
+		d.TTSAPIKey != "" || d.TTSBaseURL != "" ||
+		d.STTAPIKey != "" || d.STTBaseURL != "" {
+		return true
+	}
+	return d.Realtime != nil && (d.Realtime.APIKey != "" || d.Realtime.BaseURL != "")
+}
+
+// captureAutonomousDefaults snapshots the shipped credentials before the first
+// edit. Runs at most once (re-capturing would lose the real defaults) and skips
+// an empty set.
+func captureAutonomousDefaults(c *config.Config) {
+	if c.AutonomousDefaults != nil || c.LLMAPIKey == "" || c.LLMBaseURL == "" {
+		return
+	}
+	c.AutonomousDefaults = &config.AutonomousDefaults{
+		BaseURL: c.LLMBaseURL,
+		APIKey:  c.LLMAPIKey,
+		Model:   c.LLMModel,
+	}
+	slog.Info("captured autonomous defaults before first credential change",
+		"component", "device", "base_url", c.LLMBaseURL, "model", c.LLMModel)
+}
+
+func applyLLMFields(c *config.Config, data domain.UpdateConfigRequest, ch *updateChanges) {
+	if data.LLMConfigMode != nil {
+		c.LLMConfigMode = *data.LLMConfigMode
+		ch.llmMode = true
+	}
+	// Preserve the OS credentials used by voice/backend services and by a later
+	// switch back to OS management. Stale Settings payloads must not replace them.
+	if c.LLMConfigMode == "runtime" {
+		return
+	}
+
+	prevModel := c.LLMModel
+	prevBaseURL := c.LLMBaseURL
+	prevAPIKey := c.LLMAPIKey
+	if data.LLMAPIKey != "" {
+		c.LLMAPIKey = data.LLMAPIKey
+	}
+	if data.LLMBaseURL != "" {
+		c.LLMBaseURL = urlnorm.NormalizeBaseURL(data.LLMBaseURL)
+	}
+	if data.LLMModel != "" {
+		c.LLMModel = data.LLMModel
+	}
+	ch.model = data.LLMModel != "" && data.LLMModel != prevModel
+	ch.baseURL = data.LLMBaseURL != "" && c.LLMBaseURL != prevBaseURL
+	// Rotation only when a non-empty key differs from disk (PATCH semantics).
+	ch.apiKey = data.LLMAPIKey != "" && c.LLMAPIKey != prevAPIKey
+	ch.newModel = c.LLMModel
+
+	ch.thinking = data.LLMDisableThinking != nil && *data.LLMDisableThinking != c.LLMThinkingDisabled()
+	if data.LLMDisableThinking != nil {
+		c.LLMDisableThinking = data.LLMDisableThinking
+	}
+}
+
+// applyVoicePipelineFields applies the STT/TTS/realtime cluster (empty = keep).
+func applyVoicePipelineFields(c *config.Config, data domain.UpdateConfigRequest, ch *updateChanges) {
+	if data.VoiceInputMode != nil {
+		c.VoiceInputMode = *data.VoiceInputMode
+	}
+	if data.WakeWord != nil {
+		c.WakeWord = data.WakeWord
+	}
+	if data.WakeChime != nil {
+		on := *data.WakeChime
+		c.WakeChime = &on
+	}
+	if data.WakeFollowupS != nil {
+		seconds := *data.WakeFollowupS
+		c.WakeFollowupS = &seconds
+	}
+	if data.WakeLight != nil {
+		light := *data.WakeLight
+		light.Color = slices.Clone(light.Color)
+		c.WakeLight = &light
+	}
+	if data.TapChime != nil {
+		on := *data.TapChime
+		c.TapChime = &on
+	}
+	if data.TapLight != nil {
+		light := *data.TapLight
+		light.Color = slices.Clone(light.Color)
+		c.TapLight = &light
+	}
+	if data.WakePhrases != nil {
+		next := append([]string(nil), (*data.WakePhrases)...)
+		if len(next) == 0 {
+			next = nil
+		}
+		ch.wake = !slices.Equal(c.WakePhrases, next)
+		c.WakePhrases = next
+	}
+	// Clear before set so a new key wins when both are sent.
+	if data.ClearDeepgramAPIKey {
+		c.DeepgramAPIKey = ""
+	}
+	if data.DeepgramAPIKey != "" {
+		c.DeepgramAPIKey = data.DeepgramAPIKey
+	}
+	if data.STTAPIKey != "" {
+		c.STTAPIKey = data.STTAPIKey
+	}
+	// Clear before set so a new key wins when both are sent.
+	if data.ClearTTSAPIKey {
+		c.TTSAPIKey = ""
+	}
+	if data.TTSAPIKey != "" {
+		c.TTSAPIKey = data.TTSAPIKey
+	}
+	if data.STTBaseURL != "" {
+		c.STTBaseURL = urlnorm.NormalizeBaseURL(data.STTBaseURL)
+	}
+	if data.TTSBaseURL != "" {
+		c.TTSBaseURL = urlnorm.NormalizeBaseURL(data.TTSBaseURL)
+	}
+	if data.STTLanguage != "" {
+		c.STTLanguage = data.STTLanguage
+		c.STTModel = sttModelForLanguage(data.STTLanguage)
+	}
+	ch.newLang = c.STTLanguage
+	ch.lang = ch.prevLang != ch.newLang
+
+	if data.TTSProvider != "" {
+		c.TTSProvider = data.TTSProvider
+	}
+	if data.TTSVoice != "" {
+		c.TTSVoice = data.TTSVoice
+	}
+	if data.TTSSpeed != nil {
+		speed := *data.TTSSpeed
+		c.TTSSpeed = &speed
+	}
+	if data.Realtime != nil {
+		before := realtimeFingerprint(c)
+		applyRealtimeSet(c, *data.Realtime)
+		// The block is sent on every save; only a real change restarts HAL.
+		ch.realtime = realtimeFingerprint(c) != before
+	}
+}
+
+func applyNetworkFields(c *config.Config, data domain.UpdateConfigRequest, ch *updateChanges) {
+	ch.wifi = data.SSID != "" && data.SSID != c.NetworkSSID
+	if data.SSID != "" {
+		c.NetworkSSID = data.SSID
+	}
+	if data.Password != "" {
+		c.NetworkPassword = data.Password
+	}
+	// Captured for the WiFi goroutine, which runs after lock release.
+	ch.newSSID = c.NetworkSSID
+	ch.newPassword = c.NetworkPassword
+}
+
+func applyChannelPatch(c *config.Config, data domain.UpdateConfigRequest) {
+	if data.Channel != "" {
+		c.Channel = data.Channel
+	}
+	switch c.Channel {
+	case domain.ChannelSlack:
+		if data.SlackBotToken != "" {
+			c.SlackBotToken = data.SlackBotToken
+		}
+		if data.SlackAppToken != "" {
+			c.SlackAppToken = data.SlackAppToken
+		}
+		if data.SlackUserID != "" {
+			c.SlackUserID = data.SlackUserID
+		}
+	case domain.ChannelDiscord:
+		// Discord runs through the cloud relay; the device keeps no bot token.
+		c.DiscordManaged = true
+		if data.DiscordGuildID != "" {
+			c.DiscordGuildID = data.DiscordGuildID
+		}
+		if data.DiscordUserID != "" {
+			c.DiscordUserID = data.DiscordUserID
+		}
+		if data.DiscordOpenChannels != nil {
+			c.DiscordOpenChannels = data.DiscordOpenChannels
+		}
+		if data.DiscordGuestUserIDs != nil {
+			c.DiscordGuestUserIDs = data.DiscordGuestUserIDs
+		}
+	case domain.ChannelWhatsapp:
+		if data.WhatsappUserID != "" {
+			c.WhatsappUserID = data.WhatsappUserID
+		}
+	case domain.ChannelIMessage:
+		// Omitted plain fields preserve the saved channel; explicit empty
+		// strings clear individual fields without erasing unrelated settings.
+		if data.BluebubblesServerURL != nil {
+			c.BluebubblesServerURL = *data.BluebubblesServerURL
+		}
+		if data.BluebubblesUserAddress != nil {
+			c.BluebubblesUserAddress = *data.BluebubblesUserAddress
+		}
+		if data.BluebubblesPassword != "" {
+			c.BluebubblesPassword = data.BluebubblesPassword
+		}
+		if data.BluebubblesCallerContext != nil {
+			c.BluebubblesCallerContext = *data.BluebubblesCallerContext
+		}
+	default:
+		if data.TelegramBotToken != "" {
+			c.TelegramBotToken = data.TelegramBotToken
+		}
+		if data.TelegramUserID != "" {
+			c.TelegramUserID = data.TelegramUserID
+		}
+	}
+}
+
+func applyMQTTFields(c *config.Config, data domain.UpdateConfigRequest) {
+	if data.MQTTEndpoint != "" {
+		c.MQTTEndpoint = data.MQTTEndpoint
+	}
+	if data.MQTTUsername != "" {
+		c.MQTTUsername = data.MQTTUsername
+	}
+	if data.MQTTPassword != "" {
+		c.MQTTPassword = data.MQTTPassword
+	}
+	if data.MQTTPort != 0 {
+		c.MQTTPort = data.MQTTPort
+	}
+	if data.FAChannel != "" {
+		c.FAChannel = data.FAChannel
+	}
+	if data.FDChannel != "" {
+		c.FDChannel = data.FDChannel
+	}
+}
+
+// UpdateConfig saves non-empty fields (PATCH) and fires per-cluster side effects
+// (wifi, gateway, channel, HAL).
+func (s *Service) UpdateConfig(data domain.UpdateConfigRequest) error {
+	if data.LLMConfigMode != nil && *data.LLMConfigMode != "os" && *data.LLMConfigMode != "runtime" {
+		return fmt.Errorf("invalid llm_config_mode %q (want os or runtime)", *data.LLMConfigMode)
+	}
+	// Only LLM writes contend with runtime switching. Voice-only requests use
+	// wakeApply below, which queues opposing HTTP/MQTT updates rather than rejecting them.
+	if data.LLMConfigMode != nil || data.LLMAPIKey != "" || data.LLMBaseURL != "" || data.LLMModel != "" || data.LLMDisableThinking != nil {
+		if !s.runtimeSwitchMu.TryLock() {
+			return ErrAgentRuntimeSwitchInProgress
+		}
+		defer s.runtimeSwitchMu.Unlock()
+	}
+
+	if data.VoiceInputMode != nil {
+		if err := config.ValidateVoiceInputMode(*data.VoiceInputMode); err != nil {
+			return err
+		}
+	}
+	if data.Environment != nil {
+		if err := data.Environment.Validate(); err != nil {
+			return err
+		}
+	}
+	if err := domain.ValidateTTSSpeed(data.TTSSpeed); err != nil {
+		return err
+	}
+	if data.WakeFollowupS != nil {
+		if err := config.ValidateWakeFollowup(*data.WakeFollowupS); err != nil {
+			return err
+		}
+	}
+	if data.WakeLight != nil {
+		if err := data.WakeLight.Validate(); err != nil {
+			return err
+		}
+	}
+	if data.TapLight != nil {
+		if err := data.TapLight.Validate(); err != nil {
+			return err
+		}
+	}
+	if data.WakePhrases != nil {
+		phrases, err := config.NormalizeWakePhrases(*data.WakePhrases)
+		if err != nil {
+			return err
+		}
+		data.WakePhrases = &phrases
+	}
+	// bcrypt is CPU-intensive; compute before acquiring the config lock.
+	var adminHash string
+	if data.AdminPassword != "" {
+		hash, err := bcrypt.GenerateFromPassword([]byte(data.AdminPassword), bcrypt.DefaultCost)
+		if err != nil {
+			return fmt.Errorf("hash admin password: %w", err)
+		}
+		adminHash = string(hash)
+	}
+
+	// Validate before the lock so an invalid request never partially saves.
+	if data.Realtime != nil {
+		if err := s.validateRealtimeSet(*data.Realtime); err != nil {
+			return err
+		}
+	}
+
+	// Camera cloud opt-ins have their own serialized save-and-confirm path, shared with MQTT.
+	if data.CloudPerception != nil {
+		if _, err := s.UpdateCloudPerception(*data.CloudPerception, false); err != nil {
+			return err
+		}
+	}
+
+	// Serialize with MQTT wake and input-mode updates through persistence and HAL apply.
+	s.wakeApply.mu.Lock()
+	if !keepsWakeCue(s.config, data) {
+		s.wakeApply.mu.Unlock()
+		return config.ErrNoWakeCue
+	}
+	if !keepsTapCue(s.config, data) {
+		s.wakeApply.mu.Unlock()
+		return config.ErrNoTapCue
+	}
+
+	// Mutate inside WithLockSave so the model watcher cannot interleave.
+	var ch updateChanges
+	if err := s.config.WithLockSave(func(c *config.Config) {
+		previousWake := c.WakeWordEnabled()
+		previousMode := c.GetVoiceInputMode()
+		ch = applyUpdate(c, data, adminHash)
+		s.wakeApply.pending = s.wakeApply.pending || c.WakeWordEnabled() != previousWake
+		s.wakeApply.modePending = s.wakeApply.modePending || c.GetVoiceInputMode() != previousMode
+		// A mixed update must apply the entire saved boot configuration once.
+		if s.wakeApply.modePending && (ch.halBoot || ch.lang || ch.realtime) {
+			s.wakeApply.pending = true
+		}
+	}); err != nil {
+		s.wakeApply.mu.Unlock()
+		return fmt.Errorf("save config: %w", err)
+	}
+	slog.Info("config updated", "component", "device")
+	wakeApply := s.wakeApply.pending
+	var wakeErr error
+	if wakeApply || s.wakeApply.modePending {
+		wakeErr = s.applyPendingWakeWord()
+	}
+	s.wakeApply.mu.Unlock()
+	// A wake/input-mode restart covers the whole saved HAL config. Do not enqueue a second
+	// restart/live TTS update, including after failure: the wake retry owns it.
+	// Other saved fields still need their side effects even if HAL apply failed.
+	var modeErr error
+	if ch.llmMode {
+		modeErr = s.applyLLMMode()
+	}
+	s.fireConfigSideEffects(ch, wakeApply)
+	return errors.Join(wakeErr, modeErr)
+}
+
+// fireConfigSideEffects runs per-cluster follow-ups after a save. config.mu must
+// already be released (gateway calls take their own locks).
+func (s *Service) fireConfigSideEffects(ch updateChanges, halHandled bool) {
+	// The gateway keeps tokens in its own config, so re-run AddChannel.
+	// WhatsApp is excluded: it needs interactive QR pairing.
+	if ch.channel && ch.chanReq.Channel != domain.ChannelWhatsapp {
+		go func() {
+			if _, err := s.AddChannel(context.Background(), ch.chanReq); err != nil {
+				slog.Error("apply channel change to gateway failed", "component", "device", "channel", ch.chanReq.Channel, "error", err)
+			} else {
+				slog.Info("channel change applied to gateway", "component", "device", "channel", ch.chanReq.Channel)
+			}
+		}()
+	}
+	s.syncLLMToGateway(ch)
+	// New session so history does not keep the previous language.
+	if ch.lang && s.agentGateway != nil {
+		if key := s.agentGateway.GetSessionKey(); key != "" {
+			go func() {
+				if err := s.agentGateway.NewSession(key); err != nil {
+					slog.Warn("openclaw NewSession on stt_language change failed", "component", "device", "error", err)
+				} else {
+					slog.Info("openclaw session reset for stt_language change", "component", "device", "from", ch.prevLang, "to", ch.newLang)
+				}
+			}()
+		}
+	}
+	if ch.wake {
+		applyWakePhrases(s.config.WakePhrases)
+	}
+	if ch.sleepOff {
+		go func() {
+			if err := hal.SyncSleepMode(); err != nil {
+				slog.Warn("sleep mode sync to hal failed", "component", "device", "error", err)
+			}
+		}()
+	}
+	// Restart HAL only when a boot-read field changed; TTS is pushed live.
+	switch {
+	case halHandled:
+		// The wake path already attempted this saved HAL configuration.
+	case ch.halBoot || ch.lang || ch.realtime:
+		s.restartHAL("voice config change")
+	case ch.tts:
+		s.applyTTSConfig(s.config)
+	}
+	// Schedule only after synchronous side effects finish, so their latency
+	// cannot consume the response grace period before the HTTP handler returns.
+	if ch.wifi {
+		scheduleConfigWiFiReconnect(ch, s.networkService.SetupNetwork)
+	}
+}
+
+// Give the Settings response time to reach clients before AP/STA teardown.
+// A successful save acknowledges persistence; association still happens later.
+const configWiFiResponseGrace = 2 * time.Second
+
+func scheduleConfigWiFiReconnect(ch updateChanges, reconnect func(string, string) (bool, error)) *time.Timer {
+	if !ch.wifi {
+		return nil
+	}
+	return time.AfterFunc(configWiFiResponseGrace, func() {
+		slog.Info("reconnecting to new WiFi", "component", "device", "ssid", ch.newSSID)
+		if _, err := reconnect(ch.newSSID, ch.newPassword); err != nil {
+			slog.Error("WiFi reconnect failed", "component", "device", "error", err)
+		}
+	})
+}
+
+// syncLLMToGateway pushes model/thinking/baseURL changes into the gateway's
+// config; RefreshModelsConfig covers the model too, avoiding a second restart.
+func (s *Service) syncLLMToGateway(ch updateChanges) {
+	if ch.llmMode || s.config.LLMRuntimeManaged() || s.agentGateway == nil {
+		return
+	}
+	if ch.model && !ch.thinking && !ch.baseURL && !ch.apiKey {
+		if err := s.agentGateway.UpdatePrimaryModel(ch.newModel); err != nil {
+			if errors.Is(err, domain.ErrNotSupportedByRuntime) {
+				// Not patchable in place: the onboarding presync re-reads config.json.
+				slog.Info("primary model not device-patchable, running onboarding self-heal", "component", "device", "backend", s.agentGateway.Name())
+				go func() {
+					if err := s.agentGateway.EnsureOnboarding(); err != nil {
+						slog.Warn("onboarding self-heal after model change failed", "component", "device", "error", err)
+					}
+				}()
+			} else {
+				slog.Warn("update primary model failed", "component", "device", "error", err)
+			}
+		}
+	}
+	if ch.thinking || ch.baseURL || ch.apiKey {
+		if err := s.agentGateway.RefreshModelsConfig(); err != nil {
+			if errors.Is(err, domain.ErrNotSupportedByRuntime) {
+				// Not patchable in place: the onboarding presync re-reads config.json.
+				slog.Info("models config not device-patchable, running onboarding self-heal", "component", "device", "backend", s.agentGateway.Name())
+				go func() {
+					if err := s.agentGateway.EnsureOnboarding(); err != nil {
+						slog.Warn("onboarding self-heal after llm config change failed", "component", "device", "error", err)
+					}
+				}()
+			} else {
+				slog.Error("refresh models config failed", "component", "device", "error", err)
+			}
+		}
+	}
+}
+
+// applyLLMMode reapplies even unchanged OS values and refreshes process env.
+// Persistence happens first; an apply failure is returned so the same selection
+// can be retried without claiming that the runtime switched successfully.
+func (s *Service) applyLLMMode() error {
+	if s.agentGateway == nil {
+		return nil
+	}
+	if !s.config.LLMRuntimeManaged() {
+		err := s.agentGateway.RefreshModelsConfig()
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, domain.ErrNotSupportedByRuntime) {
+			return fmt.Errorf("LLM mode saved; apply runtime config: %w", err)
+		}
+	}
+	if err := s.agentGateway.EnsureOnboarding(); err != nil {
+		return fmt.Errorf("LLM mode saved; apply runtime config: %w", err)
+	}
+	if err := s.agentGateway.RestartAgent(); err != nil {
+		return fmt.Errorf("LLM mode saved; restart runtime: %w", err)
+	}
+	return nil
+}
+
+// UpdateVoiceConfig updates only TTS provider/voice/speed and STT language.
+func (s *Service) UpdateVoiceConfig(provider, voice, language string, speed *float64) error {
+	if err := domain.ValidateTTSSpeed(speed); err != nil {
+		return err
+	}
+	prevLang := s.config.STTLanguage
+	prevModel := s.config.STTModel
+	if provider != "" {
+		s.config.TTSProvider = provider
+	}
+	if voice != "" {
+		s.config.TTSVoice = voice
+	}
+	if language != "" {
+		s.config.STTLanguage = language
+		s.config.STTModel = sttModelForLanguage(language)
+	}
+	if speed != nil {
+		value := *speed
+		s.config.TTSSpeed = &value
+	}
+	if err := s.config.Save(); err != nil {
+		return fmt.Errorf("save config: %w", err)
+	}
+	slog.Info("voice config updated", "component", "device", "provider", s.config.TTSProvider, "voice", s.config.TTSVoice, "language", s.config.STTLanguage)
+	if language != "" && prevLang != s.config.STTLanguage && s.agentGateway != nil {
+		if key := s.agentGateway.GetSessionKey(); key != "" {
+			go func() {
+				if err := s.agentGateway.NewSession(key); err != nil {
+					slog.Warn("NewSession on language change failed", "component", "device", "error", err)
+				}
+			}()
+		}
+	}
+	if language != "" && (prevLang != s.config.STTLanguage || prevModel != s.config.STTModel) {
+		// stt_language is read at boot; nothing can be pushed for it.
+		s.restartHAL("stt language/model change")
+	} else {
+		s.applyTTSConfig(s.config)
+	}
+	return nil
+}
+
+// sttModelForLanguage uses Nova-3 for every selected language, including English.
+// Empty input lets HAL use its default.
+func sttModelForLanguage(lang string) string {
+	if lang == "" {
+		return ""
+	}
+	return "nova-3-general"
+}
+
+// RestoreAutonomousDefaults restores one section to the shipped credentials via
+// a normal config update, so it inherits every side effect.
+func (s *Service) RestoreAutonomousDefaults(section string) error {
+	d := s.config.AutonomousDefaults
+	if d == nil {
+		return errors.New("no autonomous defaults stored on this device")
+	}
+
+	var req domain.UpdateConfigRequest
+	switch strings.ToLower(strings.TrimSpace(section)) {
+	case "llm":
+		mode := "os"
+		req.LLMConfigMode = &mode
+		req.LLMAPIKey, req.LLMBaseURL, req.LLMModel = d.APIKey, d.BaseURL, d.Model
+	case "voice":
+		req.TTSAPIKey, req.TTSBaseURL = d.APIKey, d.BaseURL
+		req.STTAPIKey, req.STTBaseURL = d.APIKey, d.BaseURL
+	case "realtime":
+		req.Realtime = &domain.RealtimeSetData{APIKey: d.APIKey, BaseURL: d.BaseURL}
+	default:
+		return fmt.Errorf("unknown section %q (want llm, voice or realtime)", section)
+	}
+
+	slog.Info("restoring autonomous defaults", "component", "device", "section", section)
+	return s.UpdateConfig(req)
+}
+
+func autonomousDefaultBaseURL(c *config.Config) string {
+	if c.AutonomousDefaults == nil {
+		return ""
+	}
+	return c.AutonomousDefaults.BaseURL
+}
+
+func autonomousDefaultModel(c *config.Config) string {
+	if c.AutonomousDefaults == nil {
+		return ""
+	}
+	return c.AutonomousDefaults.Model
+}
+
+// effectiveWakePhrases is what HAL's wake gate accepts: the owner's list when set,
+// otherwise the built-in prefixes × autonomous / device type / agent name.
+func effectiveWakePhrases(c *config.Config, agentName, deviceType string) []string {
+	if len(c.WakePhrases) > 0 {
+		return append([]string(nil), c.WakePhrases...)
+	}
+	return i18n.BuildSupportedVoiceWakeWords(agentName, deviceType)
+}
+
+// applyWakePhrases makes an owner edit live: local intents strip the new phrases, and
+// HAL re-reads config.json wake_phrases when its wake list is pushed (no restart).
+func applyWakePhrases(phrases []string) {
+	i18n.SetOwnerWakePhrases(phrases)
+	hal.SetVoiceConfig(i18n.BuildVoiceWakeWords(i18n.DeviceName()))
+}
+
+// keepsWakeCue is false when the update would leave a wake with neither chime nor light.
+func keepsWakeCue(c *config.Config, data domain.UpdateConfigRequest) bool {
+	chime, light := c.WakeChimeEnabled(), c.WakeLightEnabled()
+	if data.WakeChime != nil {
+		chime = *data.WakeChime
+	}
+	if data.WakeLight != nil {
+		light = data.WakeLight.Enabled == nil || *data.WakeLight.Enabled
+	}
+	return chime || light
+}
+
+// keepsTapCue is false when the update would leave tap-to-talk with neither chime nor light.
+func keepsTapCue(c *config.Config, data domain.UpdateConfigRequest) bool {
+	chime, light := c.TapChimeEnabled(), c.TapLightEnabled()
+	if data.TapChime != nil {
+		chime = *data.TapChime
+	}
+	if data.TapLight != nil {
+		light = data.TapLight.Enabled == nil || *data.TapLight.Enabled
+	}
+	return chime || light
+}

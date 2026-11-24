@@ -1,0 +1,75 @@
+.DS_Store
+.env
+.env.local
+.env.*.local
+**/.env
+!**/.env.example
+!robots/**/rootfs/**/.env
+.idea/
+.vscode/
+.cursor/
+.claude/
+
+# Local brainstorming/spec docs (superpowers) — not part of the repo
+docs/superpowers/
+
+*.log
+integrations/perception-service/local
+*.pt
+*.pth
+
+# Runtime config (contains device-specific values and secrets)
+config/config.json
+system/config/config.json
+
+# Voice biometric data — never commit (PII)
+**/mock_data/audio/speaker_db*.json
+**/audio_recognition/speaker_db/*.json
+
+# Go build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+*.prof
+*.coverprofile
+*.pprof
+
+# Lamp (Go)
+system/os-server
+system/os-server.~
+system/bootstrap-server
+system/bootstrap-server.~
+/vendor/
+system/web/node_modules/
+system/web/dist/
+*.zip
+
+# Claude Desktop Buddy (Go) — binary outputs
+integrations/companions/claude-desktop-buddy/buddy-plugin
+integrations/companions/claude-desktop-buddy/claude-desktop-buddy
+
+# LeLamp (Python)
+.venv
+__pycache__
+*.egg-info
+
+scripts/imager/output/*.img
+scripts/release/.skill-hashes
+
+
+integrations/perception-service/src/core/ser/models/emotion2vec_plus_large/emotion2vec.onnx
+integrations/perception-service/tests/mock_data/audio/speakers/
+
+# Hardware CAD binaries are stored via Git LFS — see .gitattributes
+
+# Locally built HAL wheels (scripts/release/build-aec-wheel.sh, build-webrtcvad-wheel.sh)
+dist/aec/
+dist/webrtcvad/
+
+# Language-ID model cache (downloaded release asset)
+.models-hal/
+hal/drivers/voice/resources/ambernet.onnx

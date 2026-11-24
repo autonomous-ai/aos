@@ -1,0 +1,664 @@
+# Safety Engine
+
+The safety engine enforces a device's `SAFETY.md` bounds **deterministically in the
+runtime**, below the agent. It is the mechanism behind the first principle in
+`robots/contract/SAFETY-SPEC.md`: *safety is below the brain.* The agent requests actions;
+the engine decides — on every request, regardless of who issued it — whether the
+hardware is allowed to honour them and within what limits.
+
+> **Status:** Slice 1 (brightness ceiling) is **implemented and enforced** —
+> `hal/safety/policy.py` + the LED gate in `rgb_service.py`, loaded from
+> `robots/lamp/SAFETY.md`. Later slices reuse the same loader + gate. Each table
+> row below is marked enforced / reserved. This document tracks the code, not the
+> other way around.
+
+## Why an engine, not prompting
+
+Routing safety through the language model is unreliable — it can be argued out of a
+refusal, it can hallucinate a limit, and it cannot guarantee an action *did not*
+happen. Guard mode in this codebase was already rebuilt to deliver alerts
+deterministically for exactly this reason. The safety engine generalises that: the
+runtime, not the gateway, is the single point that clamps, blocks, or stops.
+
+## Architecture
+
+Three layers, mirroring the device layer (`ROBOT.md` → capability → route → driver):
+
+```
+SAFETY.md front matter        the declared bounds (machine contract; per capability group)
+        │  resolved via ROBOT.md safety_ref (path or http), parsed at boot
+        ▼
+hal/safety/policy.py        pure SafetyPolicy + gate functions (no IO, unit-testable)
+        │  clamp_brightness(requested) -> min(requested, ceiling)   [slice 1]
+        ▼
+HAL capability routes          call the gate BEFORE actuating (led, later servo/music)
+        │  deterministic, in-process, cannot be bypassed by the agent
+        ▼
+hardware
+```
+
+- **`SAFETY.md` front matter** — the bounds, keyed by capability group. Schema and
+  field table: `robots/contract/SAFETY-SPEC.md`.
+- **`hal/safety/policy.py`** — a pure loader (regex front-matter parse,
+  dependency-free, same discipline as `hal/board/device.py`) producing a typed
+  `SafetyPolicy`, plus pure gate functions. No hardware, no clock side effects, fully
+  unit-testable off-hardware.
+- **The routes** — each capability route consults the gate at the point of actuation.
+  The LED route clamps brightness; later the servo route clamps speed/accel and
+  guarantees `stop`. Because the gate is a plain function call in the request path,
+  there is no path around it.
+
+The policy is loaded once at boot (alongside the `DeviceProfile`) and exposed via the
+device endpoint so the declared bounds are observable: `GET /device` already returns
+`safety_ref`; the resolved bounds surface there too.
+
+## Fail-safe semantics
+
+Per-capability criticality (full rule in `robots/contract/SAFETY-SPEC.md`):
+
+| Capability | Bound absent / unloadable | Rationale |
+|------------|---------------------------|-----------|
+| light, audio, motion | pass-through (log only) | enforcement is presence-driven and uniform: a declared bound is enforced, an absent one is not — the engine never invents a limit nobody wrote |
+
+`SAFETY.md` is optional. The schema tag is validated like `ROBOT.md`'s — a missing or
+unknown-major `schema` aborts boot rather than enforce an ABI it cannot read.
+
+There is no separate kill switch: because enforcement is presence-driven, removing a
+section (or the whole front matter) turns that enforcement off. To run a device with
+unrestricted motion during bring-up, ship no `motion:` bounds; that is the off state.
+A *malformed* bound (present but out of range) still fails loud — only *absence* is
+pass-through.
+
+## Slice roadmap
+
+| Slice | Scope | Gate | Enforced where | Status |
+|-------|-------|------|----------------|--------|
+| 1 | `light.max_brightness` ceiling | `clamp_brightness` / `clamp_color` | LED gate (`rgb_service` `_handle_solid`/`_handle_paint`) | **enforced (v1)** |
+| 2 | `quiet_hours` (light + audio) | `active_max_brightness` (time-aware) + `audio_quiet_now` | LED gate + music route | **enforced (v1)** |
+| 3 | `motion.max_speed` (presence-driven) | `min_move_duration` | servo route | **enforced (v1)** (`max_accel` reserved) |
+| 3b | `motion.stop_always` | — | — | **declared / structurally guaranteed** — no route-level gate consumes this field (see below) |
+| 4 | fail-safe states (network/gateway loss → stop tracking; board fault → 503 isolation; `thermal.max_temp_c` → SoC over-temp health event + stop tracking; servo contact → halt in place + chime + short pause; servo torque cap on the weight-bearing joints; servo overload → torque cut-off + chime + timed retry; setup reserved) | WS-disconnect hook + per-capability `503` + thermal monitor (`thermal_over`/`read_soc_temp_c`) + contact + overload guards (`OverloadGuard`) | `services` on WS disconnect + HAL routes/`/health` + `server.py` `_thermal_monitor` + `animation_service.py` `_overload_tick` | **partially enforced (v1)** (setup reserved) |
+| 5 | `audio.max_volume` ceiling | `clamp_volume` | `/audio/volume` route, above the speaker/BT-sink split | **enforced (v1)** |
+| 6 | `motion.max_cog_offset_mm` (presence-driven) | whole-body centre-of-gravity score per frame (`recording_stability.py`) | recording load (`resample_recording`), physical + mock drivers; `POST /servo/move` and `/servo/nudge` cut a pose short instead | **enforced (v1)** |
+| 7 | `motion.joint_limits` (presence-driven) | per-joint `[min, max]` clamp (`LeLampFollower.send_action`) | every `Goal_Position` write on the feetech driver — recordings, tracking/gaze/aim, `/servo/move`, nudge, web; logs `[joint-limits]` (at most once a second). Lamp: the union of what recordings, aim presets and tracking use, plus 5° (`base_yaw` ±105, `base_pitch` −2..67, `elbow_pitch` −11..77, `wrist_roll` ±60, `wrist_pitch` −89..57), so nothing shipped changes; it only stops stray commands | **enforced (v1)** |
+
+Each slice adds fields to the `SafetyPolicy` and gate functions and wires one or more
+routes; the loader and the front-matter contract do not change shape between slices
+(fields are only added — the `autonomous.safety.v1` ABI).
+
+## Verifying enforcement
+
+A safety bound is only real if you can *prove* it holds and that the agent cannot get
+around it. Each slice is verified at three levels; a bound is not "done" until all
+three pass. (This is distinct from `robots/lamp/docs/security-test.md`, which covers
+network/access-control security — ports, RCE, CORS — not actuation bounds.)
+
+1. **Unit (pure gate, off-hardware).** The gate function is pure, so its limit is a
+   table test: a request above the ceiling clamps to it, a request below passes
+   through unchanged, an absent bound behaves per the fail-safe rule. Runs in CI with
+   no device.
+2. **Runtime (on the device, through the real route).** Issue the actuation request
+   over HTTP and observe the hardware-bound value, not the requested one. The declared
+   bound is also observable at `GET /device`, so the test asserts *request vs. ceiling
+   vs. observed output* line up.
+3. **Bypass audit (the safety-critical check).** Confirm there is **no** path to the
+   actuator that skips the gate — issue the same action through every route that can
+   drive it (agent path, direct route, any raw/low-level endpoint) and confirm each is
+   clamped. A bound enforced on one path but reachable on another is not enforced.
+
+### Slice 1 — brightness ceiling (checklist)
+
+- [x] **Unit:** `clamp_brightness(255)` with `max_brightness: 180` → `180`;
+      `clamp_brightness(120)` → `120`; no `max_brightness` → unchanged (pass-through).
+      `clamp_color` scales hue-preserving (white→180,180,180; red→180,0,0). Schema
+      missing/malformed/unknown-major fail-loud. (`hal/test/test_safety.py`, 21 tests.)
+- [x] **Runtime:** verified on a real Lamp — `GET /device` returns
+      `"safety": {"light": {"max_brightness": 180}}`; `POST /led/solid` at full white
+      (255) reads back `[180,180,180]`, `[100,50,0]` passes unchanged, `[255,0,0]` →
+      `[180,0,0]`.
+- [x] **Bypass audit:** the gate sits in `rgb_service` `_handle_solid` / `_handle_paint`
+      — the single chokepoint every pixel write funnels through. All callers (LED
+      routes, effects, app_state, scene, gpio_button, presence, smooth_animation, main)
+      use `dispatch(RGB_CMD_*)` → those handlers; the only direct `_driver` writes are
+      inside them (post-clamp) and `clear()` (black). Grep confirmed no path skips it.
+- [x] **Determinism:** `clamp_color` is pure and never consults the caller, so the
+      clamp is identical for the agent, the Web UI, or a raw `curl`.
+
+### Slice 2 — quiet hours (checklist)
+
+Quiet hours add a **time** dimension: the LED ceiling drops and music is
+suppressed inside a daily window (device-local wall-clock; the device runs all
+day, so this is real time-of-day, not "off at night"). The gate reads the clock
+on every request, so it flips at the boundary with no restart.
+
+The clock is read via `hal.clock.device_now()`, which resolves the device's
+**current** timezone from `/etc/timezone` (zoneinfo) on every call — so if the
+user changes the device timezone at runtime, quiet hours track the new zone
+immediately, without restarting HAL. (A plain `datetime.now()` would keep the
+timezone glibc cached at process start.) Falls back to naive system-local time
+when `/etc/timezone` is absent (dev/macOS).
+
+- [x] **Unit (injected clock):** `in_window` handles the midnight wrap
+      (22:00→07:00 true at 23:00 and 06:00, false at 12:00, end-exclusive at 07:00);
+      `active_max_brightness` returns the reduced ceiling (40) inside the window and
+      the base (180) outside; `clamp_color((255,255,255), now=23:00)` → `(40,40,40)`,
+      `now=12:00` → `(180,180,180)`; `audio_quiet_now` true in-window, false out /
+      when no policy. (`hal/test/test_safety.py`.)
+- [x] **Runtime:** `GET /device` reports `safety.light.quiet_hours` +
+      `safety.audio.quiet_hours`. With the window set to the current time, the LED
+      ring clamps to the reduced ceiling and `POST /audio/play` returns
+      `{"status":"suppressed"}`; outside the window both behave normally.
+- [x] **Bypass audit:** the LED quiet ceiling rides the same `rgb_service`
+      `_handle_solid`/`_handle_paint` chokepoint as slice 1 (no new path). Music
+      suppression sits in `/audio/play` — the only route that starts discretionary
+      audio (TTS is intentionally exempt).
+- [x] **Determinism:** the window check is pure given `now`; the only impurity is
+      reading the system clock, isolated in `policy._now()` so tests inject time.
+
+### Slice 3 — motion (checklist)
+
+Motion is **presence-driven**, the same rule as light/audio: a declared bound is
+enforced, an absent one is pass-through (a device that ships no `motion:` bounds
+moves unrestricted — that is the off state, not a refusal). `max_speed` is enforced
+by *stretching a move's duration* (the move still reaches its target; only speed is
+capped) — never by truncating the destination. Recovery actions
+(`release`/`zero`/`hold`/`stop`) are never gated so you can always safe the body.
+`stop_always` is parsed and reported as part of the declared policy, but no HAL
+route currently consumes that field: this recovery property is structural (the
+routes are ungated), not an independently enforced policy gate. `POST
+/servo/stop` is the route that property exists for — it aborts a move or a
+recording in flight and *holds* (torque stays on), reads no bound, and takes no
+arguments. It is not `/servo/release`, which travels to a rest pose before
+cutting torque; a stop that moves first is wrong for anything with wheels or
+legs (#201).
+
+`POST /servo/move` rejects non-finite joint targets with 422. When a `motion.max_speed` ceiling is declared, every requested joint must have a finite current position; a failed, missing or invalid pose read returns 503 before any move. Without that ceiling, the existing pass-through behavior remains. No new joint-angle limits are introduced. `/servo/stop` cancels the tracking worker before checking motor connectivity, so a disconnected motor cannot leave tracking active; the request still returns 503 if the hardware cannot be halted.
+
+The vision-tracking loop is gated too, and needs its own mechanism:
+`min_move_duration` cannot bound it because there is no destination to stretch a
+move toward, only a per-frame speed profile. `cap_speed_dps` clamps the loop's
+own pursuit/saccade ceilings (55 / 100 deg/s, `hal/drivers/tracking/constants.py`)
+to the declared `motion.max_speed` at the single place the profile is chosen
+(`tracker_service.set_profile`). Those constants are tuning, not permission — on
+Lamp (`max_speed: 120`) nothing is clamped today; a body declaring a lower
+ceiling is what the gate is for.
+
+Recorded animations are gated at load time rather than per frame. A recording
+is resampled onto the playback loop's own fps grid, and any segment demanding
+more than the ceiling is *stretched in time* — the same degradation the route
+gate uses, applied per segment so a recording slows down exactly where it was
+impossible and nowhere else (`hal/drivers/motors/recording_timing.py`, shared by
+the physical and mock drivers so the simulator plays what the body plays). The
+ceiling is the lower of the servo's measured limit (`SERVO_MAX_DPS`, 250 deg/s)
+and the declared `motion.max_speed`.
+
+Recorded animations are gated for **stability** as well as speed, at the same
+load-time chokepoint. Every joint can sit inside its own range while the
+*combination* puts the centre of gravity outside the base, and no per-joint bound
+expresses that, so `hal/drivers/motors/recording_stability.py` reconstructs the
+whole-body centre of gravity for every frame and **refuses** a recording that
+reaches further from the base axis than `motion.max_cog_offset_mm` allows. Unlike
+speed, there is no degradation that makes a tipping pose safe — the recording is
+skipped, so the failure mode is a missing animation, not a crash. The geometry
+comes from the body's own URDF via the `ROBOT.md` `urdf_ref` key; the check is
+presence-driven and inert without both declarations, and a body that declares a
+ceiling but no usable `urdf_ref` logs that it cannot score a pose and passes
+through rather than failing closed. Lamp declares 22 mm (measured: the
+third-party clip that tipped lamp-0c89 peaked at 31.6 mm, the worst shipped
+recording at 17.7 mm, the other 28 at or below 17.6 mm — see
+`robots/lamp/docs/motion-playback.md`); no other body declares it, so nothing
+else changes behaviour. Direct moves are scored too: `POST /servo/move` and
+`/servo/nudge` do not refuse a pose past the ceiling but **cut it short**
+(`limit_lean_back`), moving only as far as the centre of gravity stays within the
+ceiling, and `/servo/move` reports the target it sent in `clamped`. The vision
+loops (tracking, gaze, aim) apply the same cut with their own tighter 16 mm
+(`MAX_LEAN_BACK_MM`), because a face above the frame keeps them asking for more
+lift. Derive the number per body from its own animation
+library — it is millimetres of that body's geometry and mass, never a constant to
+copy.
+
+Recorded moves on the Reachy SDK path are gated differently, because the driver
+does not own the playback loop: `ReachyMotionService` hands a trajectory to
+`mini.play_move()` and the Pollen daemon streams it. There is no frame to slow
+down, so the move is **scanned before playback and refused** if its peak head
+rotation exceeds the declared ceiling (`peak_head_dps`, `_move_refused`). Speed
+is measured as the true angle between head orientations over a ≥20 ms window —
+per-axis euler deltas spike at gimbal crossings, and raw frame pairs turn
+timestamp jitter into speeds the head never reaches. Head *translation* is not
+bounded: `max_speed` is deg/s and `head_x/y/z` are millimetres, and no body
+declares a translation limit — not enforced, so not claimed.
+
+Refusal applies to every source including Pollen's own library, deliberately: an
+official move tripping the gate is evidence the declared number is wrong, and
+excusing it by origin would hide that signal. `robots/reachy-mini/SAFETY.md`
+records how its ceiling was derived and what still needs a real robot.
+
+The Stack-chan Wi-Fi path keeps the same duration gate across a process and
+network boundary. `StackChanMotionService` sends the already-stretched duration
+as `duration_ms`, renews a short controller lease while that timed interpolation
+runs, and releases the lease into a measured-position hold at the end. A torque
+release supersedes any active move, travels to the conservative head-down rest
+pose, confirms that pose from measured joint feedback, and only then disables
+torque. If the pose is not reached, it halt-holds with torque enabled. Its
+handshake requires `motion.timed_move`, measured position, halt-and-hold and
+torque-release capabilities. If HAL, its process or Wi-Fi disappears, the ESP32
+firmware expires the lease and halt-holds the measured pose; on a WebSocket
+close the installed firmware instead releases torque and restarts, which is
+why HAL keeps the transport open on a commissioning miss;
+firmware that only exposes an uncalibrated spring-speed parameter is rejected as
+incompatible because it cannot honor the declared degree-per-second ceiling.
+This path is covered by host protocol tests; physical fault-injection over a
+real Wi-Fi link remains a device qualification step.
+
+The driver also implements the refcounted `MotionService.acquire_body()` /
+`release_body()` contract used by look, capture and tracking. Overlapping owners
+keep `_tracking_active` true until the last owner exits; clearing the separate
+tracking-session flag cannot release another owner's claim. Ownership is local
+coordination for gaze and emotion routes, distinct from the firmware controller
+lease. It does not prevent the owner from moving or bypass the always-available
+halt path.
+
+The Stack-chan transport rechecks every timed move against measured position
+and `motion.max_speed`, including zero and gravity-rest moves. A superseding
+release halt-holds before measuring its start pose. Unreadable position or a
+required duration over 60 seconds fails closed without sending the move. The
+gateway publishes a connection only after sending `hello.accepted`, so motion
+commands cannot overtake the handshake.
+
+The companion [Stack-chan integration repository](https://github.com/glifocat/stackchan-autonomous/tree/9a5209596b97c257b6b2c1f6ff6bec91c44f8112)
+ships firmware patches and a separate standalone HTTP bridge. Its Docker demo
+does not boot `hal.server` and is not a startup test for this driver. Full HAL
+still needs a device profile declaring `motion.driver: stackchan` and the host
+board. The inspected firmware returns `completed` with state `scheduled` when
+it installs a timed move, not when the body arrives; `motion.halt` clears the
+lease, so the host reacquires it before the next move. Source agreement does
+not establish physical qualification or identify the firmware flashed on a body.
+
+All Stack-chan moves confirm measured arrival before releasing the controller
+lease. Firmware scheduling delays can extend interpolation past the requested
+duration, so elapsed host time alone is not completion. HAL renews the lease
+while checking arrival (within 1 degree), using a 2-second settling window
+before halting and returning an error instead of reporting success. Individual
+protocol requests remain subject to the configured command timeout.
+
+Home commissioning belongs to the experimental Stack-chan bench tool, not the
+shared OS motion contract. The standard `hal.server:app` entrypoint exposes no
+`/stackchan/*` or `/servo/home*` endpoints. The bench HTTP schema and routes live in
+`robots/_experimental/stackchan/commissioning.py`; the Stack-chan driver enforces
+its coordinate frame and commissioning bounds. Shared servo routes, models, and
+the `MotionService` contract remain unchanged.
+
+The explicit bench entrypoint exposes `GET /stackchan/home` for passive capability
+discovery and `GET /stackchan/home/position` for measured pan/tilt in
+`calibrated_home_deg_v1`, both without a motion lease. Motion remains disabled by
+default (`STACKCHAN_HOME_COMMISSIONING_ENABLED=0`). When explicitly enabled,
+`POST /stackchan/home/move` requires firmware capability `motion.home_degrees.v1`,
+an explicit coordinate frame, only a tilt target from 7 to 10 degrees, and a
+requested duration from 2 to 10 seconds. The speed policy may stretch duration
+up to 60 seconds. Starting feedback must show pan within ±30 degrees and tilt
+in [0, 5). Yaw torque is off during this pitch-only move. Below 5 degrees, stop
+or transport loss can leave torque off or the session faulted; mechanical
+support and direct supervision remain required.
+
+During each trajectory, including its optional repeat, the driver reads feedback
+after waits of at most 250 ms or half the lease TTL, whichever is shorter.
+Request latency adds to this interval; configured command timeouts still apply.
+Invalid feedback or yaw drift over 1 degree triggers a halt without waiting for
+the motion duration to end. This sampled check cannot detect every excursion
+between reads. A missed target after settling is halted and reported with measured
+settle samples while preserving the connection. Firmware rejections also keep the
+connection open; command timeouts still close it, and the installed firmware
+releases torque and reboots on disconnect. A successful hold is not guaranteed
+for every failure, particularly below the firmware's hold floor.
+
+Success requires measured pitch within 1 degree of target, at least 6 degrees,
+and at least 1 degree of positive progress. If the head settles short but stable
+(last samples within 0.2 degrees, at least 1 degree of progress, at least 6 degrees,
+and short by more than 1 but no more than 3 degrees), the driver repeats the same
+target at most once. The response reports `recommands`. Only measured arrival
+allows `lease.release` to re-energize both axes; the driver then rechecks position.
+
+Use bench `POST /stackchan/stop` and `POST /stackchan/release` for diagnostics.
+Firmware rejections return 502 with `op`, `code`, and `message`; other reported
+release failures, including missed arrival and cancellation, return 502 with
+`message` and `errors`. A failed release never reports successful torque-off on
+this bench endpoint. Shared `/servo/stop` and `/servo/release` retain their existing
+OS behavior; the latter's legacy success response alone does not prove release.
+This tool does not verify calibration or qualify hardware for routine use.
+
+The Stack-chan driver remains experimental. Before device qualification:
+
+- Identify and pin a matching firmware build with the required motion
+  capabilities; this HAL driver does not add those capabilities to stock firmware.
+- Verify authenticated WSS and certificate validation on the real ESP32.
+- Confirm completed bounded moves, measured position and duration limits on
+  the actual pan/tilt assembly.
+- Exercise halt, Wi-Fi loss, HAL process loss and lease expiry during motion,
+  verifying the physical hold and recovery behavior.
+- Calibrate the gravity-rest pose and physically confirm torque release only
+  after that pose has been measured.
+
+Host and loopback tests, and separate face, LED or speaker tests, do not complete
+these motion qualification steps.
+
+Select it with `driver: stackchan` in the device profile's `motion` capability.
+Set `STACKCHAN_DEVICE_ID`, a distinct `STACKCHAN_BODY_TOKEN` of at least 32
+characters, and both `STACKCHAN_BODY_TLS_CERT` and `STACKCHAN_BODY_TLS_KEY`.
+`STACKCHAN_BODY_HOST` (default `0.0.0.0`) and `STACKCHAN_BODY_PORT` (default
+`8765`) configure the listener; `STACKCHAN_BODY_COMMAND_TIMEOUT` (default `3.0`
+seconds) and `STACKCHAN_BODY_LEASE_TTL_MS` (default `1500`, accepted `250..5000`)
+configure failure timing. TLS is mandatory unless
+`STACKCHAN_BODY_ALLOW_INSECURE_WS=1` explicitly enables plain WebSocket for an
+isolated development network. Never use that opt-in in production.
+
+### Learned-policy interface (dry run)
+
+`POST /policy/run` is an interface-only endpoint for a learned controller such
+as ACT or SmolVLA. It validates and logs `policy` plus `task`, returns a
+`dry_run` run record, and does **not** import an inference runtime, capture an
+observation, or issue a motor target. This is deliberately not a safety bypass:
+there are no targets to pass through it yet. When execution is added, every
+target must traverse the motion gate and `POST /servo/stop` must first cancel
+the policy worker, then hold the body. `POST /policy/stop` clears a dry-run
+request without touching a motor; on a body that also mounts `/servo/stop`,
+that existing hardware stop first makes the same cancellation call, then holds
+the body.
+
+- [x] **Unit:** `min_move_duration` stretches a too-fast move (120° at 120 deg/s →
+      1.0s), passes a slow one, bounds an instant (duration 0) request, passes
+      through with no `max_speed` and with no policy at all, ignores joints with no
+      known start; commented `# stop_always` is not parsed as a bound; `max_speed:
+      0` fails loud. (`hal/test/test_safety.py`.)
+- [ ] **Runtime (NOT yet verified on device — user deploys):** `GET /device`
+      reports `safety.motion`; `/servo/move` at a tiny duration returns a stretched
+      `duration` and the ring/arm moves at the capped speed; a device with no
+      `motion:` bounds moves unrestricted (no 403).
+- [x] **Bypass audit (routes):** the speed cap is applied at `/servo/move` via
+      `min_move_duration` (the one endpoint that takes a duration). NOTE: internal
+      animation (idle/emotion poses driven by the runtime, not the agent) is not
+      gated — that is device-controlled, not agent-requested; revisit if needed.
+- [x] **Determinism:** `min_move_duration` is pure (no clock, no caller identity).
+
+### Slice 4 — fail-safe states (checklist)
+
+Fail-safe is **state-driven** rather than per-request clamping: when the device loses a
+critical dependency it falls into a safe posture deterministically, below the agent.
+Six conditions are enforced today; setup-incomplete is reserved.
+
+- [x] **Network / gateway loss → stop agent-driven tracking.** On gateway WebSocket
+      disconnect, `runtimes/openclaw/service_ws.go` calls
+      `hal.StopServoTracking()` (`system/lib/hal`) → HAL `POST /servo/track/stop`,
+      so the body stops chasing a target it has no fresh vision for. Best-effort and
+      guarded by `SetUpCompleted`. Key nuance: the device does **not** freeze or "hold
+      pose" — local idle animation continues (it is local and harmless) and recovery
+      reflexes (`motion.stop`/release, mute, sleep, wake) stay available; only
+      *agent-driven* tracking and new motion stop.
+- [x] **Board / driver fault → 503 isolation.** Already met: a faulting capability
+      returns `503` per-route while the rest keep serving, surfaced via `/health`. No
+      new mechanism — the fail-safe contract reuses the existing isolation.
+- [x] **Thermal (SoC over-temp) → health event + stop tracking.** Presence-driven on
+      `thermal.max_temp_c`: a background monitor (`server.py` `_thermal_monitor`) reads
+      the SoC temp from `/sys/class/thermal` every ~10s via `policy.read_soc_temp_c`; the
+      pure `policy.thermal_over` hysteresis gate trips at `max_temp_c` and clears at
+      `resume_temp_c` (default `max−10`). On trip it sets `state.thermal_over`, logs, and
+      stops discretionary tracking; idle stays alive. Surfaced at `GET /health.thermal`.
+      Threshold is SoC-specific — read the board's own critical trip, not a generic guess.
+- [ ] **Setup incomplete → reserved.** Not gated in the runtime yet (setup/identity
+      reflexes only is declared intent, not enforced).
+- [x] **Servo contact → halt in place, chime, short pause.** Stops the arm when it
+      hits something while moving. It shares the monitor thread and the `Present_Load`
+      read with the overload cut-off below (its own `on_contact` handler, falling back
+      to `on_overload` when unset), and is set in
+      the same file: an optional `contact` object (`load`, `hold_s`, `pause_s`, exactly
+      those keys, plus the optional `profile_margin`, `lag_margin` and `off_playback`
+      below) in the board entry; no `contact` means no contact stop. `load` is one
+      floor for every joint or a `{joint: floor}` map, and a joint left out of the map
+      is not watched. A watched joint at or above its floor (Lamp: `base_yaw` `550`,
+      `wrist_roll` `750`, `wrist_pitch` `650`, in 0.1 % of full drive) for
+      `contact.hold_s` (Lamp: `0.05` s, about two 50 ms samples) halts motion in flight,
+      and so does any joint above its **learned envelope** while a learned recording
+      plays (see the next paragraph), pins the current pose and keeps **torque on**, so the arm
+      does not drop; the runtime stops the vision tracker, silently (no chime: it
+      fired too often to be welcome). For
+      `contact.pause_s` (Lamp: `3` s) goal writes are blocked so nothing drives back
+      into the obstacle, and `/servo/move`, `/servo/aim`, `/servo/nudge` fail with
+      "Servo contact stop active". Then the state is re-read from hardware and idle
+      resumes; a body parked meanwhile stays put. It is checked before the cut-off, and
+      an arm still forced while held trips the cut-off as before. With
+      `contact.release_after_s` set (Lamp: `1` s), a hand still **holding** the arm that
+      long into the pause — the stopped joint still at or above the floor that stopped
+      it (its learned envelope load or lag floor when one applied) or pushed 1°
+      (`CONTACT_RELEASE_LAG`) further off its pin than it had settled to 0.5 s in, that
+      settled offset capped at 3° (`CONTACT_RELEASE_LAG_BASE_MAX`: pinned untouched at
+      −72°, lamp-75c9's `base_yaw` held 40-45 % against its cable and sat 2.5-2.7° off, and
+      a bare 1° let it go limp), if that joint has a fixed contact floor, or any
+      other fixed-floor joint (`base_yaw`, the wrists) at the floor that stop compared it
+      against (its learned envelope there, never above its fixed floor: on lamp-75c9 a
+      hand held `wrist_pitch` at 32 % under a 17 % envelope floor while `wrist_roll` had
+      stopped the arm, and the fixed 65 % kept it on), or a weight-bearing joint past its
+      learned hold or `off_playback` load/lag floor — is not a bump: the driver logs `[contact] … releasing torque` and
+      hands over to the cut-off's torque-off (arm goes limp, `retry_s` lockout, the
+      cut-off's chime). After that lockout the resume ramps the limp arm back at up to its
+      torque cap, so the contact stop sits out the ramp (`duration` + 0.5 s): on lamp-75c9
+      it stopped `base_yaw` at 60 %, released it again and looped every lockout. A bump let go within the window only pauses. The stopping floor
+      matters on a learned unit: on lamp-52e6 a hand stopped `base_yaw` at 39.6 % (envelope
+      18 %), holding it at 23-36 %; on lamp-a0ae (`P=16`) a hand held `base_yaw` at only
+      12-16 % but 1.3-8.5° off, while a pinned `base_yaw` left alone drifted 0.0°. A weight-bearing joint (no fixed floor: `base_pitch`,
+      `elbow_pitch`) never releases on its learned floor: pinned, it keeps a gravity load
+      (and some sag) that depends on the pose it stopped in, not the one the envelope learned. Untouched,
+      lamp-a0ae's `elbow_pitch` stopped at 38.0 % over a 22.7 % floor and then held 33.4 %,
+      so even a 10 % margin let it go limp. They release on what they learned to **hold
+      still in that pose** instead (`HoldLearner`, `hal/drivers/motors/hold_profile.py`):
+      every spell in which all goals stay still (within 0.5°) for the 3 s pause with
+      torque on, learn run or not, is sampled the way a pause sees a pinned arm, past a
+      0.5 s settle for the last move's lag, for `base_pitch` / `elbow_pitch` load and lag.
+      The peaks are kept per pose cell of 5° x 5° (`base_pitch`, `elbow_pitch`) and
+      updated like the passive envelope (2 spells, falling 50 % of the gap per spell, twice the envelope's share since the lamp is rarely still for a whole pause, from
+      the fixed floor but never under a hold once measured, a heavier one rising at once; a learn run's spells,
+      held 4 s at each recording's end pose, set the cell outright). In a pause these
+      joints release at the learned peak plus the profile margins, the cell's own
+      envelope raised by what its ±1 neighbours actually measured (not their envelopes:
+      a neighbour learned once still sits near the fixed floor it falls from, and on
+      lamp-75c9 one held a learned cell's elbow release at 51 % against its 21 %), and only where that is under their `off_playback` floor (and, for a
+      capped load, under the cap): an unlearned pose, or a cell a hand raised, keeps the
+      `off_playback` floor or the cut-off as before. Saved at most once a minute to
+      `/var/lib/hal/contact_hold.json` (`HAL_CONTACT_HOLD_PATH`), dropped like the
+      envelope when `torque_limit` changes. Surfaced at
+      `GET /health.servo_overload.contact` (`active`, `resume_in_s`, `trips`,
+      `last_trip`, thresholds). Lamp's floors come from lamp-52e6 (2026-10-09): over
+      19 recordings the free-motion peaks were `base_yaw` 46 %, `wrist_roll` 52 %,
+      `wrist_pitch` 43 %, while a hand blocking `base_yaw` drove it to 94-100 %.
+      `base_pitch` and `elbow_pitch` get no fixed floor: carrying the arm's weight they
+      reach 83-100 % in free motion, while a hand blocking them read only 36-74 %, so a
+      fixed floor cannot tell the two apart.
+      **Learned envelope (an elevator door's learn run).** What a free run loads at each
+      frame of a recording repeats, so with `contact.profile_margin` set (Lamp: `120` =
+      12 %) the driver keeps a per-unit envelope at `/var/lib/hal/contact_profile.json`
+      (`HAL_CONTACT_PROFILE_PATH`; there is no shared default, because load and friction
+      differ unit to unit — an envelope learned on lamp-52e6 tripped lamp-a0ae's idle
+      every 8 s — so a unit that has not learned one runs on the fixed floors only):
+      `{recording: {joint: [max load per frame],
+      "lag:<joint>": [max |goal - present| per frame, 0.1 deg]}}`. The lag entries
+      matter where load cannot help: a joint at its torque cap, or a soft one a hand
+      simply slows, falls behind its goal. With `contact.lag_margin` set (Lamp: `35` =
+      3.5°) a joint trailing its learned lag by that much is a hit too. The goal is
+      the one `LeLampFollower.send_action` last wrote when every joint has one from
+      the last second (`GOAL_CACHE_S`), so a playback tick reads only `Present_Load`
+      and `Present_Position`; after a raw move or a torque change, or with no write
+      that recent, `Goal_Position` is read back from the servos.
+      `POST /servo/contact/learn` (or **Learn** under Touch Sensitivity on the web
+      Monitor Servo page; `{"recordings": [...], "runs": 2}`; default every
+      recording except `music_*`) plays each recording free `runs` times in the
+      background and saves the per-frame max; the area around the arm must be clear,
+      since whatever it touches is learned as normal. While a learned recording plays
+      its own frames, every joint's floor is the envelope (max over ±3 frames) plus the
+      margin, and that includes `base_pitch` and `elbow_pitch`. The ramp into a
+      recording has no envelope and keeps the fixed floors. While no recording owns the
+      body (gaze turns, tracking, `/servo/move`, holds) the optional
+      `contact.off_playback` map applies instead: load floors by joint name and lag
+      floors as `lag:<joint>` in 0.1 deg (Lamp: `base_pitch` 57 %; no `elbow_pitch` load
+      floor, since lamp-a0ae's elbow reaches its 60 % torque cap in untouched lifts;
+      lag `base_yaw` 10°, `base_pitch` 14°, `elbow_pitch` 12°, `wrist_roll` 9°,
+      `wrist_pitch` 12°). Joints lag more under the 60 % torque cap: floors taken from
+      70 %-cap data tripped falsely 5 times during a learn run on lamp-52e6, these gave
+      no false trip over ~3 min (6 recordings + 90 s idle). They sit out a direct move
+      (`move_to`/`move_to_raw`: gaze/search turns, aim, `/servo/move`, startup, zero, park) and `OFF_PLAYBACK_SETTLE_S`
+      (0.5 s) after it, when only the fixed floors apply: a fast move outruns the
+      servo's acceleration ramp, and on lamp-a0ae that lag (`wrist_roll` 12-14°) and
+      spin-up load (`elbow_pitch` 54 %) stopped the arm 0.2 s into untouched moves. They
+      sit out the ramp into a recording too, which only the fixed floors watch: idle's
+      settled flag outlives a halt into the ramp back, and on lamp-75c9 that ramp from a
+      −72° aim trailed `base_yaw` 17° and stopped on the still floor of 10°. A
+      unit that has learned the recording playing — settled idle included — uses its
+      own envelope instead of `off_playback` (lamp-a0ae's heavier elbow idles at
+      54-60 % against the 52 % taken from lamp-52e6). On
+      lamp-52e6 the gaze cut most recordings short within a second whenever someone
+      sat in front of it, so this is where a hand usually meets the arm. Re-learn after recalibrating the arm.
+      **Passive learning** (`PassiveLearner` in `hal/drivers/motors/contact_profile.py`)
+      keeps the envelope current without a learn run: every play of a recording
+      (`music_*` included) is sampled like a learn run, and counts only when it ran from
+      its first frame to its last with no contact stop, cut-off, direct move or learn
+      run in it. The last 5 clean runs per recording stay in RAM, and from 2 on (as many
+      as a learn run plays) each clean run updates that recording's envelope toward
+      them: their per-frame max while fewer than 5 (the loosest), then the second
+      highest, so one run a hand brushed does not count. A higher value replaces the
+      envelope at once, so a heavy frame stops the arm only once, up to the cut-off's
+      80 % for load and 30° for lag. A value once measured (by a clean run or a learn
+      run; the highest per frame is saved in `contact_profile.json.measured`) is never
+      lowered by lighter runs after it. Only what sits above it comes down, a quarter of
+      the gap per update: a recording's first envelope, which starts at the fixed floors
+      it ran under before (Lamp: the contact `load` floors, then `off_playback` load and
+      lag, then a capped joint's `torque_limit`), so it starts where the lamp stood, and
+      a false stop's raise. A frame a later run reaches for
+      the first time (20 Hz sampling skips some 30 fps frames on each run) falls from
+      its learned neighbours within ±3 frames instead, so it does not hold its whole
+      floor window up at the fixed floor. A run that trips never
+      counts, so a contact pause nobody touches (it ends without a torque release, and
+      from 0.5 s in, `CONTACT_HELD_SETTLE_S`, no joint reached its release floor even
+      briefly) is taken as a false stop instead. A pause a hand held short of a release
+      leaves the envelope alone: on lamp-75c9 hands holding `elbow_pitch` at 30-45 %
+      loosened it at every pause, and one at its 60 % cap lifted `idle`'s whole elbow
+      channel past the cap. For a false stop the envelope within ±3 frames of it
+      rises at once to where that sample would not have stopped it, at most 10 times
+      a day per recording, and those frames of that joint's channel do not come down
+      for 24 h after (kept in RAM, so a HAL restart ends it); every other frame and
+      channel keeps falling (on lamp-75c9 a hold over the whole recording kept all five
+      joints of `idle` near their fixed floors for a day after four early stops). A
+      capped joint stopped at its `torque_limit` (within 1 %) rises to the cap within
+      ±30 frames (1 s) of the stop instead, leaving that stretch to its lag: lamp-c0a4's
+      elbow reaches its cap at `idle` frames that vary from run to run, and stopped
+      `idle` every 5 s on a 41 % floor. Raising the whole channel, as before, left
+      lamp-75c9's `idle` elbow load unwatched at every frame. Updates are saved at most once a minute (the file is overwritten,
+      about 100 KB a write). The envelope is saved with the `torque_limit`
+      it was learned under (`contact_profile.json.signature`); after a `torque_limit`
+      change it is dropped at startup and the fixed floors apply until it is learned
+      again (an envelope learned at 60 % tripped lamp-c0a4's idle `base_pitch` about
+      300 times in 25 min at 70 %).
+      `GET /health.servo_overload.contact.profile` shows `margin`, how many recordings
+      are learned, which one a learn run is on, `passive_runs` (clean runs held per
+      recording) and `hold_cells` (pose cells with a learned hold).
+      **Limits:** nothing is seen before the touch, and a light object the arm can
+      simply push, such as a cup or a photo frame, may never load a joint enough to trip.
+- [x] **Servo torque cap → a softer arm.** An optional `torque_limit` map
+      (`{joint: limit}`, 0.1 % of full drive) in the same board entry is written to
+      each servo's `Torque_Limit` (STS3215 register 48) at every configure, so that
+      joint pushes at most that hard into a hand or an object. `Present_Load` then
+      tops out at the limit, so a load floor above it (the cut-off's 80 %) never trips
+      on that joint. Lamp caps `base_yaw` and `base_pitch` at `600` (60 %) and
+      `elbow_pitch` at `700` (70 %): over the 19 recordings on lamp-52e6 a 70 % cap
+      moved the worst tracking lag from 17° to 18° (`shock`) and 50 % stretched it to
+      24°; 60 % trades a little lag for a gentler push. The elbow sat at its 60 % cap in
+      untouched `idle` on lamp-75c9, leaving its load nothing to tell a hand by there, so
+      it gets 70 %. The cut-off's 80 % therefore never trips on these three joints (the
+      cap itself bounds their drive); it still guards `wrist_roll` and `wrist_pitch`.
+- [x] **Servo overload (stall) → cut torque, chime, timed retry.** Gear protection for
+      a blocked or forced arm. Driver-level and feetech-only (`AnimationService`),
+      device-owned: thresholds come from `robots/<device>/servo_overload.json` (a
+      `boards` map with `load`, `hold_s`, `retry_s`, optional `enabled`), read by
+      `hal/board/servo_overload.py`; no file, no board entry or `enabled: false` means
+      no cut-off, and a malformed file fails boot. It is not a `SAFETY.md` field. No
+      current sensor is needed: a monitor thread reads every joint's `Present_Load`
+      (STS3215 register 60, the drive duty in 0.1 % units) every 50 ms. A joint at or
+      above `load` (Lamp: `800` = 80 %) for `hold_s` (Lamp: `1.5` s) trips the pure
+      `OverloadGuard` (`hal/drivers/motors/overload.py`). On
+      trip the driver halts motion in flight and writes `Torque_Enable=0` to all servos
+      with **no park move** (the arm is blocked, so it goes limp where it is); the
+      runtime then plays the ack chime and stops the vision tracker. A joint whose
+      torque-off write failed (dropped packet) is retried every 50 ms until confirmed;
+      until then `/health` reports `cut_complete: false` with the joints in
+      `pending_off`. For `retry_s` (Lamp: `120` s) no goal reaches the bus, because a
+      goal write re-engages torque on these servos: playback and tracker frames are
+      dropped, `/servo/move`, `/servo/aim` and `/servo/nudge` fail with "Servo overload
+      cut-off active", a raw move already in flight (startup / zero / park) aborts at
+      its next frame, new ones are skipped, and torque-on is skipped. Every one of
+      these checks runs under the bus lock the cut-off itself takes, so a cut cannot
+      land between a check and its write. After the
+      delay the body comes back through the normal `resume()` path (torque on, state
+      re-read from hardware, ramp into idle; an earlier hold is dropped). If it was
+      released (asleep) or zero-posed meanwhile it stays limp until the next resume.
+      Still blocked → it trips again. A failed load read never trips. Surfaced at
+      `GET /health.servo_overload` (`active`, `retry_in_s`, `trips`, `cut_complete`,
+      `pending_off`, `last_trip`, and per-joint `load` / `peak` for tuning). Lamp's
+      80 % / 1.5 s was measured on lamp-52e6 (2026-10-09) at full torque: free-motion
+      peaks reached 87 % (`base_pitch` in `shock`) for under 0.3 s, a hand holding
+      `base_yaw` or `elbow_pitch` read 94-100 %, and the mis-calibrated `goodbye`
+      grinding the desk (100 % for 1.2 s) stays under the 1.5 s hold. Only Lamp ships
+      the file.
+- [x] **Unit:** `thermal_over` trips at/above `max_temp_c`, holds through hysteresis
+      above `resume_temp_c`, clears at/below it, and is False with no policy / no thermal
+      section / unreadable temp; `read_soc_temp_c` parses millidegrees → °C and returns
+      None on any read error; parse defaults `resume = max − 10` and fails loud on
+      `max_temp_c ≤ 0` or `resume ≥ max`. (`hal/test/test_safety.py`.)
+- [ ] **Runtime (NOT device-verified):** the WS-disconnect → `/servo/track/stop` path and
+      the thermal monitor are repo-level only; not yet confirmed on a live device (pull the
+      gateway link; heat the SoC past `max_temp_c`).
+
+### Slice 5 — `audio.max_volume` (checklist)
+
+The Lamp `pro-respeaker-lite` profile sets `max_volume` to 50% and keeps `startup_volume` at 35%. The web volume scale maps 100% to that 50% mixer limit.
+
+An all-day speaker ceiling, independent of `audio.quiet_hours`: the window suppresses
+*discretionary* output (music), while the ceiling bounds *how loud anything gets*,
+including spoken replies.
+
+- [x] **Gate:** `policy.clamp_volume` — pure, no clock, no caller identity. Absent bound
+      = pass-through (only the 0–100 scale clamp), the same presence-driven rule as
+      `clamp_brightness`.
+- [x] **Enforced where:** `POST /audio/volume` (`hal/routes/audio.py`), clamped **above**
+      the sink split so the ceiling holds on the built-in speaker (amixer/DAC dB) and on a
+      Bluetooth headset sink alike. The persisted volume (`config/.volume`, restored by
+      os-server at boot) stores the clamped value, so a pre-existing higher setting cannot
+      survive a reboot as an unbounded one.
+- [x] **Bypass audit (callers):** every path that sets volume goes through this one route
+      — agent/skill, `system/intent` (`rules_audio.go` "volume up"/"quieter"), the Monitor
+      web slider, and os-server's boot restore (`config_watch.go` → `hal.SetVolume`). The
+      gate sits in the route rather than in the callers, so none of them can be the thing
+      that decides.
+- [x] **Reported:** both `GET` and `POST /audio/volume` return `max_volume` (null when
+      undeclared); the `POST` reply also carries the volume actually applied, so a caller
+      never has to assume its request landed verbatim and a UI can correct itself at once
+      instead of drifting until the next poll.
+      `system/lib/hal.MaxVolume()` and the Monitor slider read it — advisory only, so a
+      client that skips it still cannot exceed the bound; it just loses the ability to
+      scale its steps. The slider bounds its track to the ceiling instead of letting the
+      handle snap back from a dead zone, and `rules_audio.go` expresses "louder"/"quieter"
+      as fractions of the usable range (otherwise, on a device whose ceiling is 40, a
+      fixed "quieter" of 30 stops being distinguishable from "louder").
+- [x] **Unit:** clamp above/below ceiling, pass-through with no bound and no policy,
+      0–100 scale clamp, a `max_volume` nested inside `quiet_hours` not read as the all-day
+      bound, and fail-loud on out-of-range. (`hal/test/test_safety.py`.)
+- [ ] **Runtime (NOT device-verified):** repo-level only — not yet confirmed against a
+      live speaker (set 100 via API, read back the ceiling; check the amixer/BT sink value).
+
+## Relationship to existing ad-hoc enforcement
+
+Some safety behaviour already exists, hardcoded and scattered: `motion.stop()` in the
+motors/animation services, lerobot's mechanical position clamp, the LED brightness
+scaling config. That mechanical position clamp is still the only per-joint position
+limit: the command path has **no** declared position bound (recordings are gated for
+speed and, since slice 6, for whole-body stability — neither is a per-joint clamp).
+The engine does not rip these out at once — it *centralises* them
+into the declared policy one slice at a time, so the bounds become data a device
+declares rather than constants buried in drivers. Slice 1 introduces the engine with
+a bound that has **no** prior enforcement (an agent-independent brightness ceiling),
+proving the path end to end before migrating the existing pieces.

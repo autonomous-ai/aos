@@ -1,0 +1,619 @@
+"""Base context manager: summarization, turn persistence and prompt assembly."""
+
+import json
+import logging
+import re
+import threading
+import time
+from abc import ABC, abstractmethod
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import hal.config as app_config
+from hal.realtime.constants import RESOURCES_DIR
+from hal.realtime.summarizer import RealtimeSummarizer
+
+logger = logging.getLogger(__name__)
+
+# Heading the summariser is told to put unanswered requests under
+# (resources/summarize_prompt.md). expire_open_requests keys off it.
+OPEN_REQUESTS_HEADING = "## Open requests"
+
+# First section of summary.md while an activity (quiz, debate, lesson, game)
+# is in progress — its rules, position and covered items. Written by the
+# summarizer (resources/summarize_prompt.md); fit_summary never drops it.
+CURRENT_ACTIVITY_HEADING: str = "## Current activity"
+
+
+def fit_summary(summary: str, max_chars: int) -> str:
+    """Shrink an over-long summary by whole bullets, oldest history first.
+
+    A hard cut at max_chars dropped the END of the summary — the newest debate
+    rounds and `## Open requests` (#449). The activity and open-request
+    sections are what the next session needs most, so they are kept whole and
+    bullets are removed from the other sections top-down (the summary runs
+    oldest to newest). A hard cut remains only as the last resort.
+    """
+    if len(summary) <= max_chars:
+        return summary
+    protected: set[str] = {CURRENT_ACTIVITY_HEADING, OPEN_REQUESTS_HEADING}
+    lines: list[str] = summary.splitlines()
+    section: str = ""
+    droppable: list[int] = []
+    for i, line in enumerate(lines):
+        if line.startswith("## "):
+            section = line.strip()
+        elif section not in protected and line.lstrip().startswith(("- ", "* ")):
+            droppable.append(i)
+    dropped: set[int] = set()
+    size: int = len(summary)
+    for i in droppable:
+        if size <= max_chars:
+            break
+        dropped.add(i)
+        size -= len(lines[i]) + 1
+    fitted: str = "\n".join(line for i, line in enumerate(lines) if i not in dropped)
+    return fitted[:max_chars]
+
+
+# Example bullet: `- [2026-09-15T11:56:02+00:00] turn off the TV`
+_OPEN_REQUEST_BULLET_RE = re.compile(r"^\s*[-*]\s*\[([^\]]*)\]")
+
+
+def _parse_open_request_stamp(raw: str) -> float | None:
+    """Epoch seconds of a bullet's `[...]` stamp (naive = UTC), or None when not ISO-8601."""
+    try:
+        stamp = datetime.fromisoformat(raw.strip())
+    except ValueError:
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return stamp.timestamp()
+
+
+def expire_open_requests(summary: str, now_s: float, file_age_s: float, ttl_s: float) -> str:
+    """Drop expired bullets from the `## Open requests` section of a summary.
+
+    Per bullet by its ISO stamp; file_age_s is the fallback. ttl_s <= 0 disables.
+    """
+    if ttl_s <= 0:
+        return summary
+    # Safe only because the prompt contract puts the heading on its own line.
+    if OPEN_REQUESTS_HEADING.lower() not in summary.lower():
+        return summary
+    out: list[str] = []
+    in_section = False
+    section_start = 0
+    kept_bullets = 0
+    dropped = 0
+
+    def close_section() -> None:
+        nonlocal in_section
+        in_section = False
+        if kept_bullets == 0:
+            del out[section_start:]
+
+    for line in summary.splitlines():
+        if line.strip().lower() == OPEN_REQUESTS_HEADING.lower():
+            in_section = True
+            section_start = len(out)
+            kept_bullets = 0
+            out.append(line)
+            continue
+        if in_section and line.lstrip().startswith("#"):
+            close_section()
+        if in_section:
+            m = _OPEN_REQUEST_BULLET_RE.match(line)
+            if m:
+                stamp_s = _parse_open_request_stamp(m.group(1))
+                expired = (now_s - stamp_s >= ttl_s) if stamp_s is not None else (file_age_s >= ttl_s)
+                if expired:
+                    dropped += 1
+                    continue
+                kept_bullets += 1
+        out.append(line)
+    if in_section:
+        close_section()
+    if dropped == 0:
+        return summary
+    return "\n".join(out).strip()
+
+
+def expire_current_activity(summary: str, now_s: float, file_age_s: float, ttl_s: float) -> str:
+    """Drop the `## Current activity` section once the activity has gone quiet.
+
+    The section tells a fresh session to carry on a quiz or debate; re-fed
+    after the user walked away it would resume a test they abandoned the night
+    before, and fit_summary protects it at the cost of real history. Its first
+    bullet carries a `[<ISO-8601>] Last active` stamp (summarize_prompt.md);
+    ttl_s or more before now_s — or, without a parseable stamp, a file that old —
+    and the whole section goes. ttl_s <= 0 disables.
+    """
+    if ttl_s <= 0 or CURRENT_ACTIVITY_HEADING.lower() not in summary.lower():
+        return summary
+    lines: list[str] = summary.splitlines()
+    start: int = next(
+        i for i, line in enumerate(lines)
+        if line.strip().lower() == CURRENT_ACTIVITY_HEADING.lower()
+    )
+    end: int = next(
+        (i for i in range(start + 1, len(lines)) if lines[i].lstrip().startswith("#")),
+        len(lines),
+    )
+    stamp_s: float | None = None
+    for line in lines[start + 1:end]:
+        m = _OPEN_REQUEST_BULLET_RE.match(line)
+        if m:
+            stamp_s = _parse_open_request_stamp(m.group(1))
+            break
+    expired: bool = (now_s - stamp_s >= ttl_s) if stamp_s is not None else (file_age_s >= ttl_s)
+    if not expired:
+        return summary
+    return "\n".join(lines[:start] + lines[end:]).strip()
+
+
+def _device_answers_overheard_speech() -> bool:
+    """ROBOT.md `answer_overheard_speech: true`; False when the profile is unavailable."""
+    try:
+        from hal.server_support.boot_config import boot_config
+        return bool(boot_config().profile.answer_overheard_speech)
+    except Exception:
+        return False
+
+
+def _wake_names() -> list[str]:
+    """What people call the device: the owner's wake phrases, else the built-in ones."""
+    phrases: list[str] = app_config.custom_wake_phrases()
+    if not phrases:
+        try:
+            from hal.drivers.voice._internal.config import DEFAULT_WAKE_WORDS
+            phrases = [p.casefold() for p in DEFAULT_WAKE_WORDS]
+        except Exception:
+            return []
+    return list(dict.fromkeys(p.strip() for p in phrases if p.strip()))
+
+
+def wake_names_section(names: list[str]) -> str:
+    """Tell the model that a wake name in the audio is the call to it, not the request.
+
+    Without it Gemini hears "Sam, mấy giờ rồi?" as "Exam mấy giờ rồi?" or as
+    another language, then delegates or rejects a question it could answer.
+    """
+    if not names:
+        return ""
+    listed: str = ", ".join(f'"{n}"' for n in names)
+    return (
+        "# HOW PEOPLE CALL YOU\n\n"
+        f"People wake you by saying one of these: {listed}. Such a name at the "
+        "start or end of what they say (\"Sam, what time is it?\") is only the "
+        "call to you: it is not part of the request, not another language, and "
+        "not a reason to reject or delegate. Transcription often mishears it "
+        "(\"Sam\" as \"Exam\" or \"some\"); treat a similar-sounding word there "
+        "the same way and answer the rest normally."
+    )
+
+
+class ContextManagerBase(ABC):
+    """Abstract base for realtime voice agent context managers."""
+
+    DEFAULT_PROMPT_PATH: Path = RESOURCES_DIR / "system_prompt.md"
+    PROVIDER_PROMPT_PATHS: dict[str, Path] = {
+        "openai": RESOURCES_DIR / "system_prompt_openai.md",
+        "gemini": RESOURCES_DIR / "system_prompt_gemini.md",
+        "gptlive": RESOURCES_DIR / "system_prompt_gptlive.md",
+        "pipecat_v1": RESOURCES_DIR / "system_prompt_pipecat.md",
+    }
+
+    LANGUAGE_NAMES: dict[str, str] = {
+        "en": "English",
+        "vi": "Vietnamese",
+        "zh-CN": "Chinese (Simplified)",
+        "zh-TW": "Chinese (Traditional)",
+        "ko": "Korean",
+        "ar": "Arabic",
+        "ja": "Japanese",
+        "fr": "French",
+        "de": "German",
+        "es": "Spanish",
+        "pt": "Portuguese",
+        "id": "Indonesian",
+        "th": "Thai",
+    }
+
+    def __init__(
+        self,
+        workspace_dir: str = "",
+        realtime_memory_path: str = app_config.REALTIME_MEMORY_PATH,
+        language: str | None = None,
+        provider: str = "",
+        max_memory_entries: int = app_config.REALTIME_MAX_MEMORY_ENTRIES,
+        trim_keep: int = app_config.REALTIME_MEMORY_TRIM_KEEP,
+        device_memory_max_chars: int = app_config.REALTIME_DEVICE_MEMORY_MAX_CHARS,
+        realtime_memory_max_chars: int = app_config.REALTIME_MEMORY_MAX_CHARS,
+        summarizer: RealtimeSummarizer | None = None,
+    ) -> None:
+        self._workspace: Path = Path(workspace_dir)
+        self._realtime_memory_path: Path = Path(realtime_memory_path)
+        self._language: str = language or "English"
+        self._provider: str = provider.strip().lower()
+        self._max_memory_entries: int = max_memory_entries
+        self._trim_keep: int = trim_keep
+        self._device_memory_max_chars: int = device_memory_max_chars
+        self._realtime_memory_max_chars: int = realtime_memory_max_chars
+        self._summarizer: RealtimeSummarizer | None = summarizer
+        self._summary_path: Path = self._realtime_memory_path.parent / "summary.md"
+        self._device_summary_path: Path = (
+            self._realtime_memory_path.parent / "device_summary.md"
+        )
+        # Billed every turn -> keep tight (~1.5k tokens).
+        self._summary_max_chars: int = app_config.REALTIME_SUMMARY_MAX_CHARS
+        self._open_request_ttl_s: float = float(app_config.REALTIME_SUMMARY_OPEN_REQUEST_TTL_S)
+        self._raw_memory_path: Path = self._realtime_memory_path.with_name(
+            "memory_raw.jsonl"
+        )
+        self._realtime_memory_lock: threading.Lock = threading.Lock()
+        self._realtime_summarize_lock: threading.Lock = threading.Lock()
+        # Consecutive summarize calls that produced nothing; logged at ERROR
+        # from the second, because memory then silently stops being compressed.
+        self._summary_failures: int = 0
+
+    IDENTITY_NAME_FILE: str = "IDENTITY.md"
+
+    @classmethod
+    def read_agent_name(cls, workspace_dir: str) -> str:
+        """Read only an explicit name field (never inferred from persona prose); '' if missing."""
+        try:
+            content = (Path(workspace_dir) / cls.IDENTITY_NAME_FILE).read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            return ""
+        for line in content.splitlines():
+            field = re.match(r"^\s*(?:[-*]\s+)?\*\*name:\*\*\s*(.*)$", line, re.I)
+            if field:
+                name = re.split(r"[—|\-]", field.group(1), maxsplit=1)[0].strip()
+                if name:
+                    return name.lower()
+        return ""
+
+    @abstractmethod
+    def load_device_context(self) -> str:
+        """Load agent identity context (e.g. SOUL.md, IDENTITY.md, USER.md)."""
+
+    @abstractmethod
+    def load_device_memory(self) -> list[str]:
+        """Load device memory entries (summary + unsummarized recent files)."""
+
+    @abstractmethod
+    def load_skills_catalog(self) -> str:
+        """Load skill definitions as a formatted string (e.g. markdown table)."""
+
+    @abstractmethod
+    def summarize_device_memory(self) -> None:
+        """Summarize device memory files into a persistent summary."""
+
+    def summarize_realtime_memory(self) -> None:
+        """Summarize entries in memory.jsonl into summary.md, keeping entries added during summarization."""
+        if not self._summarizer:
+            return
+        with self._realtime_summarize_lock:
+            try:
+                to_summarize: list[str] = []
+                with self._realtime_memory_lock:
+                    if not self._realtime_memory_path.exists():
+                        return
+
+                    raw: str = self._realtime_memory_path.read_text(
+                        encoding="utf-8"
+                    ).strip()
+
+                    if not raw:
+                        return
+
+                    lines: list[str] = raw.splitlines()
+                    # The newest turns stay verbatim for the next session;
+                    # only the older ones are folded into summary.md.
+                    # Bounded by chars too (half the verbatim budget): a few
+                    # long replies could otherwise fill the window on their own,
+                    # drop an unsummarized turn and re-trigger every turn.
+                    keep_recent: int = max(0, app_config.REALTIME_SUMMARY_KEEP_RECENT_TURNS)
+                    kept: int = 0
+                    tail_chars: int = 0
+                    for line in reversed(lines):
+                        size: int = len(self._format_jsonl_entry(line))
+                        if kept >= keep_recent or tail_chars + size > self._realtime_memory_max_chars // 2:
+                            break
+                        kept += 1
+                        tail_chars += size
+                    to_read: list[str] = lines[: len(lines) - kept]
+                    lines_read: int = len(to_read)
+                    entries: list[str] = self._parse_jsonl_lines(to_read)
+                    if not entries:
+                        return
+
+                    if self._summary_path.exists():
+                        existing: str = self._read_summary_for_refeed()
+                        if existing:
+                            to_summarize.append(f"[Previous summary]\n{existing}")
+                    to_summarize.extend(entries)
+
+                logger.info(
+                    "[realtime] Summarizing %d realtime memory entries...", len(entries)
+                )
+                new_summary: str = self._summarizer.summarize(to_summarize)
+                if not new_summary:
+                    self._summary_failures += 1
+                    log = logger.error if self._summary_failures >= 2 else logger.warning
+                    log(
+                        "[realtime] realtime memory summarize produced nothing "
+                        "(%d in a row) — %d entries stay unsummarized",
+                        self._summary_failures, len(entries),
+                    )
+                    return
+                self._summary_failures = 0
+                # Enforce the floor cap at WRITE time — the summary is
+                # billed every turn and re-fed as [Previous summary] input
+                # to the next summarize, so an uncapped write compounds.
+                if len(new_summary) > self._summary_max_chars:
+                    fitted: str = fit_summary(new_summary, self._summary_max_chars)
+                    logger.warning(
+                        "[realtime] summary over cap %d → %d chars "
+                        "(dropped oldest history bullets)",
+                        len(new_summary), len(fitted),
+                    )
+                    new_summary = fitted
+                with self._realtime_memory_lock:
+                    self._summary_path.write_text(
+                        new_summary + "\n", encoding="utf-8"
+                    )
+                    # Only remove the lines we read — keep any new entries added during summarization
+                    current_lines: list[str] = (
+                        self._realtime_memory_path.read_text(encoding="utf-8")
+                        .strip()
+                        .splitlines()
+                    )
+                    remaining: list[str] = current_lines[lines_read:]
+                    self._realtime_memory_path.write_text(
+                        "\n".join(remaining) + "\n" if remaining else "",
+                        encoding="utf-8",
+                    )
+                logger.info(
+                    "[realtime] Realtime memory summarization complete → summary.md (kept %d new entries)",
+                    len(remaining),
+                )
+            except Exception as e:
+                logger.exception(
+                    "[realtime] Failed to summarize realtime memory due to %s", e
+                )
+
+    def build_instructions(self) -> str:
+        """Build the full per-turn instruction "floor" from all context sources and log its size breakdown."""
+        sections: list[str] = []
+        sizes: list[tuple[str, int]] = []
+
+        def add(label: str, text: str) -> None:
+            if text:
+                sections.append(text)
+                sizes.append((label, len(text)))
+
+        add("prompt", self._load_system_prompt())
+
+        identity: str = self.load_device_context()
+        identity_rules: str = (
+            "(Reading rules: SOUL.md describes WHAT you are — your kind and "
+            "character; kind words there may look like names. Your actual "
+            f"given name is the **Name:** value in {self.IDENTITY_NAME_FILE} — it is "
+            "authoritative, overrides any name-like word elsewhere in this "
+            "section, and is where renames land.)"
+        )
+        add(
+            "identity",
+            f"# DEVICE IDENTITY\n\n{identity_rules}\n\n{identity}" if identity else "",
+        )
+
+        add("wake_names", wake_names_section(_wake_names()))
+
+        catalog: str = self.load_skills_catalog()
+        add("skills", f"# SKILLS CATALOG\n\n{catalog}" if catalog else "")
+
+        device_mem: list[str] = self.load_device_memory()
+        add("device_mem", "# DEVICE MEMORY\n\n" + "\n\n".join(device_mem) if device_mem else "")
+
+        rt_mem: list[str] = self.load_realtime_memory()
+        add("realtime_mem", "# REALTIME MEMORY\n\n" + "\n\n".join(rt_mem) if rt_mem else "")
+
+        if self._provider == "gemini":
+            # Restate routing after memory so Gemini makes the function call instead of a promise-only answer.
+            add("routing", (RESOURCES_DIR / "routing_prompt_gemini.md").read_text(
+                encoding="utf-8").strip())
+
+        # Last so it supersedes the addressed-speech rules above (ROBOT.md opt-in).
+        if _device_answers_overheard_speech():
+            add("overheard", self._render_prompt_file(RESOURCES_DIR / "answer_overheard_override.md"))
+
+        result: str = "\n\n".join(sections)
+        total: int = len(result)
+        breakdown: str = "  ".join(f"{label}={c}c(~{c // 4}t)" for label, c in sizes)
+        logger.info(
+            "[realtime] floor breakdown: total=%dc (~%dt billed EVERY turn) | %s",
+            total,
+            total // 4,
+            breakdown,
+        )
+        return result
+
+    def add_turn(self, user_text: str, agent_text: str) -> None:
+        """Save a conversation turn to both working memory and raw archive."""
+        entry: dict[str, Any] = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "user": user_text,
+            "agent": agent_text,
+        }
+        line: str = json.dumps(entry, ensure_ascii=False) + "\n"
+        try:
+            with self._realtime_memory_lock:
+                self._realtime_memory_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(self._realtime_memory_path, "a", encoding="utf-8") as f:
+                    f.write(line)
+                with open(self._raw_memory_path, "a", encoding="utf-8") as f:
+                    f.write(line)
+            self._trim_memory_if_needed()
+        except Exception as e:
+            logger.warning("[realtime] Failed to save realtime memory: %s", e)
+
+    @staticmethod
+    def _format_jsonl_entry(line: str) -> str:
+        """Parse a JSONL line into a formatted string. Returns empty string on failure."""
+        try:
+            entry: dict[str, Any] = json.loads(line)
+            ts: str = entry.get("ts", "")
+            user: str = entry.get("user", "")
+            agent: str = entry.get("agent", "")
+            return f"[{ts}] User: {user} | Agent: {agent}"
+        except (json.JSONDecodeError, KeyError):
+            return ""
+
+    @staticmethod
+    def _parse_jsonl_lines(lines: list[str]) -> list[str]:
+        """Parse multiple JSONL lines into formatted strings, skipping failures."""
+        entries: list[str] = []
+        for line in lines:
+            formatted: str = ContextManagerBase._format_jsonl_entry(line)
+            if formatted:
+                entries.append(formatted)
+        return entries
+
+    def _load_system_prompt(self) -> str:
+        """Load provider-specific system prompt with {language} placeholder resolved."""
+        prompt_path: Path = self.PROVIDER_PROMPT_PATHS.get(
+            self._provider, self.DEFAULT_PROMPT_PATH
+        )
+        if not prompt_path.exists():
+            prompt_path = self.DEFAULT_PROMPT_PATH
+        return self._render_prompt_file(prompt_path)
+
+    def _render_prompt_file(self, path: Path) -> str:
+        """Read a prompt resource with its {language} placeholder resolved; '' if missing."""
+        try:
+            template: str = path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            return ""
+        lang_name: str = self.LANGUAGE_NAMES.get(self._language, self._language)
+        return template.replace("{language}", lang_name)
+
+    def load_realtime_memory(self) -> list[str]:
+        """Load existing summary + latest entries from realtime memory JSONL."""
+        with self._realtime_memory_lock:
+            return self._load_realtime_memory_unlocked()
+
+    def _read_summary_for_refeed(self) -> str:
+        """summary.md with its stale `## Open requests` / `## Current activity` removed."""
+        try:
+            existing: str = self._summary_path.read_text(encoding="utf-8").strip()
+            now_s: float = time.time()
+            file_age_s: float = now_s - self._summary_path.stat().st_mtime
+        except Exception as e:
+            logger.warning("[realtime] Failed to read summary: %s", e)
+            return ""
+        if not existing:
+            return ""
+        trimmed: str = expire_open_requests(existing, now_s, file_age_s, self._open_request_ttl_s)
+        if trimmed != existing:
+            logger.info("[realtime] dropped stale open requests from summary (file age %.0fs)", file_age_s)
+        # Same TTL: an activity untouched this long was abandoned (#449).
+        fresh: str = expire_current_activity(trimmed, now_s, file_age_s, self._open_request_ttl_s)
+        if fresh != trimmed:
+            logger.info("[realtime] dropped stale current activity from summary")
+        return fresh
+
+    def _load_realtime_memory_unlocked(self) -> list[str]:
+        entries: list[str] = []
+
+        if self._summary_path.exists():
+            summary: str = self._read_summary_for_refeed()
+            if summary:
+                entries.append(f"[Previous summary]\n{summary}")
+
+        if not self._realtime_memory_path.exists():
+            return entries
+
+        try:
+            lines: list[str] = (
+                self._realtime_memory_path.read_text(encoding="utf-8")
+                .strip()
+                .splitlines()
+            )
+        except Exception as e:
+            logger.warning("[realtime] Failed to read realtime memory: %s", e)
+            return entries
+
+        # Verbatim turns have their own budget, separate from the summary's
+        # (REALTIME_SUMMARY_MAX_CHARS). Sharing one left ~3k chars of turns
+        # next to a full summary, and the turns it dropped were not summarized
+        # yet (#449).
+        total_chars: int = 0
+        selected_lines: list[str] = []
+        for line in reversed(lines):
+            formatted: str = self._format_jsonl_entry(line)
+            if not formatted:
+                continue
+            if total_chars + len(formatted) > self._realtime_memory_max_chars:
+                break
+            selected_lines.append(formatted)
+            total_chars += len(formatted)
+        selected_lines.reverse()
+        entries.extend(selected_lines)
+        return entries
+
+    def _trim_memory_if_needed(self) -> None:
+        """Summarize working memory in background and trim raw archive."""
+        try:
+            needs_summarize: bool = False
+
+            if self._realtime_memory_path.exists() and self._summarizer:
+                with self._realtime_memory_lock:
+                    raw: str = self._realtime_memory_path.read_text(
+                        encoding="utf-8"
+                    ).strip()
+                    # Measured the way the loader counts (formatted entries),
+                    # against the verbatim budget, with headroom so the
+                    # summary lands before the loader starts dropping turns.
+                    verbatim_chars: int = sum(
+                        len(self._format_jsonl_entry(line)) for line in raw.splitlines()
+                    )
+                    needs_summarize = verbatim_chars > (
+                        self._realtime_memory_max_chars
+                        * app_config.REALTIME_SUMMARIZE_AT_FRACTION
+                    )
+
+            with self._realtime_memory_lock:
+                if self._raw_memory_path.exists():
+                    raw_lines: list[str] = (
+                        self._raw_memory_path.read_text(encoding="utf-8")
+                        .strip()
+                        .splitlines()
+                    )
+                    if len(raw_lines) > self._max_memory_entries:
+                        kept: list[str] = raw_lines[-self._trim_keep :]
+                        self._raw_memory_path.write_text(
+                            "\n".join(kept) + "\n", encoding="utf-8"
+                        )
+                        logger.info(
+                            "Trimmed memory_raw.jsonl: %d → %d entries",
+                            len(raw_lines),
+                            len(kept),
+                        )
+
+            # One summarize at a time: with the earlier trigger every turn
+            # during a slow summarize would otherwise queue another thread.
+            if needs_summarize and not self._realtime_summarize_lock.locked():
+                logger.info(
+                    "[realtime] Memory.jsonl exceeds char limit — summarizing in background"
+                )
+                threading.Thread(
+                    target=self.summarize_realtime_memory,
+                    daemon=True,
+                    name="rt-summarize",
+                ).start()
+
+        except Exception as e:
+            logger.warning("[realtime] Failed to trim realtime memory: %s", e)

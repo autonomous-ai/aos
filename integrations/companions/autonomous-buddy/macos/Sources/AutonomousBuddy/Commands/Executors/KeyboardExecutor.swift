@@ -1,0 +1,178 @@
+import AppKit
+import CoreGraphics
+import Foundation
+
+struct TypeTextExecutor: Executor {
+    let action = "type_text"
+
+    func execute(params: [String: Any]) async throws -> [String: Any] {
+        guard let text = params["text"] as? String else { throw ExecutorError.missingParam("text") }
+        let delayMs = try ExecutorParameters.integer(params, "delay_ms", default: 15, range: 0...1000)
+        guard text.utf16.count <= 100_000 else { throw ExecutorError.invalidParam("text too long") }
+        let target = try KeyboardFocusGuard.parseTarget(params["app"])
+        try Task.checkCancellation()
+        let focus = try await KeyboardFocusGuard.resolve(target: target)
+        try Task.checkCancellation()
+
+        guard AccessibilityCheck.isTrusted() else {
+            AccessibilityCheck.requestPrompt()
+            throw ExecutorError.permissionDenied("Accessibility access required for typing")
+        }
+        guard let source = CGEventSource(stateID: .hidSystemState) else {
+            throw ExecutorError.actionFailed("could not create event source")
+        }
+
+        for scalar in text.unicodeScalars {
+            try Task.checkCancellation()
+            let utf16 = Array(String(scalar).utf16)
+            guard let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
+                  let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false) else {
+                throw ExecutorError.actionFailed("could not create keyboard event")
+            }
+            keyDown.flags = []
+            keyUp.flags = []
+            utf16.withUnsafeBufferPointer { buf in
+                if let base = buf.baseAddress {
+                    keyDown.keyboardSetUnicodeString(stringLength: buf.count, unicodeString: base)
+                    keyUp.keyboardSetUnicodeString(stringLength: buf.count, unicodeString: base)
+                }
+            }
+            try await focus.postPair(down: keyDown, up: keyUp)
+            if delayMs > 0 {
+                try await Task.sleep(nanoseconds: UInt64(delayMs) * 1_000_000)
+            }
+        }
+        return ["typed_chars": text.count]
+    }
+}
+
+struct KeyComboExecutor: Executor {
+    let action = "key_combo"
+
+    func execute(params: [String: Any]) async throws -> [String: Any] {
+        guard let keys = params["keys"] as? [String], !keys.isEmpty else {
+            throw ExecutorError.invalidParam("keys")
+        }
+        let (flags, code) = try Self.parse(keys: keys)
+        let target = try KeyboardFocusGuard.parseTarget(params["app"])
+        try Task.checkCancellation()
+        let focus = try await KeyboardFocusGuard.resolve(target: target)
+        try Task.checkCancellation()
+        guard AccessibilityCheck.isTrusted() else {
+            AccessibilityCheck.requestPrompt()
+            throw ExecutorError.permissionDenied("Accessibility access required for key combos")
+        }
+        guard let source = CGEventSource(stateID: .hidSystemState),
+              let keyDown = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: true),
+              let keyUp = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: false) else {
+            throw ExecutorError.actionFailed("could not create event")
+        }
+        keyDown.flags = flags
+        keyUp.flags = flags
+        try await focus.postPair(down: keyDown, up: keyUp)
+        return ["dispatched": true]
+    }
+
+    static func parse(keys: [String]) throws -> (CGEventFlags, CGKeyCode) {
+        guard keys.count <= 6 else { throw ExecutorError.invalidParam("keys") }
+        var flags: CGEventFlags = []
+        var keyCode: CGKeyCode?
+        for raw in keys {
+            let k = raw.lowercased()
+            switch k {
+            case "cmd", "command", "meta": flags.insert(.maskCommand)
+            case "shift": flags.insert(.maskShift)
+            case "opt", "option", "alt": flags.insert(.maskAlternate)
+            case "ctrl", "control": flags.insert(.maskControl)
+            case "fn": flags.insert(.maskSecondaryFn)
+            default:
+                guard let code = KeyMap.code(for: k) else {
+                    throw ExecutorError.invalidParam("unknown key: \(raw)")
+                }
+                guard keyCode == nil else {
+                    throw ExecutorError.invalidParam("exactly one non-modifier key required")
+                }
+                keyCode = code
+            }
+        }
+        guard let code = keyCode else {
+            throw ExecutorError.invalidParam("no non-modifier key in combo")
+        }
+        return (flags, code)
+    }
+}
+
+enum KeyMap {
+    static let map: [String: CGKeyCode] = [
+        "a": 0, "s": 1, "d": 2, "f": 3, "h": 4, "g": 5, "z": 6, "x": 7, "c": 8, "v": 9,
+        "b": 11, "q": 12, "w": 13, "e": 14, "r": 15, "y": 16, "t": 17,
+        "1": 18, "2": 19, "3": 20, "4": 21, "6": 22, "5": 23,
+        "=": 24, "9": 25, "7": 26, "-": 27, "8": 28, "0": 29,
+        "]": 30, "o": 31, "u": 32, "[": 33, "i": 34, "p": 35,
+        "return": 36, "enter": 36, "ret": 36,
+        "l": 37, "j": 38, "'": 39, "k": 40, ";": 41, "\\": 42,
+        ",": 43, "/": 44, "n": 45, "m": 46, ".": 47,
+        "tab": 48, "space": 49, "spc": 49, "`": 50,
+        "delete": 51, "backspace": 51, "bs": 51,
+        "escape": 53, "esc": 53,
+        "f1": 122, "f2": 120, "f3": 99, "f4": 118,
+        "f5": 96, "f6": 97, "f7": 98, "f8": 100,
+        "f9": 101, "f10": 109, "f11": 103, "f12": 111,
+        "left": 123, "right": 124, "down": 125, "up": 126,
+        "home": 115, "end": 119, "pageup": 116, "pagedown": 121,
+        "fwd_delete": 117, "forward_delete": 117,
+    ]
+
+    static func code(for key: String) -> CGKeyCode? {
+        return map[key]
+    }
+}
+
+// A named-app command pins the current foreground process once, then checks it
+// immediately before each complete key pair. It never activates another app.
+struct KeyboardFocusGuard {
+    let target: String?
+    let processID: pid_t?
+
+    static func parseTarget(_ value: Any?) throws -> String? {
+        guard let value else { return nil }
+        guard let target = value as? String else { throw ExecutorError.invalidParam("app") }
+        let trimmed = target.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed.utf8.count <= 1024 else { throw ExecutorError.invalidParam("app") }
+        return trimmed
+    }
+
+    @MainActor
+    static func resolve(target: String?) throws -> KeyboardFocusGuard {
+        try Task.checkCancellation()
+        guard let target else { return KeyboardFocusGuard(target: nil, processID: nil) }
+        guard let frontmost = NSWorkspace.shared.frontmostApplication else {
+            throw ExecutorError.actionFailed("target app is not frontmost; observe and activate it before keyboard input")
+        }
+        let resolvedURL = OpenAppExecutor.resolveAppURL(named: target)?.standardizedFileURL
+        let matches = frontmost.localizedName == target || frontmost.bundleIdentifier == target
+            || frontmost.bundleURL?.lastPathComponent == target
+            || (resolvedURL != nil && frontmost.bundleURL?.standardizedFileURL == resolvedURL)
+        guard matches else {
+            throw ExecutorError.actionFailed("target app is not frontmost: \(target); observe before keyboard input")
+        }
+        return KeyboardFocusGuard(target: target, processID: frontmost.processIdentifier)
+    }
+
+    func validate(frontmostPID: pid_t?) throws {
+        guard let processID else { return }
+        guard processID > 0, frontmostPID == processID else {
+            throw ExecutorError.actionFailed("focus changed away from target app: \(target ?? ""); input stopped, observe partial results")
+        }
+    }
+
+    @MainActor
+    func postPair(down: CGEvent, up: CGEvent) throws {
+        try Task.checkCancellation()
+        try validate(frontmostPID: NSWorkspace.shared.frontmostApplication?.processIdentifier)
+        // No suspension/cancellation between down and up: a focus change must
+        // not leave a held modifier or key. Already posted input is not undone.
+        down.post(tap: .cghidEventTap)
+        up.post(tap: .cghidEventTap)
+    }
+}

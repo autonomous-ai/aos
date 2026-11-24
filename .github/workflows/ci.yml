@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  go:
+    name: Go (system) — build · vet · test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+      - name: build
+        run: go build ./...
+      - name: vet
+        run: go vet ./...
+      - name: test
+        run: go test ./...
+
+  web:
+    name: Web (system/web) — typecheck · build · lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: system/web/package-lock.json
+      - name: install
+        working-directory: system/web
+        run: npm ci
+      - name: typecheck + build
+        working-directory: system/web
+        run: npm run build
+      # Two intentional exhaustive-deps warnings remain; eslint exits 0 on warnings.
+      - name: lint
+        working-directory: system/web
+        run: npm run lint
+
+  python:
+    name: Python (hal) — unit tests · syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: syntax check every tracked Python source (including routes)
+        run: python -B scripts/ci/check_python_syntax.py
+      - name: Python syntax gate regression tests
+        run: python -B -m unittest discover -s scripts/ci -p 'test_*.py' -v
+      # Catches broken/moved local imports that py_compile misses (stdlib only).
+      - name: hal lint (broken / moved-away local imports)
+        run: python hal/scripts/lint.py
+      - name: unit tests (board + device — no hardware deps)
+        run: python -m unittest hal.test.test_board hal.test.test_device hal.test.test_safety -v
+      - name: HAL route contracts (no hardware deps)
+        run: python -B -m unittest hal.test.test_route_contracts -v
+      - name: Hermes Jev plugin tests (mock proxy, no credentials)
+        run: python -B -m unittest discover -s runtimes/hermes/plugins/jev -p 'test_*.py' -v
+      # Go-embedded Python patches need fixture-based contract tests.
+      - name: Hermes runtime patch contracts (generated Python + idempotence)
+        run: python -B -m unittest discover -s runtimes/hermes -p '*_test.py' -v
+      - name: Buddy helper tests (mock transport, no desktop actions)
+        run: python -B -m unittest discover -s skills/computer-use/tests -p 'test_*.py' -v
+      - name: Radio drama helper tests (mock catalog and HAL, no network)
+        run: python -B -m unittest discover -s skills/radio-drama/tests -p 'test_*.py' -v
+      - name: conformance suite (CTS — devices vs COMPATIBILITY.md)
+        run: python -m unittest discover -s robots/contract/cts -v
+      # Checks the setup.sh SKILLS_CATALOG block that TestCatalogMatchesTree cannot see.
+      - name: skill catalog matches the skills/ tree
+        run: python3 scripts/skills/gen_catalog.py --check
+
+  lamp-os-package:
+    name: lampOS OTA package — adapter and release contracts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: release package and transaction contracts
+        run: |
+          python3 -m unittest discover -s scripts/release/tests
+          python3 -m unittest discover -s scripts/provision/tests -p test_software_update_services.py
+          bash -n scripts/release/upload-lamp-os.sh scripts/release/lamp-os-build-container.sh scripts/provision/software-update
+      - name: adapter formatting, lint and tests
+        run: |
+          cargo fmt --manifest-path scripts/release/lamp-os-adapter/Cargo.toml -- --check
+          cargo clippy --locked --manifest-path scripts/release/lamp-os-adapter/Cargo.toml --all-targets -- -D warnings
+          cargo test --locked --manifest-path scripts/release/lamp-os-adapter/Cargo.toml

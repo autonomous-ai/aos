@@ -1,0 +1,14 @@
+{
+  "boards": {
+    "orangepi_sun60": {
+      "chip": 0,
+      "lines": [
+        37,
+        96,
+        97,
+        98
+      ],
+      "detect": true
+    }
+  }
+}

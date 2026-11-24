@@ -1,0 +1,638 @@
+# Safety Engine (Bộ máy An toàn)
+
+Safety engine thực thi các **giới hạn (bounds)** trong `SAFETY.md` của thiết bị một
+cách **tất định, ngay trong runtime**, *dưới* tầng agent. Đây là cơ chế hiện thực
+nguyên tắc số một trong `robots/contract/SAFETY-SPEC.md`: *an toàn nằm dưới bộ não.* Agent
+yêu cầu hành động; engine quyết định — trên **mọi** yêu cầu, bất kể ai phát ra —
+phần cứng có được phép thực thi không và trong giới hạn nào.
+
+> **Trạng thái:** Slice 1 (trần độ sáng) đã **được hiện thực và thực thi** —
+> `hal/safety/policy.py` + gate LED trong `rgb_service.py`, nạp từ
+> `robots/lamp/SAFETY.md`. Các slice sau tái dùng cùng loader + gate. Mỗi dòng bảng
+> dưới được đánh dấu đã-thực-thi / dự-trữ. Tài liệu này bám theo code, không ngược lại.
+
+## Vì sao cần engine, không phải nhắc (prompt) agent
+
+Định tuyến an toàn qua mô hình ngôn ngữ là không đáng tin — nó có thể bị thuyết phục
+bỏ qua việc từ chối, có thể bịa ra giới hạn, và **không** đảm bảo được một hành động
+đã *không* xảy ra. Guard mode trong codebase này đã từng được dựng lại để gửi cảnh báo
+một cách tất định cũng vì lý do đó. Safety engine tổng quát hóa điều này: **runtime**,
+không phải gateway, là điểm duy nhất clamp/chặn/dừng.
+
+## Kiến trúc
+
+Ba tầng, soi gương tầng thiết bị (`ROBOT.md` → capability → route → driver):
+
+```
+SAFETY.md front matter        các giới hạn đã khai (contract máy đọc; theo capability group)
+        │  resolve qua ROBOT.md safety_ref (path hoặc http), parse lúc boot
+        ▼
+hal/safety/policy.py        SafetyPolicy thuần + gate functions (không IO, unit-testable)
+        │  clamp_brightness(requested) -> min(requested, ceiling)   [slice 1]
+        ▼
+HAL capability routes          gọi gate TRƯỚC khi actuate (led, sau này servo/music)
+        │  tất định, in-process, agent không bypass được
+        ▼
+phần cứng
+```
+
+- **`SAFETY.md` front matter** — các bound, keyed theo capability group. Schema + bảng
+  field: `robots/contract/SAFETY-SPEC.md`.
+- **`hal/safety/policy.py`** — loader thuần (parse front-matter bằng regex,
+  dependency-free, cùng kỷ luật với `hal/board/device.py`) tạo ra `SafetyPolicy`
+  có kiểu, kèm các gate function thuần. Không phần cứng, không tác dụng phụ về đồng hồ,
+  unit-testable hoàn toàn off-hardware.
+- **Các route** — mỗi capability route hỏi gate tại điểm actuate. Route LED clamp độ
+  sáng; sau này route servo clamp speed/accel và đảm bảo `stop`. Vì gate là một lời gọi
+  hàm nằm trên đường yêu cầu, không có đường nào vòng qua nó.
+
+Policy được nạp một lần lúc boot (cùng `DeviceProfile`) và lộ ra qua endpoint thiết bị
+để các bound khai báo quan sát được: `GET /device` đã trả `safety_ref`; các bound
+resolve cũng hiện ở đó.
+
+## Ngữ nghĩa fail-safe
+
+Theo mức tới hạn của từng capability (quy tắc đầy đủ ở `robots/contract/SAFETY-SPEC.md`):
+
+| Capability | Bound vắng / không nạp được | Lý do |
+|------------|------------------------------|-------|
+| light, audio, motion | pass-through (chỉ log) | enforcement theo sự hiện diện và đồng nhất: bound có khai thì thực thi, vắng thì thôi — engine không bao giờ bịa ra giới hạn không ai khai |
+
+`SAFETY.md` là tùy chọn. Tag `schema` được validate như của `ROBOT.md` — `schema`
+thiếu hoặc major lạ sẽ abort boot thay vì thực thi một ABI không đọc được.
+
+Không có kill-switch riêng: vì enforcement theo sự hiện diện, **xóa một section (hoặc cả
+front matter) là cách tắt enforcement đó**. Muốn chạy device với motion không giới hạn
+lúc bring-up thì đừng khai `motion:` bounds — đó chính là trạng thái *tắt*. Một bound
+*sai định dạng* (có nhưng ngoài khoảng, vd `max_speed: 0`) vẫn fail loud; chỉ *vắng mặt*
+mới là pass-through.
+
+## Lộ trình slice
+
+| Slice | Phạm vi | Gate | Thực thi ở đâu | Trạng thái |
+|-------|---------|------|----------------|-----------|
+| 1 | trần `light.max_brightness` | `clamp_brightness` / `clamp_color` | gate LED (`rgb_service` `_handle_solid`/`_handle_paint`) | **đã thực thi (v1)** |
+| 2 | `quiet_hours` (light + audio) | `active_max_brightness` (theo giờ) + `audio_quiet_now` | gate LED + route music | **đã thực thi (v1)** |
+| 3 | `motion.max_speed` (theo sự hiện diện) | `min_move_duration` | route servo | **đã thực thi (v1)** (`max_accel` dự trữ) |
+| 3b | `motion.stop_always` | — | — | **được khai báo / đảm bảo theo cấu trúc** — chưa có route-level gate nào dùng field này (xem bên dưới) |
+| 4 | trạng thái fail-safe (mất mạng/gateway → dừng tracking; lỗi board → cô lập `503`; `thermal.max_temp_c` → health event quá nhiệt SoC + dừng tracking; chạm vật cản → dừng tại chỗ (giữ torque) + chime + tạm dừng ngắn; giới hạn torque servo ở các khớp chịu trọng lượng; quá tải servo → cắt torque + chime + thử lại theo giờ; setup dự trữ) | hook WS-disconnect + `503` theo từng capability + monitor nhiệt (`thermal_over`/`read_soc_temp_c`) + guard contact + overload (`OverloadGuard`) | `services` khi gateway WS disconnect + route HAL/`/health` + `server.py` `_thermal_monitor` + `animation_service.py` `_overload_tick` | **thực thi một phần (v1)** (setup dự trữ) |
+| 5 | trần `audio.max_volume` | `clamp_volume` | route `/audio/volume`, phía trên chỗ rẽ nhánh loa/sink BT | **thực thi (v1)** |
+| 6 | `motion.max_cog_offset_mm` (theo sự hiện diện) | chấm trọng tâm toàn thân theo từng frame (`recording_stability.py`) | lúc load recording (`resample_recording`), cả driver thật lẫn mock; `POST /servo/move` và `/servo/nudge` thì cắt ngắn tư thế | **thực thi (v1)** |
+| 7 | `motion.joint_limits` (theo sự hiện diện) | kẹp `[min, max]` theo từng khớp (`LeLampFollower.send_action`) | mọi lần ghi `Goal_Position` trên driver feetech — recording, tracking/gaze/aim, `/servo/move`, nudge, web; log `[joint-limits]` (tối đa 1 lần/giây). Lamp: hợp của dải mà recording, aim preset và tracking dùng, cộng 5° (`base_yaw` ±105, `base_pitch` −2..67, `elbow_pitch` −11..77, `wrist_roll` ±60, `wrist_pitch` −89..57), nên không thứ gì đã ship bị đổi; nó chỉ chặn lệnh lạc | **thực thi (v1)** |
+
+Mỗi slice thêm field vào `SafetyPolicy` và gate function rồi nối một/nhiều route;
+loader và contract front-matter **không** đổi hình dạng giữa các slice (chỉ thêm field
+— ABI `autonomous.safety.v1`).
+
+## Kiểm chứng việc thực thi (verify enforcement)
+
+Một bound chỉ thực sự tồn tại nếu bạn *chứng minh* được nó giữ vững **và** agent không
+lách qua được. Mỗi slice được kiểm ở ba mức; bound chưa "xong" cho tới khi cả ba pass.
+(Khác với `robots/lamp/docs/security-test.md` — cái đó về security mạng/kiểm soát truy
+cập: port, RCE, CORS — không phải giới hạn actuation.)
+
+1. **Unit (gate thuần, off-hardware).** Gate là hàm thuần nên giới hạn của nó là một
+   bảng test: yêu cầu trên trần thì clamp về trần, yêu cầu dưới trần thì giữ nguyên,
+   bound vắng thì hành xử theo quy tắc fail-safe. Chạy trong CI không cần thiết bị.
+2. **Runtime (trên thiết bị, qua route thật).** Phát yêu cầu actuate qua HTTP và quan
+   sát giá trị *thực tế đẩy ra phần cứng*, không phải giá trị đã xin. Bound khai báo
+   cũng quan sát được ở `GET /device`, nên test khẳng định *request vs trần vs output
+   quan sát* khớp nhau.
+3. **Bypass audit (kiểm tra tới hạn của an toàn).** Xác nhận **không** có đường nào tới
+   actuator né được gate — phát cùng hành động qua **mọi** route có thể điều khiển nó
+   (đường agent, route trực tiếp, mọi endpoint raw/cấp thấp) và xác nhận mỗi đường đều
+   bị clamp. Bound thực thi trên một đường nhưng chạm được qua đường khác = chưa thực thi.
+
+### Slice 1 — trần độ sáng (checklist)
+
+- [x] **Unit:** `clamp_brightness(255)` với `max_brightness: 180` → `180`;
+      `clamp_brightness(120)` → `120`; không khai → giữ nguyên (pass-through).
+      `clamp_color` scale giữ hue (trắng→180,180,180; đỏ→180,0,0). Schema
+      thiếu/sai/major-lạ fail-loud. (`hal/test/test_safety.py`, 21 test.)
+- [x] **Runtime:** đã verify trên Lamp thật — `GET /device` trả
+      `"safety": {"light": {"max_brightness": 180}}`; `POST /led/solid` trắng đầy (255)
+      đọc lại `[180,180,180]`, `[100,50,0]` giữ nguyên, `[255,0,0]` → `[180,0,0]`.
+- [x] **Bypass audit:** gate nằm ở `rgb_service` `_handle_solid` / `_handle_paint` —
+      chokepoint duy nhất mọi lệnh ghi pixel đi qua. Mọi caller (route LED, effects,
+      app_state, scene, gpio_button, presence, smooth_animation, main) đều dùng
+      `dispatch(RGB_CMD_*)` → 2 handler đó; chỉ còn `_driver` ghi trực tiếp bên trong
+      chúng (sau clamp) + `clear()` (màu đen). Grep xác nhận không đường nào né.
+- [x] **Tất định:** `clamp_color` thuần, không hỏi caller — clamp giống hệt dù từ agent, Web UI hay `curl` thô —
+      gate không quan tâm ai xin.
+
+### Slice 2 — quiet hours (checklist)
+
+Quiet hours thêm chiều **thời gian**: trong khung giờ trong ngày, trần LED giảm và
+nhạc bị chặn (giờ wall-clock local; máy chạy cả ngày nên đây là giờ thực, không
+phải "tắt ban đêm"). Gate đọc đồng hồ mỗi request → đổi ngay ở ranh giới, không cần
+restart.
+
+Đồng hồ đọc qua `hal.clock.device_now()` — resolve **timezone hiện tại** của máy từ
+`/etc/timezone` (zoneinfo) mỗi lần gọi. Nhờ vậy khi user đổi múi giờ lúc đang chạy,
+quiet hours bám zone mới **ngay**, không cần restart HAL. (`datetime.now()` thường sẽ
+giữ timezone glibc cache lúc process khởi động.) Thiếu `/etc/timezone` (dev/macOS) thì
+fallback về giờ local naive.
+
+- [x] **Unit (clock inject):** `in_window` xử lý wrap nửa đêm (22:00→07:00 đúng lúc
+      23:00 và 06:00, sai lúc 12:00, loại trừ 07:00); `active_max_brightness` trả trần
+      giảm (40) trong khung, base (180) ngoài khung; `clamp_color((255,255,255),
+      now=23:00)` → `(40,40,40)`, `now=12:00` → `(180,180,180)`; `audio_quiet_now`
+      true trong khung, false ngoài / khi không có policy. (`hal/test/test_safety.py`.)
+- [x] **Runtime:** `GET /device` báo `safety.light.quiet_hours` +
+      `safety.audio.quiet_hours`. Đặt khung trùng giờ hiện tại → vòng LED kẹp xuống
+      trần giảm và `POST /audio/play` trả `{"status":"suppressed"}`; ngoài khung thì
+      bình thường.
+- [x] **Bypass audit:** trần quiet LED đi chung chokepoint `rgb_service`
+      `_handle_solid`/`_handle_paint` như slice 1 (không thêm đường). Chặn nhạc nằm ở
+      `/audio/play` — route duy nhất khởi động audio tùy ý (TTS cố ý miễn trừ).
+- [x] **Tất định:** kiểm tra khung giờ thuần khi truyền `now`; chỗ duy nhất không
+      thuần là đọc đồng hồ hệ thống, cô lập trong `policy._now()` để test inject giờ.
+
+### Slice 3 — motion (checklist)
+
+Motion **theo sự hiện diện**, cùng quy tắc với light/audio: bound có khai thì thực
+thi, vắng thì pass-through (device không khai `motion:` bounds sẽ chạy không giới
+hạn — đó là trạng thái *tắt*, không phải từ chối). `max_speed` enforce bằng **kéo
+dài duration** (move vẫn tới target, chỉ chậm lại) — không cắt cụt đích. Recovery
+(`release`/`zero`/`hold`/`stop`) không bao giờ bị gate để luôn safe được body.
+`stop_always` được parse và trả về như một phần policy đã khai báo, nhưng hiện chưa
+có HAL route nào dùng field này: tính chất recovery là cấu trúc (các route không bị
+gate), không phải policy gate được thực thi độc lập. `POST /servo/stop` chính là
+route mà tính chất đó tồn tại vì nó — cắt ngang move hoặc recording đang chạy rồi
+*giữ nguyên vị trí* (torque vẫn ON), không đọc bound nào, không nhận tham số nào.
+Nó KHÔNG phải `/servo/release` — cái đó đi về tư thế nghỉ rồi mới tắt torque; một
+lệnh dừng mà lại di chuyển trước là sai với mọi thân có bánh hoặc có chân (#201).
+
+`POST /servo/move` từ chối target joint không hữu hạn với 422. Khi có giới hạn `motion.max_speed`, mọi joint được yêu cầu phải có vị trí hiện tại hữu hạn; lỗi đọc pose, thiếu joint hoặc pose không hợp lệ trả 503 trước khi phát lệnh di chuyển. Không khai báo giới hạn này thì giữ nguyên pass-through. Không thêm giới hạn góc joint mới. `/servo/stop` dừng worker tracking trước khi kiểm tra kết nối motor, tránh để tracking chạy khi motor mất kết nối; vẫn trả 503 nếu không thể halt phần cứng.
+
+Vòng lặp vision-tracking cũng đã được gate, nhưng cần cơ chế riêng:
+`min_move_duration` không bound được nó vì không có đích nào để kéo dài duration,
+chỉ có speed profile theo từng frame. `cap_speed_dps` kẹp trần pursuit/saccade của
+chính vòng lặp (55 / 100 deg/s, `hal/drivers/tracking/constants.py`) xuống
+`motion.max_speed` đã khai báo, ngay tại chỗ duy nhất profile được chọn
+(`tracker_service.set_profile`). Hai hằng số đó là tuning, không phải giấy phép —
+trên Lamp (`max_speed: 120`) hôm nay không có gì bị kẹp; gate này dành cho thân nào
+khai trần thấp hơn.
+
+Recorded animation được gate lúc load chứ không phải từng frame. Recording được
+resample lên đúng lưới fps của vòng phát, và đoạn nào đòi hơn trần thì bị *giãn
+theo thời gian* — cùng kiểu suy giảm mà gate ở route dùng, áp theo từng đoạn nên
+recording chỉ chậm lại đúng chỗ bất khả thi, không chỗ nào khác
+(`hal/drivers/motors/recording_timing.py`, dùng chung cho driver thật và mock để
+simulator phát đúng thứ body phát). Trần là giá trị nhỏ hơn giữa giới hạn đo được
+của servo (`SERVO_MAX_DPS`, 250 deg/s) và `motion.max_speed` đã khai.
+
+Recorded animation còn được gate về **độ ổn định** chứ không chỉ tốc độ, tại đúng
+chokepoint lúc load. Mỗi joint có thể nằm trong dải của chính nó trong khi *tổ hợp*
+lại đẩy trọng tâm ra ngoài đế, và không bound theo từng joint nào diễn đạt được
+điều đó, nên `hal/drivers/motors/recording_stability.py` dựng lại trọng tâm toàn
+thân cho từng frame và **TỪ CHỐI** recording nào vươn xa trục đế hơn mức
+`motion.max_cog_offset_mm` cho phép. Khác với tốc độ, không có cách suy giảm nào
+làm một tư thế sắp lật trở nên an toàn — recording bị bỏ qua, nên chế độ hỏng là
+thiếu một animation, không phải crash. Hình học lấy từ chính URDF của thân qua khoá
+`urdf_ref` trong `ROBOT.md`; kiểm tra này theo sự hiện diện và bất hoạt nếu thiếu
+một trong hai khai báo, còn thân nào khai trần nhưng không có `urdf_ref` dùng được
+thì ghi log là không chấm được tư thế rồi pass-through chứ không fail-closed. Lamp
+khai 22 mm (đo được: clip bên thứ ba làm lật lamp-0c89 đạt đỉnh 31.6 mm, recording
+tệ nhất trong bộ ship là 17.7 mm, 28 cái còn lại ≤ 17.6 mm — xem
+`robots/lamp/docs/motion-playback.md`); chưa thân nào khác khai, nên không có gì
+khác đổi hành vi. Lệnh di chuyển trực tiếp cũng được chấm: `POST /servo/move` và
+`/servo/nudge` không từ chối tư thế vượt trần mà **cắt ngắn** nó (`limit_lean_back`),
+chỉ đi tới chỗ trọng tâm còn trong trần, và `/servo/move` báo mục tiêu thực gửi
+trong `clamped`. Các vòng lặp thị giác (tracking, gaze, aim) cắt y như vậy với trần
+riêng chặt hơn 16 mm (`MAX_LEAN_BACK_MM`), vì mặt nằm trên khung hình khiến chúng
+cứ đòi ngẩng thêm. Mỗi thân phải tự suy ra con số từ thư viện animation của chính
+nó — đó là milimet theo hình học và khối lượng của thân đó, không phải hằng số để
+chép lại.
+
+Recorded move trên đường SDK của Reachy được gate theo kiểu khác, vì driver
+KHÔNG sở hữu vòng phát: `ReachyMotionService` giao trajectory cho
+`mini.play_move()` rồi daemon Pollen stream nó. Không có frame nào để làm chậm,
+nên move được **quét trước khi phát và bị TỪ CHỐI** nếu tốc độ xoay đầu đỉnh
+vượt trần đã khai (`peak_head_dps`, `_move_refused`). Tốc độ đo bằng góc quay
+thật giữa hai hướng đầu trên cửa sổ ≥20 ms — sai phân từng trục euler bị vọt ở
+điểm gimbal, còn lấy từng cặp frame thô thì biến nhiễu timestamp thành tốc độ
+mà đầu không bao giờ đạt. Chuyển động **tịnh tiến** của đầu không bị bound:
+`max_speed` tính bằng deg/s còn `head_x/y/z` là milimet, và chưa body nào khai
+giới hạn tịnh tiến — không enforce thì không tuyên bố là có.
+
+Từ chối áp cho MỌI nguồn, kể cả thư viện chính chủ của Pollen, và đó là chủ ý:
+một move chính chủ rớt gate là bằng chứng con số đã khai bị sai, đặc cách theo
+nguồn sẽ che mất tín hiệu đó. `robots/reachy-mini/SAFETY.md` ghi rõ trần đó suy
+ra từ đâu và thứ gì vẫn cần robot thật mới xác nhận được.
+
+Đường Wi-Fi của Stack-chan giữ nguyên gate theo `duration` xuyên qua ranh giới
+process và mạng. `StackChanMotionService` gửi duration đã được kéo dài dưới dạng
+`duration_ms`, gia hạn một controller lease ngắn trong lúc firmware nội suy theo
+thời gian, rồi kết thúc lease bằng cách giữ tại vị trí đo được. Lệnh nhả torque
+ưu tiên hơn move đang chạy, đưa đầu về tư thế nghỉ cúi xuống thận trọng, rồi mới
+xác nhận tư thế đó từ phản hồi vị trí đo được trước khi tắt torque. Nếu không tới
+được tư thế nghỉ, driver halt-hold và giữ torque bật. Handshake bắt buộc
+firmware khai `motion.timed_move`, đọc vị trí thật, halt-and-hold và torque
+release. Nếu HAL, process hoặc Wi-Fi biến mất, firmware ESP32 hết hạn lease rồi
+dừng và giữ tại vị trí đo được; còn khi WebSocket bị đóng, firmware đang cài sẽ
+nhả torque và khởi động lại, vì vậy HAL giữ kết nối mở khi commissioning không
+đạt target; firmware chỉ có tham số spring
+speed chưa hiệu chuẩn sẽ bị từ chối vì không thể giữ đúng trần độ/giây đã khai.
+Đường này đã có test protocol phía host; fault injection trên Wi-Fi và phần cứng
+thật vẫn là bước qualification trên thiết bị.
+
+Driver cũng triển khai contract đếm số owner `MotionService.acquire_body()` /
+`release_body()` dùng cho look, capture và tracking. Khi các owner chồng lấn,
+`_tracking_active` giữ giá trị true cho tới khi owner cuối cùng thoát; xoá cờ
+tracking-session riêng không thể nhả quyền của owner khác. Ownership chỉ điều
+phối gaze và emotion trong HAL, tách biệt với controller lease của firmware.
+Nó không ngăn owner điều khiển chuyển động và không chặn đường halt luôn sẵn có.
+
+Transport Stack-chan kiểm tra lại mọi chuyển động có thời lượng dựa trên vị trí
+đo được và `motion.max_speed`, bao gồm về zero và gravity-rest. Khi release thay
+thế chuyển động đang chạy, driver halt-hold trước khi đo tư thế bắt đầu. Nếu
+không đọc được vị trí hoặc thời lượng an toàn vượt 60 giây, driver báo lỗi và
+không gửi chuyển động. Gateway chỉ công bố kết nối sau khi gửi `hello.accepted`,
+để lệnh chuyển động không vượt trước handshake.
+
+[Repo tích hợp Stack-chan](https://github.com/glifocat/stackchan-autonomous/tree/9a5209596b97c257b6b2c1f6ff6bec91c44f8112)
+cung cấp firmware patch và HTTP bridge độc lập. Demo Docker không khởi động
+`hal.server`, nên không phải test startup cho driver này. HAL đầy đủ vẫn cần
+profile khai báo `motion.driver: stackchan` và board của host. Firmware đã đối
+chiếu trả `completed` với state `scheduled` khi cài lịch chuyển động, chưa có
+nghĩa thân máy đã đến đích; `motion.halt` xóa lease, nên host acquire lại trước
+chuyển động tiếp theo. Việc khớp source không chứng minh qualification phần
+cứng hoặc xác định firmware thực tế đã flash trên thiết bị.
+
+Mọi chuyển động Stack-chan xác nhận vị trí đo được đã tới đích trước khi nhả
+controller lease. Trễ lập lịch firmware có thể kéo dài nội suy quá thời lượng
+yêu cầu, nên chỉ thời gian trên host không chứng minh chuyển động hoàn tất.
+HAL gia hạn lease trong lúc kiểm tra tới đích (sai số tối đa 1 độ), dùng khoảng
+chờ ổn định 2 giây trước khi halt và báo lỗi thay vì báo thành công. Từng request
+protocol vẫn chịu command timeout đã cấu hình.
+
+Commissioning home thuộc công cụ thử nghiệm riêng của Stack-chan, không thuộc
+contract motion chung của OS. Entrypoint chuẩn `hal.server:app` không có endpoint
+`/stackchan/*` hoặc `/servo/home*`. Schema HTTP và route thử nghiệm nằm trong
+`robots/_experimental/stackchan/commissioning.py`; driver Stack-chan thực thi
+frame tọa độ và giới hạn commissioning riêng. Route servo, model và contract
+`MotionService` dùng chung được giữ nguyên.
+
+Entrypoint thử nghiệm cung cấp `GET /stackchan/home` để discovery capability thụ
+động và `GET /stackchan/home/position` để đọc pan/tilt đo được trong
+`calibrated_home_deg_v1`; cả hai không acquire motion lease. Chuyển động mặc định
+bị tắt (`STACKCHAN_HOME_COMMISSIONING_ENABLED=0`). Khi được bật rõ ràng,
+`POST /stackchan/home/move` yêu cầu capability firmware `motion.home_degrees.v1`,
+frame tọa độ tường minh, chỉ target tilt từ 7 đến 10 độ và duration yêu cầu từ
+2 đến 10 giây. Safety policy có thể kéo dài duration tới 60 giây. Feedback ban
+đầu phải có pan trong ±30 độ và tilt trong [0, 5). Torque yaw tắt trong chuyển
+động chỉ có pitch này. Dưới 5 độ, stop hoặc mất transport có thể khiến torque
+tắt hoặc session lỗi; vẫn cần hỗ trợ cơ khí và giám sát trực tiếp.
+
+Trong mỗi chuyển động, kể cả lần lặp lại tùy chọn, driver đọc feedback sau khoảng
+chờ tối đa 250 ms hoặc nửa TTL của lease, lấy giá trị ngắn hơn. Độ trễ request
+cộng thêm vào khoảng này; command timeout đã cấu hình vẫn áp dụng. Feedback lỗi
+hoặc yaw lệch quá 1 độ sẽ kích hoạt halt mà không đợi hết duration. Giám sát theo
+mẫu không thể phát hiện mọi sai lệch giữa các lần đọc. Khi không tới đích sau
+settling, driver halt và trả các mẫu đo settling nhưng giữ kết nối. Lỗi firmware
+cũng giữ kết nối; command timeout vẫn đóng kết nối, và firmware đang dùng sẽ
+nhả torque rồi reboot khi mất kết nối. Không thể bảo đảm giữ vị trí thành công
+cho mọi lỗi, nhất là dưới ngưỡng giữ của firmware.
+
+Thành công yêu cầu pitch đo được trong sai số 1 độ so với target, ít nhất 6 độ
+và đã tiến dương ít nhất 1 độ. Nếu đầu dừng thiếu nhưng ổn định (các mẫu cuối
+trong 0,2 độ, đã tiến ít nhất 1 độ, đạt ít nhất 6 độ, thiếu hơn 1 nhưng không
+quá 3 độ), driver lặp lại đúng target tối đa một lần. Phản hồi ghi `recommands`.
+Chỉ khi đo được đã tới đích, `lease.release` mới cấp torque lại cho cả hai trục;
+sau đó driver đọc lại vị trí.
+
+Dùng `POST /stackchan/stop` và `POST /stackchan/release` của công cụ để chẩn đoán.
+Lỗi firmware trả 502 với `op`, `code`, `message`; các lỗi nhả lực khác được báo,
+gồm không tới đích và bị hủy, trả 502 với `message`, `errors`. Endpoint nhả lực
+thử nghiệm không báo thành công khi thao tác thất bại. `/servo/stop` và
+`/servo/release` chung giữ hành vi OS hiện có; chỉ phản hồi thành công của
+endpoint release cũ chưa chứng minh torque đã được nhả. Công cụ này không xác
+minh calibration hoặc qualification phần cứng để sử dụng thường xuyên.
+
+Driver Stack-chan vẫn ở giai đoạn thử nghiệm. Trước khi qualification thiết bị:
+
+- Xác định và pin bản firmware tương thích có các motion capability bắt buộc;
+  driver HAL này không bổ sung các capability đó vào firmware stock.
+- Kiểm tra WSS có xác thực và xác minh certificate trên ESP32 thật.
+- Xác nhận chuyển động có giới hạn hoàn tất, vị trí đo được và giới hạn duration
+  trên cụm pan/tilt thật.
+- Thử halt, mất Wi-Fi, mất process HAL và hết hạn lease khi đang chuyển động,
+  xác minh hành vi giữ vị trí và phục hồi trên phần cứng.
+- Hiệu chỉnh tư thế gravity-rest và xác nhận thực tế rằng torque chỉ được nhả
+  sau khi đã đo được tư thế đó.
+
+Test host và loopback, cũng như test face, LED hoặc speaker riêng, không hoàn tất
+các bước qualification chuyển động này.
+
+Chọn driver bằng `driver: stackchan` trong capability `motion` của device
+profile. Đặt `STACKCHAN_DEVICE_ID`, một `STACKCHAN_BODY_TOKEN` riêng dài ít nhất
+32 ký tự, cùng `STACKCHAN_BODY_TLS_CERT` và `STACKCHAN_BODY_TLS_KEY`.
+`STACKCHAN_BODY_HOST` (mặc định `0.0.0.0`) và `STACKCHAN_BODY_PORT` (mặc định
+`8765`) cấu hình listener; `STACKCHAN_BODY_COMMAND_TIMEOUT` (mặc định `3.0` giây)
+và `STACKCHAN_BODY_LEASE_TTL_MS` (mặc định `1500`, chấp nhận `250..5000`) cấu
+hình thời gian phát hiện lỗi. TLS là bắt buộc, trừ khi
+`STACKCHAN_BODY_ALLOW_INSECURE_WS=1` bật WebSocket không mã hoá một cách tường
+minh cho mạng phát triển cô lập. Không dùng tuỳ chọn này trong production.
+
+### Interface learned-policy (dry run)
+
+`POST /policy/run` hiện chỉ là interface cho learned controller như ACT hoặc
+SmolVLA. Endpoint validate và ghi log `policy` cùng `task`, trả về run record
+`dry_run`, và **không** import runtime inference, không lấy observation, cũng
+không gửi motor target. Vì chưa có target nên đây không phải đường vòng qua
+safety gate. Khi có execution thật, mọi target phải đi qua motion gate và
+`POST /servo/stop` phải huỷ policy worker trước rồi mới giữ nguyên body. Route
+`POST /policy/stop` xoá dry-run request mà không đụng motor; trên body có mount
+`/servo/stop`, route dừng phần cứng hiện có cũng gọi cancellation như vậy trước
+rồi mới giữ nguyên body.
+
+- [x] **Unit:** `min_move_duration` kéo dài move quá nhanh (120° @120 deg/s → 1.0s),
+      giữ move chậm, kẹp request tức thì (duration 0), pass-through khi không có
+      `max_speed` và khi không có policy nào, bỏ qua joint không biết vị trí đầu;
+      comment `# stop_always` không bị parse; `max_speed:0` fail-loud.
+      (`hal/test/test_safety.py`.)
+- [ ] **Runtime (CHƯA verify trên máy — bạn deploy):** `GET /device` báo
+      `safety.motion`; `/servo/move` duration nhỏ → trả `duration` đã kéo dài, move
+      ở tốc độ kẹp; device không có `motion:` bounds → chạy không giới hạn (không 403).
+- [x] **Bypass audit (route):** cap tốc độ áp ở `/servo/move` qua `min_move_duration`
+      (endpoint duy nhất nhận duration). LƯU Ý: animation nội bộ (idle/emotion do
+      runtime, không phải agent) chưa gate.
+- [x] **Tất định:** `min_move_duration` thuần (không clock, không xét caller).
+
+### Slice 4 — trạng thái fail-safe (checklist)
+
+Fail-safe **theo trạng thái** chứ không clamp từng request: khi thiết bị mất một phụ
+thuộc tới hạn, nó rơi về tư thế an toàn một cách tất định, *dưới* tầng agent. Sáu điều
+kiện đã thực thi; setup-incomplete còn dự trữ.
+
+- [x] **Mất mạng / gateway → dừng tracking do agent điều khiển.** Khi gateway
+      WebSocket disconnect, `runtimes/openclaw/service_ws.go` gọi
+      `hal.StopServoTracking()` (`system/lib/hal`) → HAL `POST /servo/track/stop`,
+      để body thôi đuổi theo một target không còn cập nhật vision mới. Best-effort và
+      được gác bởi `SetUpCompleted`. Lưu ý then chốt: thiết bị **không** đóng băng hay
+      "giữ pose" — animation idle local vẫn tiếp tục (nó local và vô hại) và các reflex
+      phục hồi (`motion.stop`/release, mute, sleep, wake) luôn sẵn sàng; chỉ tracking và
+      motion mới *do agent điều khiển* mới dừng.
+- [x] **Lỗi board / driver → cô lập `503`.** Đã có sẵn: capability bị lỗi trả `503`
+      theo từng route trong khi phần còn lại vẫn phục vụ, lộ ra qua `/health`. Không cơ
+      chế mới — contract fail-safe tái dùng cô lập đã có.
+- [x] **Nhiệt (quá nhiệt SoC) → health event + dừng tracking.** Theo sự hiện diện trên
+      `thermal.max_temp_c`: một monitor nền (`server.py` `_thermal_monitor`) đọc nhiệt độ
+      SoC từ `/sys/class/thermal` mỗi ~10s qua `policy.read_soc_temp_c`; gate hysteresis
+      thuần `policy.thermal_over` trip tại `max_temp_c` và clear tại `resume_temp_c`
+      (mặc định `max−10`). Khi trip nó set `state.thermal_over`, log, và dừng tracking tùy
+      ý; idle vẫn sống. Lộ ra ở `GET /health.thermal`. Ngưỡng đặc thù theo SoC — đọc
+      critical trip riêng của board, không đoán chung chung.
+- [ ] **Setup chưa xong → dự trữ.** Chưa gate trong runtime (chỉ reflex setup/identity
+      là ý định đã khai, chưa thực thi).
+- [x] **Chạm vật cản → dừng tại chỗ, chime, tạm dừng ngắn.** Dừng tay đèn khi nó va
+      vào vật gì đó lúc đang chuyển động. Dùng chung thread monitor, lần đọc
+      `Present_Load` và handler `on_overload` với cut-off quá tải bên dưới, và được cấu
+      hình trong cùng file: object `contact` tùy chọn (`load`, `hold_s`, `pause_s`, đúng
+      ba key đó) trong entry board; không có `contact` nghĩa là không có contact stop.
+      `load` là một sàn chung cho mọi khớp hoặc một map `{joint: floor}`, và khớp không có
+      trong map thì không được theo dõi. Khớp được theo dõi ở mức sàn của nó trở lên (Lamp:
+      `base_yaw` `550`, `wrist_roll` `750`, `wrist_pitch` `650`, đơn vị 0,1 % lực đẩy tối
+      đa) trong `contact.hold_s` (Lamp: `0.05` s, khoảng hai mẫu 50 ms) sẽ dừng chuyển
+      động đang chạy, và khớp nào vượt **envelope đã học** khi một recording đã học đang
+      chạy cũng vậy (xem đoạn tiếp theo); khi đó driver ghim tư thế hiện tại và giữ **torque bật**, nên tay đèn không rơi;
+      runtime dừng vision tracker qua `on_contact`, không phát âm thanh (bỏ chime vì
+      kêu quá thường xuyên, gây khó chịu).
+      Trong `contact.pause_s` (Lamp: `3` s)
+      mọi lệnh ghi goal bị chặn để không lái ngược vào vật cản, và `/servo/move`,
+      `/servo/aim`, `/servo/nudge` lỗi với "Servo contact stop active". Sau đó trạng thái
+      được đọc lại từ phần cứng và idle chạy tiếp; thân máy đã được park trong lúc đó thì
+      giữ nguyên. Contact stop được kiểm tra trước cut-off, và tay đang giữ mà vẫn bị ép
+      thì cut-off vẫn trip như cũ. Khi đặt `contact.release_after_s` (Lamp: `1` s), tay
+      vẫn **giữ** tay đèn lâu chừng đó trong lúc tạm dừng — khớp vừa dừng vẫn ở sàn đã làm
+      nó dừng trở lên (sàn tải hoặc lag của đường bao đã học nếu có) hoặc bị đẩy lệch thêm
+      1° (`CONTACT_RELEASE_LAG`) so với độ lệch nó tự ổn định ở 0,5 s sau khi ghim, độ lệch đó
+      tối đa tính 3° (`CONTACT_RELEASE_LAG_BASE_MAX`: ghim ở −72° mà không ai chạm,
+      `base_yaw` của lamp-75c9 vẫn gồng 40-45 % chống lực cáp và lệch 2,5-2,7°, nên ngưỡng
+      1° tuyệt đối làm nó rũ), nếu khớp đó có sàn contact cố định, hoặc khớp
+      có sàn cố định khác (`base_yaw`, hai khớp wrist) ở mức sàn mà lần dừng đó so với nó
+      (đường bao đã học tại đó, không cao hơn sàn cố định: trên lamp-75c9 tay giữ
+      `wrist_pitch` ở 32 % trên sàn đường bao 17 % trong khi `wrist_roll` làm dừng, và sàn
+      cố định 65 % giữ torque), hoặc khớp gánh trọng lượng vượt tải giữ đã học hay sàn
+      tải/lag `off_playback` — thì không phải va chạm thoáng qua: driver log
+      `[contact] … releasing torque` và chuyển sang cắt torque như cut-off (tay đèn rũ,
+      khoá `retry_s`, chime của cut-off). Hết khoá, lệnh resume kéo tay đèn đang rũ về với
+      lực tới trần torque, nên contact stop bỏ qua đoạn ramp đó (`duration` + 0,5 s): trên
+      lamp-75c9 nó từng dừng `base_yaw` ở 60 %, nhả lại và lặp mỗi lần khoá. Chạm rồi buông trong khoảng đó thì chỉ tạm dừng.
+      Sàn đã làm dừng quan trọng với đèn đã học: trên lamp-52e6 tay chặn `base_yaw` ở
+      39.6 % (đường bao 18 %) nhưng không giữ nổi tới sàn cố định 55 %, chỉ giữ ở 23-36 %; trên lamp-a0ae (`P=16`) tay
+      giữ `base_yaw` chỉ ở 12-16 % nhưng lệch 1.3-8.5°, còn `base_yaw` ghim yên không ai
+      chạm lệch 0.0°.
+      Khớp gánh trọng lượng (không có sàn cố định: `base_pitch`, `elbow_pitch`) không bao
+      giờ nhả theo sàn đã học: khi ghim, nó vẫn chịu tải trọng lực (và bị võng) tuỳ tư thế lúc dừng,
+      không phải tư thế đường bao đã học. Không ai chạm, `elbow_pitch` của lamp-a0ae dừng ở
+      38.0 % trên sàn 22.7 % rồi giữ 33.4 %, nên cộng 10 % vẫn rũ. Thay vào đó chúng nhả
+      theo tải **giữ đứng yên ở đúng tư thế đó** đã học (`HoldLearner`,
+      `hal/drivers/motors/hold_profile.py`): mỗi quãng mọi goal đứng yên (trong 0,5°) đủ
+      3 s pause với torque bật, có lượt học hay không, được lấy mẫu như pause thấy tay đèn
+      bị ghim, bỏ 0,5 s đầu cho lag của lần di chuyển trước tắt, cho tải và lag của
+      `base_pitch` / `elbow_pitch`. Đỉnh được giữ theo ô tư thế 5° x 5° (`base_pitch`,
+      `elbow_pitch`) và cập nhật như envelope học ngầm (2 quãng, giảm 50 % khoảng cách mỗi quãng, gấp đôi envelope vì đèn ít khi đứng yên đủ một pause, từ
+      sàn cố định nhưng không xuống dưới mức đã đo thật, nặng hơn thì tăng ngay; quãng của lượt học, giữ 4 s
+      ở tư thế cuối mỗi recording, đặt thẳng giá trị ô). Trong pause các khớp này nhả ở
+      đỉnh đã học cộng margin của profile, lấy đường bao của chính ô đó nâng theo mức đo
+      thật của các ô kề ±1 (không lấy đường bao của ô kề: ô kề mới học một lần còn sát sàn
+      cố định nó đang giảm từ đó, và trên lamp-75c9 một ô như vậy giữ ngưỡng nhả elbow của
+      ô đã học ở 51 % trong khi ô đó đo được 21 %), và chỉ khi mức đó dưới
+      sàn `off_playback` (với tải bị giới hạn thì dưới trần): tư thế chưa học, hoặc ô bị
+      tay đẩy lên, vẫn theo sàn `off_playback` hoặc cut-off như trước. Lưu tối đa mỗi phút
+      một lần vào `/var/lib/hal/contact_hold.json` (`HAL_CONTACT_HOLD_PATH`), bị bỏ như
+      envelope khi `torque_limit` đổi. Lộ ra ở `GET /health.servo_overload.contact` (`active`,
+      `resume_in_s`, `trips`, `last_trip`, các ngưỡng). Sàn của Lamp lấy từ lamp-52e6
+      (2026-10-09): qua 19 recording, đỉnh chuyển động tự do là `base_yaw` 46 %,
+      `wrist_roll` 52 %, `wrist_pitch` 43 %, còn lấy tay chặn `base_yaw` đẩy nó lên
+      94-100 %. `base_pitch` và `elbow_pitch` không có sàn cố định: do gánh trọng lượng tay
+      đèn, chúng lên 83-100 % khi chuyển động tự do, trong khi lấy tay chặn chỉ đọc được
+      36-74 %, nên một sàn cố định không phân biệt được hai trường hợp.
+      **Envelope đã học (như lượt học của cửa thang máy).** Load của một lượt chạy tự do ở
+      mỗi frame của recording lặp lại được, nên khi đặt `contact.profile_margin` (Lamp:
+      `120` = 12 %) driver giữ một envelope riêng cho từng máy ở
+      `/var/lib/hal/contact_profile.json` (`HAL_CONTACT_PROFILE_PATH`; không có bản mặc
+      định dùng chung, vì tải và ma sát khác nhau giữa các máy — envelope học trên
+      lamp-52e6 làm idle của lamp-a0ae dừng nhầm mỗi 8 giây — nên máy chưa tự học chỉ
+      chạy với các sàn cố định): `{recording: {joint:
+      [load tối đa mỗi frame], "lag:<joint>": [|goal - present| tối đa mỗi frame, 0,1
+      độ]}}`. Các entry lag có ích ở chỗ load bất lực: một khớp đang chạm trần torque,
+      hoặc một khớp mềm mà tay chỉ làm chậm lại, sẽ tụt sau goal của nó. Khi đặt
+      `contact.lag_margin` (Lamp: `35` = 3,5°), khớp nào trễ hơn lag đã học đúng mức đó
+      cũng tính là va chạm. Goal là giá trị `LeLampFollower.send_action` ghi gần nhất,
+      khi mọi khớp đều có một giá trị ghi trong giây vừa qua (`GOAL_CACHE_S`), nên mỗi
+      nhịp lúc phát recording chỉ đọc `Present_Load` và `Present_Position`; sau một lần
+      di chuyển raw, một lần bật/tắt torque, hoặc khi không có lần ghi nào gần như vậy,
+      `Goal_Position` được đọc lại từ servo. `POST /servo/contact/learn` (hoặc nút **Learn** ở mục Touch
+      Sensitivity trang Servo của web Monitor; `{"recordings": [...], "runs": 2}`; mặc định mọi recording trừ `music_*`) chạy tự do mỗi recording `runs` lần ở
+      nền và lưu giá trị tối đa từng frame; vùng quanh tay đèn phải trống, vì thứ gì nó
+      chạm vào đều được học là bình thường. Khi một recording đã học chạy frame của chính
+      nó, sàn của mọi khớp là envelope (tối đa trong ±3 frame) cộng margin, kể cả
+      `base_pitch` và `elbow_pitch`. Đoạn ramp vào recording không có envelope và giữ các
+      sàn cố định. Khi không recording nào sở hữu thân máy (quay nhìn theo gaze, tracking,
+      `/servo/move`, giữ tư thế) thì map tùy chọn `contact.off_playback` được áp thay: sàn
+      load theo tên khớp và sàn lag dạng `lag:<joint>` (Lamp: `base_pitch` 57 %,
+      không có sàn tải `elbow_pitch`, vì elbow của lamp-a0ae chạm trần torque 60 % ngay cả
+      khi nâng tay không ai chạm; lag `base_yaw` 10°, `base_pitch` 14°, `elbow_pitch` 12°,
+      `wrist_roll` 9°, `wrist_pitch` 12°, lưu theo 0,1 độ). Ở trần torque 60 % các khớp
+      trễ nhiều hơn: các sàn lấy từ dữ liệu trần 70 % đã trip nhầm 5 lần trong một lượt
+      học trên lamp-52e6, còn các sàn này không trip nhầm lần nào qua ~3 phút (6
+      recording + 90 s idle). Các sàn này đứng ngoài trong lúc một lệnh xoay trực tiếp chạy
+      (`move_to`/`move_to_raw`: gaze/search quay, aim, `/servo/move`, khởi động, zero, park) và thêm `OFF_PLAYBACK_SETTLE_S`
+      (0,5 s) sau đó, và cả đoạn ramp vào một recording (cờ idle đã ổn định còn bật sau khi
+      halt, và trên lamp-75c9 đoạn ramp về từ tư thế aim −72° làm `base_yaw` trễ 17° rồi dừng
+      ở sàn đứng yên 10°); lúc này chỉ còn các sàn cố định: lệnh nhanh chạy trước đà tăng tốc
+      của servo, và trên lamp-a0ae độ trễ đó (`wrist_roll` 12-14°) cùng tải lúc khởi động
+      (`elbow_pitch` 54 %) đã dừng tay đèn 0,2 s sau khi bắt đầu những lần xoay không ai
+      chạm. Máy đã học recording đang chạy — kể cả idle đã ổn định — dùng envelope của
+      chính nó thay cho `off_playback` (elbow nặng hơn của lamp-a0ae khi idle lên 54-60 %
+      so với sàn 52 % lấy từ lamp-52e6). Trên lamp-52e6, gaze cắt ngang phần lớn recording chỉ trong một giây mỗi
+      khi có người ngồi trước đèn, nên đây là chỗ tay người thường gặp tay đèn. Học lại
+      sau khi hiệu chuẩn lại tay đèn.
+      **Học ngầm** (`PassiveLearner` trong `hal/drivers/motors/contact_profile.py`) giữ
+      envelope luôn mới mà không cần lượt học: mỗi lần phát một recording (kể cả
+      `music_*`) được lấy mẫu như lượt học, và chỉ được tính khi chạy từ frame đầu tới
+      frame cuối mà không có contact stop, cut-off, di chuyển trực tiếp hay lượt học nào
+      xen vào. 5 lần chạy sạch gần nhất của mỗi recording được giữ trong RAM, và từ 2 lần
+      trở lên (bằng số lần một lượt học chạy) mỗi lần chạy sạch kéo envelope của
+      recording đó về phía chúng: giá trị tối đa từng frame khi chưa đủ 5 lần (lỏng
+      nhất), đủ 5 lần thì giá trị lớn thứ hai, nên một lần bị tay chạm nhẹ không được
+      tính. Giá trị cao hơn thay envelope ngay, nên một frame tải nặng chỉ làm dừng một
+      lần, tối đa tới 80 % của cut-off cho tải và 30° cho lag. Giá trị đã đo thật (lần
+      chạy sạch hoặc lượt học; mức cao nhất từng frame lưu ở
+      `contact_profile.json.measured`) không bao giờ bị các lần chạy nhẹ hơn sau đó kéo
+      xuống. Chỉ phần nằm trên mức đó mới giảm, một phần tư khoảng chênh mỗi lần: envelope
+      đầu tiên của một recording, bắt đầu từ các sàn cố định nó dùng trước đó (Lamp: sàn
+      `load` của contact, rồi tải và lag `off_playback`, rồi `torque_limit` của khớp bị
+      giới hạn) nên bắt đầu đúng chỗ đèn đang đứng, và phần đã nâng vì dừng nhầm. Frame
+      mà một lần chạy sau mới lấy mẫu lần đầu (lấy mẫu 20 Hz bỏ sót một số frame 30 fps
+      mỗi lần) thì giảm từ giá trị đã học của các frame lân cận trong ±3 frame, để nó
+      không giữ cả cửa sổ sàn ở mức sàn cố định. Lần
+      chạy nào bị trip không bao giờ được tính, nên một lần dừng mà không ai chạm trong lúc
+      pause (kết thúc mà không nhả torque, và từ 0,5 s trở đi, `CONTACT_HELD_SETTLE_S`,
+      không khớp nào chạm ngưỡng nhả dù chỉ thoáng qua) được coi là dừng nhầm. Lần pause
+      có tay giữ nhưng chưa tới mức nhả thì envelope giữ nguyên: trên lamp-75c9 tay giữ
+      `elbow_pitch` ở 30-45 % làm envelope bị nới mỗi lần pause, và một lần chạm trần 60 %
+      đã đẩy cả kênh elbow của `idle` lên quá trần. Với lần dừng nhầm:
+      envelope trong ±3 frame quanh đó tăng ngay tới mức mà mẫu đó không còn làm dừng,
+      tối đa 10 lần mỗi ngày cho mỗi recording, và chính các frame đó của kênh khớp đó
+      không giảm trong 24 giờ sau (giữ trong RAM, restart HAL là hết); mọi frame và kênh
+      khác vẫn giảm bình thường (trên lamp-75c9, khoá cả recording sau bốn lần dừng sớm
+      đã giữ cả năm khớp của `idle` sát sàn cố định suốt một ngày). Khớp bị giới hạn
+      torque mà dừng đúng ở `torque_limit` (trong khoảng 1 %) thì tăng tới mức trần
+      trong ±30 frame (1 s) quanh lần dừng, để đoạn đó chỉ còn được canh bằng lag:
+      elbow của lamp-c0a4 chạm trần ở những frame `idle` khác nhau giữa các lần chạy, và
+      đã làm `idle` dừng mỗi 5 giây với sàn 41 %. Cách cũ nâng cả kênh đã làm tải elbow
+      của `idle` trên lamp-75c9 không còn được canh ở frame nào. Cập nhật được lưu tối đa 1 phút một lần
+      (ghi đè file, khoảng 100 KB mỗi lần). Envelope được lưu
+      kèm `torque_limit` lúc học (`contact_profile.json.signature`); đổi `torque_limit`
+      thì khi khởi động envelope bị bỏ và dùng các sàn cố định cho tới khi học lại
+      (envelope học ở 60 % làm idle của lamp-c0a4 trip `base_pitch` khoảng 300 lần trong
+      25 phút ở 70 %).
+      `GET /health.servo_overload.contact.profile` hiện `margin`, số recording đã học,
+      recording mà lượt học đang chạy, `passive_runs` (số lần chạy sạch đang giữ của
+      mỗi recording) và `hold_cells` (số ô tư thế đã học tải giữ).
+      **Giới hạn:** không thấy gì trước khi chạm, và một vật
+      nhẹ mà tay đèn đẩy đi được, như cái cốc hay khung ảnh, có thể không bao giờ làm khớp nào đủ tải để
+      trip.
+- [x] **Giới hạn torque servo → tay đèn mềm hơn.** Map `torque_limit` tùy chọn
+      (`{joint: limit}`, đơn vị 0,1 % lực đẩy tối đa) trong cùng entry board được ghi vào
+      `Torque_Limit` của từng servo (register 48 của STS3215) mỗi lần configure, nên khớp
+      đó đẩy vào tay hay vật cản tối đa chỉ mạnh đến vậy. Khi đó `Present_Load` chạm trần ở
+      mức giới hạn, nên một sàn load cao hơn nó (80 % của cut-off) không bao giờ trip trên
+      khớp đó. Lamp giới hạn `base_yaw` và `base_pitch` ở `600` (60 %), `elbow_pitch` ở
+      `700` (70 %): qua 19 recording trên lamp-52e6, trần 70 % đẩy độ trễ bám tệ nhất từ
+      17° lên 18° (`shock`), 50 % kéo nó lên 24°; chọn 60 % để đẩy nhẹ hơn. Elbow của
+      lamp-75c9 tự chạm trần 60 % trong `idle` không ai chạm, nên tải của nó không còn phân
+      biệt được tay ở đó; vì vậy elbow dùng 70 %. `Present_Load` của ba khớp này đứng ở
+      trần, nên cut-off 80 % không bao giờ trip trên chúng — chính trần torque
+      giới hạn lực đẩy của chúng; cut-off vẫn bảo vệ `wrist_roll` và `wrist_pitch`.
+- [x] **Quá tải servo (kẹt) → cắt torque, chime, thử lại theo giờ.** Bảo vệ bánh răng
+      khi tay đèn bị chặn hoặc bị ép. Ở tầng driver, chỉ cho feetech
+      (`AnimationService`), do device quản lý: ngưỡng lấy từ
+      `robots/<device>/servo_overload.json` (map `boards` với `load`, `hold_s`,
+      `retry_s`, `enabled` tùy chọn), đọc bởi `hal/board/servo_overload.py`; không có
+      file, không có entry board hoặc `enabled: false` nghĩa là không có cut-off, còn
+      file sai định dạng làm boot thất bại. Đây không phải field của `SAFETY.md`. Không
+      cần cảm biến dòng: một thread monitor đọc `Present_Load` của mọi khớp (register 60
+      của STS3215, duty điều khiển theo đơn vị 0,1 %) mỗi 50 ms (20 Hz). Khớp nào ở mức `load`
+      trở lên (Lamp: `800` = 80 %) trong `hold_s` (Lamp: `1.5` s) sẽ trip
+      `OverloadGuard` thuần (`hal/drivers/motors/overload.py`). Khi trip, driver dừng chuyển động đang
+      chạy và ghi `Torque_Enable=0` cho mọi servo, **không có bước park** (tay đang bị
+      chặn nên thả lỏng tại chỗ); runtime sau đó phát ack chime và dừng vision tracker.
+      Khớp nào ghi tắt torque thất bại (rớt gói) được thử lại mỗi 50 ms tới khi xác
+      nhận; trước đó `/health` báo `cut_complete: false` kèm các khớp trong
+      `pending_off`. Trong `retry_s` (Lamp: `120` s) không goal nào tới được bus, vì ghi
+      goal sẽ bật lại torque trên loại servo này: frame của playback và tracker bị bỏ,
+      `/servo/move`, `/servo/aim` và `/servo/nudge` lỗi với "Servo overload cut-off
+      active", một raw move đang chạy (startup / zero / park) dừng ở frame kế tiếp, move
+      mới bị bỏ qua, và bật torque bị bỏ qua. Mọi kiểm tra này chạy dưới chính bus lock
+      mà cut-off dùng, nên cut không thể chen vào giữa lần kiểm tra và lần ghi. Hết thời gian
+      chờ, thân máy trở lại qua đường `resume()` bình thường (bật torque, đọc lại trạng
+      thái từ phần cứng, ramp vào idle; hold trước đó bị bỏ). Nếu trong lúc đó nó đã được
+      release (ngủ) hoặc zero-pose thì vẫn thả lỏng tới lần resume kế tiếp. Vẫn bị chặn
+      → trip lại. Đọc load lỗi không bao giờ trip. Lộ ra ở `GET /health.servo_overload`
+      (`active`, `retry_in_s`, `trips`, `cut_complete`, `pending_off`, `last_trip`, cùng
+      `load` / `peak` theo từng khớp để tinh chỉnh). Giá trị 80 % / 1.5 s của Lamp đo trên lamp-52e6 (2026-10-09) ở full
+      torque: đỉnh chuyển động tự do 87 % (`base_pitch` trong `shock`) kéo dài dưới
+      0.3 s; lấy tay giữ `base_yaw`/`elbow_pitch` lên 94-100 %; recording `goodbye` hiệu
+      chuẩn sai cạ xuống bàn (100 % trong 1.2 s) vẫn dưới hold 1.5 s. Cut-off giữ ack
+      chime (contact stop có chime riêng).
+      Chỉ Lamp kèm file này.
+- [x] **Unit:** `thermal_over` trip tại/trên `max_temp_c`, giữ qua hysteresis khi còn
+      trên `resume_temp_c`, clear tại/dưới nó, và là False khi không có policy / không có
+      section thermal / nhiệt không đọc được; `read_soc_temp_c` parse millidegrees → °C và
+      trả None khi đọc lỗi; parse mặc định `resume = max − 10` và fail-loud khi
+      `max_temp_c ≤ 0` hoặc `resume ≥ max`. (`hal/test/test_safety.py`.)
+- [ ] **Runtime (CHƯA verify trên máy):** đường WS-disconnect → `/servo/track/stop` và
+      monitor nhiệt mới ở mức repo; chưa xác nhận trên thiết bị sống (ngắt link gateway;
+      đốt nóng SoC vượt `max_temp_c`).
+
+### Slice 5 — `audio.max_volume` (checklist)
+
+Profile Lamp `pro-respeaker-lite` đặt `max_volume` là 50% và giữ `startup_volume` ở 35%. Thang volume trên web quy đổi 100% thành giới hạn mixer 50% này.
+
+Trần âm lượng áp dụng cả ngày, độc lập với `audio.quiet_hours`: khung giờ chỉ chặn
+output *tuỳ ý* (nhạc), còn trần giới hạn *mọi thứ to tới đâu*, kể cả câu trả lời nói.
+
+- [x] **Gate:** `policy.clamp_volume` — thuần tuý, không đọc đồng hồ, không phân biệt
+      caller. Không khai = pass-through (chỉ còn kẹp thang 0–100), đúng luật
+      presence-driven như `clamp_brightness`.
+- [x] **Thực thi ở đâu:** `POST /audio/volume` (`hal/routes/audio.py`), kẹp **phía trên**
+      chỗ rẽ nhánh sink nên trần có hiệu lực như nhau với loa tích hợp (amixer/DAC dB) và
+      tai nghe Bluetooth. Giá trị lưu lại (`config/.volume`, os-server khôi phục lúc boot)
+      là giá trị đã kẹp, nên mức cao đặt từ trước không sống sót qua lần reboot.
+- [x] **Rà đường vòng (caller):** mọi đường đặt volume đều chui qua đúng route này —
+      agent/skill, `system/intent` (`rules_audio.go` "volume up"/"quieter"), slider web
+      Monitor, và bước khôi phục lúc boot của os-server (`config_watch.go` →
+      `hal.SetVolume`). Gate nằm trong route chứ không nằm ở caller, nên không caller nào
+      là thứ quyết định.
+- [x] **Báo ra ngoài:** cả `GET` lẫn `POST /audio/volume` đều trả `max_volume` (null khi
+      không khai); riêng reply của `POST` còn mang giá trị thực đã áp, nên caller không phải
+      đoán request có vào nguyên vẹn hay không và UI tự sửa ngay thay vì trôi tới vòng poll
+      kế tiếp.
+      `system/lib/hal.MaxVolume()` và slider Monitor đọc trường này — chỉ mang tính tham
+      khảo, client bỏ qua vẫn không vượt được trần, chỉ mất khả năng chia bước theo dải
+      thật. Slider giới hạn track đúng bằng trần thay vì để tay kéo vào vùng chết rồi bị
+      bật ngược, còn `rules_audio.go` diễn đạt "louder"/"quieter" theo tỉ lệ của dải dùng
+      được (nếu không, trên máy có trần 40 thì "quieter" cố định 30 gần như không khác
+      "louder").
+- [x] **Unit:** kẹp trên/dưới trần, pass-through khi không có bound và không có policy,
+      kẹp thang 0–100, `max_volume` lồng trong `quiet_hours` không bị đọc thành trần cả
+      ngày, và fail-loud khi ngoài dải. (`hal/test/test_safety.py`.)
+- [ ] **Runtime (CHƯA verify trên thiết bị):** mới ở mức repo — chưa xác nhận trên loa
+      thật (đặt 100 qua API rồi đọc lại trần; kiểm giá trị amixer/sink BT).
+
+## Quan hệ với enforcement hardcode rời rạc hiện có
+
+Một số hành vi an toàn đã tồn tại, hardcode và rải rác: `motion.stop()` trong service
+motors/animation, clamp vị trí cơ học của lerobot, config scale độ sáng LED. Clamp
+vị trí cơ học đó vẫn là giới hạn vị trí theo từng joint duy nhất: đường lệnh **không**
+có bound vị trí nào được khai báo (recording được gate theo tốc độ và, từ slice 6,
+theo độ ổn định toàn thân — cả hai đều không phải clamp theo từng joint). Engine
+**không** gỡ hết một lúc — nó *tập trung hóa* chúng vào policy khai báo từng slice một,
+để các bound trở thành **dữ liệu thiết bị khai** thay vì hằng số chôn trong driver.
+Slice 1 giới thiệu engine bằng một bound **chưa** từng được thực thi (trần độ sáng độc
+lập với agent), chứng minh đường đi đầu-cuối trước khi di trú các mảnh đã có.

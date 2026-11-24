@@ -1,0 +1,11 @@
+# Lamp CAD binaries (STEP/STL/Fusion) tracked via Git LFS
+robots/lamp/hardware/**/*.stp filter=lfs diff=lfs merge=lfs -text
+robots/lamp/hardware/**/*.STP filter=lfs diff=lfs merge=lfs -text
+robots/lamp/hardware/**/*.step filter=lfs diff=lfs merge=lfs -text
+robots/lamp/hardware/**/*.STEP filter=lfs diff=lfs merge=lfs -text
+robots/lamp/hardware/**/*.stl filter=lfs diff=lfs merge=lfs -text
+robots/lamp/hardware/**/*.STL filter=lfs diff=lfs merge=lfs -text
+robots/lamp/hardware/**/*.f3d filter=lfs diff=lfs merge=lfs -text
+robots/lamp/hardware/**/*.f3z filter=lfs diff=lfs merge=lfs -text
+robots/lamp/hardware/**/*.glb filter=lfs diff=lfs merge=lfs -text
+robots/lamp/hardware/**/*.GLB filter=lfs diff=lfs merge=lfs -text

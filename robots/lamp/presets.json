@@ -1,0 +1,72 @@
+{
+  "_comment": "Per-device preset overrides for lamp. See robots/contract/ROBOT-SPEC.md § Per-device presets. Lamp's LED ring is 32 pixels (vs the platform default of 64). Every emotion uses its own low-glare color from a quantized RGB wheel: each channel is 0-3, so the palette stays diverse without exceeding the tested brightness cap.",
+  "ambient_led": {"resting": {"effect": "solid", "color": [1, 1, 1]}},
+  "led_count": 32,
+  "_comment_listening": "Speed only; the color is the blue group value below. Base speed is 1.2, the fastest in EMOTION_PRESETS (every other breathing preset is 0.2-0.6), and it was reported as glaring on the lamp. Lowering the color had already been tried and did not help, because the level was never this cue's problem. breathing() sweeps 0 -> peak -> 0 over 100 steps of 0.03/speed, so modulation depth is 100% at every speed and only the period moves: 2.5 s at 1.2. A full-ring, full-depth swing that fast, sustained for as long as the user keeps talking, reads as pulsing rather than as light. 0.3 puts it back with the family. Confirmed by eye on lamp-0c89, 21/08/2026.",
+  "_comment_music_strong": "music_strong is the only cue on FX_RAINBOW, and rainbow sweeps the hue itself -- it never reads a color, so neither the 0-3 palette cap below nor the request intensity can dim it. Until brightness was wired into it, it painted at value 1.0 and rode straight to the light.max_brightness ceiling (120) on all 32 pixels at once, ~40x every other emotion here. brightness is the same 0.0-1.0 field the scene table uses; 0.012 lands the sweep at peak 3, the same peak as the rest of this palette. A full ring is no argument for going higher: breathing paints a solid ring too and still sits at 3. Section comments must stay at this top level: the overlay treats every key inside a section as a preset name and fails loud on one it does not recognise.",
+  "_comment_emotion_palette": "The former six-color grouping is retired. Emotion colors now use distinct positions on one quantized RGB wheel, capped at 3 per channel. Effects, speeds, and servo animations remain inherited from the base presets unless explicitly overridden below. Lamp maps the stretching emotion to the idle recording so waking keeps the stretching state transition without the stretching movement.",
+  "emotion": {
+    "sad":          { "color": [0, 1, 3] },
+    "shy":          { "color": [3, 0, 1] },
+    "confused":     { "color": [3, 2, 0] },
+    "headshake":    { "color": [3, 0, 0] },
+
+    "happy":        { "color": [3, 3, 0] },
+    "laugh":        { "color": [2, 3, 0] },
+    "excited":      { "color": [3, 1, 0] },
+
+    "curious":      { "color": [0, 3, 3] },
+    "thinking":     { "color": [2, 0, 3], "servo": null },
+    "scan":         { "color": [0, 2, 3] },
+    "acknowledge":  { "color": [0, 3, 0] },
+
+    "music_chill":  { "color": [0, 3, 2] },
+    "music_strong": { "brightness": 0.012 },
+
+    "listening":    { "color": [0, 0, 3], "speed": 0.3 },
+
+    "shock":        { "color": [2, 2, 2] },
+
+    "greeting":     { "color": [3, 0, 3] },
+    "goodbye":      { "color": [3, 0, 2] },
+    "caring":       { "color": [3, 1, 2] },
+
+    "idle":         { "color": [1, 2, 3] },
+    "nod":          { "color": [2, 3, 1] },
+    "stretching":   { "color": [3, 2, 1], "servo": "idle" }
+  },
+  "_comment_status_led": "All status LED RGB channels are capped at 3 for the low-glare device test. Effects and speeds remain inherited from the base presets. Verify that alert and privacy cues remain readable and that low-level breathing does not visibly step.",
+  "status_led": {
+    "ota":             { "color": [0, 3, 0], "speed": 0.6 },
+    "error":           { "color": [3, 0, 0] },
+    "booting":         { "color": [0, 1, 3], "speed": 0.6 },
+    "connectivity":    { "color": [3, 1, 0], "speed": 0.6 },
+    "wifi_connecting": { "color": [0, 1, 3] },
+    "hal_down":        { "color": [2, 0, 3], "speed": 0.6 },
+    "agent_down":      { "color": [0, 3, 3], "speed": 0.6 },
+    "hardware":        { "color": [3, 3, 0], "speed": 0.6 },
+    "ready_flash":     { "color": [3, 3, 3] },
+    "ota_progress":    { "color": [3, 1, 0] },
+    "ota_error":       { "color": [3, 1, 1] },
+    "ota_success":     { "color": [0, 3, 1] },
+    "mic_muted":       { "color": [3, 0, 0] },
+    "setup":           { "color": [3, 3, 3] }
+  },
+  "_comment_button_led": "Button hold-warning and Harness confirmation RGB channels are capped at 3 for the low-glare device test. The driver distinguishes shutdown and factory reset through blink versus solid, not hue.",
+  "button_led": {
+    "harness_on":     { "effect": "breathing_fine", "color": [3, 1, 0], "speed": 0.6 },
+    "harness_off":    { "effect": "blink", "color": [2, 2, 2], "speed": 1.0, "duration_ms": 300 },
+    "sleep_warn":     { "color": [2, 1, 3] },
+    "shutdown_warn":  { "color": [3, 0, 0] },
+    "factory_reset":  { "color": [3, 0, 0] }
+  },
+  "_comment_scene": "Scene brightness only — hue (the color temperature mix) stays at the base value. Two things were wrong at the base levels. (1) reading/focus/energize all landed above lamp's max_brightness ceiling of 120, and clamp_color only scales DOWN, so all three collapsed to peak 120: three different scenes rendering as one, at the brightest level the ring can do. (2) Peak alone understates a scene: unlike an emotion cue, a scene lights all 32 pixels, so total flux is far higher than the peak number suggests — judging a scene by its peak the way we judge an indicator makes it come out too bright, which is what happened on the first pass here. Peaks now: energize 61, reading 48, focus 38, relax 25, movie 10, night 3. Night is deliberately far below the rest — it is a nightlight, meant to let you find your way without waking you, not to light the room; it is also blue-free by hue so it does not suppress melatonin. Spaced wider at the top because perceived brightness goes as roughly the cube root of value.",
+  "scene": {
+    "energize": { "brightness": 0.24 },
+    "reading":  { "brightness": 0.19 },
+    "focus":    { "brightness": 0.15 },
+    "relax":    { "brightness": 0.1 },
+    "movie":    { "brightness": 0.04 },
+    "night":    { "brightness": 0.012 }
+  }
+}

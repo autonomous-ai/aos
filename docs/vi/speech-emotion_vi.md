@@ -1,0 +1,506 @@
+# Nhận Diện Cảm Xúc Giọng Nói (SER)
+
+**Khởi động:** Speaker-ID và SER khởi tạo bằng hai worker nền độc lập, bao gồm lấy public key và nạp model SER. HAL và voice cơ bản không chờ hai phần này. Khi chưa sẵn sàng, transcript đi tiếp không có danh tính người nói, SER bỏ qua phiên (không phát lại). Mỗi service dùng được ngay khi khởi tạo xong; khởi tạo lỗi sẽ thử lại mỗi 30 giây ở nền. Tính năng bị tắt hoặc thiết bị không có audio không tạo worker. Mute/unmute giữ lại service; hủy pipeline và tắt HAL hủy retry, dừng SER kể cả khi nó khởi tạo xong sau lúc hủy. Speaker recognizer vẫn dùng chung với HTTP routes trong process.
+
+HAL phân tích cảm xúc từ giọng nói **sau mỗi phiên mic** (VAD trigger → im lặng ~2.5 s đóng phiên), độc lập với việc STT có trả transcript hay không. Nhờ vậy, tiếng cười, thở dài, "ờ ờ" và các tín hiệu phi-lời-nói (vốn để lại transcript rỗng) vẫn được phân loại. `SpeakerDecorator.submit_speech_emotion_from_session` dựng một WAV mono 16 kHz từ **snapshot chưa cắt** của phiên và đưa vào `SpeechEmotionService`; service đó lọc trước (prefilter) audio ngay tại thiết bị, phân loại trên cloud, gom theo người dùng, khử trùng lặp theo nhóm phân cực, rồi gửi sự kiện `speech_emotion.detected` tới OS server. Speaker recognition cung cấp trường `user` (rơi về `unknown` khi không nhận diện được, buffer quá ngắn để tạo embedding, hoặc không khớp ai); nó **không phải là cổng chặn** trước SER.
+
+Đây là bản sinh đôi phía giọng nói của nhận diện cảm xúc khuôn mặt (`emotion.detected`). Kiến trúc, cách phân nhóm phân cực và cửa sổ dedup được làm đối xứng có chủ đích để cả hai phương thức rơi vào cùng các skill phía sau (`user-emotion-detection/SKILL.md`, mood logging, music suggestion).
+
+> Đừng nhầm với **Emotion Expression** (`emotion/SKILL.md`) — cái đó điều khiển đầu ra cảm xúc của *chính thiết bị* (servo + LED + mắt). SER là cảm nhận điều *người dùng* cảm thấy qua giọng nói; expression là cách *agent* thể hiện cảm xúc của nó.
+
+**Tiếng Anh:** [docs/speech-emotion.md](../speech-emotion.md)
+
+> **Trang này là tài liệu tham chiếu SER ở mức nền tảng** — kiến trúc, các cổng chặn, nhóm phân cực, cấu hình, audio debug, các chế độ lỗi. Phía cloud (model emotion2vec, tiền xử lý, giới hạn đầu vào 2–8 s) được mô tả ở [perception-service: Speech emotion (SER)](../../integrations/perception-service/docs/perceptions.md#4-speech-emotion-ser) (tiếng Anh).
+>
+> Khi tài liệu và code mâu thuẫn, **code thắng**.
+
+**Tài liệu liên quan:** [Tuning sensing (SER)](../../robots/lamp/docs/vi/sensing-tuning_vi.md#speech-emotion-recognition-ser) · [perception-service](perception-service_vi.md) · [Sensing behavior](../../robots/lamp/docs/vi/sensing-behavior_vi.md)
+
+---
+
+## Kiến Trúc
+
+```
+voice_service._stream_session(...) finally:                      ← mỗi lần phiên mic kết thúc
+    ├─ finalize_session(...) → (combined, ser_audio_buffer, buf_duration)
+    │      ser_audio_buffer = snapshot CHƯA CẮT (SER giữ tiếng cười / thở dài);
+    │      audio_buffer bị cắt tại chỗ, chỉ dùng cho speaker recognition
+    │
+    ├─ speaker-ID prepass: identify_and_decorate(final_text, audio_buffer)
+    │      → (final_msg, se_user, display)      ← lần recognize DUY NHẤT của turn này
+    │
+    └─ dispatch_turn(...)                        (_internal/turn_dispatch.py)
+           ├─ if combined: sensing_sender.send(final_msg, event_type)
+           │      `voice` / `voice_command` / `voice_followup` / `voice_agent_handled`
+           └─ submit_speech_emotion_from_session(ser_audio_buffer, user)   ← pipeline SER
+                  └─ _session_wav_for_ser(buffer) → (wav, duration_s)
+                  └─ SpeechEmotionService.submit(user, wav, duration_s)
+                  ▼
+SpeechEmotionService.submit(user, wav_bytes, duration_s)   ← non-blocking
+    │  5 cổng (available / user khác rỗng / wav khác rỗng / duration ≥ 3.0 s /
+    │          không phải mọi bucket đều còn trong cửa sổ dedup)
+    │  queue.put_nowait                          ← maxsize 8; đầy → loại job CŨ NHẤT
+    ▼
+worker thread (daemon)
+    │  bỏ job đã chờ > 30 s trong hàng đợi (cảm xúc đã cũ)
+    │  Emotion2VecRecognizer.recognize(wav_bytes)
+    │     ├─ prefilter — RMS trim + cổng voiced, rồi Silero VAD, sau đó cắt đoạn ≤8 giây nhiều giọng nói nhất   ← CỤC BỘ, loại phi-tiếng-nói
+    │     ├─ POST {DL_BACKEND_URL}/hal/api/dl/ser/recognize
+    │     │     ← { "label": "happy", "confidence": 0.78 }
+    │  neutral / other / <unk> → bỏ (trước cổng confidence)
+    │  cổng confidence theo nhãn
+    │  _persist_wav() → clip debug ghi ra đĩa (giữ 200 clip mới nhất)
+    ▼
+buffer[user].append(_Inference)              ← gom theo từng user
+    ▲
+    │  (flush thread thức dậy mỗi SPEECH_EMOTION_FLUSH_S)
+    ▼
+flush:
+    ① bỏ các nhãn neutral / <unk> / other (phòng thủ — worker đã bỏ trước đó)
+    ② mode(label) trên các mẫu đã đệm của user này
+    ③ bucket = polarity(mode)                ← positive | negative
+    ④ dedup TTL: key=(user, bucket) trong SPEECH_EMOTION_DEDUP_WINDOW_S
+    ⑤ POST OS server /api/sensing/event với type="speech_emotion.detected"
+```
+
+Pipeline voice của HAL **chỉ gọi `submit()`**. Prefilter, toàn bộ HTTP I/O tới perception-service, việc đệm, phân nhóm, dedup, retry, và POST tới OS server đều nằm gọn trong module `speech_emotion/` — chúng không bao giờ chặn đường STT.
+
+Có một điểm gọi **thứ hai**: khi cổng wake-word từ chối một turn, `VoiceService._stream_session` (`voice_service.py`) submit trực tiếp với `user="unknown"` mặc định. Nó chỉ chạm tới được khi `WAKEWORD_ENABLED` bật — giá trị đọc từ `wakeword` trong `config.json`, mặc định là **false** (`hal/config.py`) — nên ở cấu hình always-listening đang ship, mọi phiên mic kết thúc đều tới SER qua `dispatch_turn`.
+
+---
+
+## Module `speech_emotion/`
+
+```
+hal/drivers/voice/speech_emotion/
+├── __init__.py        # API công khai: SpeechEmotionService + ABC + engine + kiểu kết quả
+├── constants.py       # mặc định, bộ nhãn, bản đồ bucket, ngưỡng prefilter, loại sự kiện
+├── base.py            # BaseSpeechEmotionRecognizer (ABC), dataclass SpeechEmotionResult
+├── emotion2vec.py     # Emotion2VecRecognizer — prefilter + lớp bọc HTTP cho /hal/api/dl/ser/recognize
+├── utils.py           # normalize_label, is_neutral, bucket_for, hedge_for, format_message,
+│                      # wav_to_pcm16, pcm16_to_wav, compute_frame_rms, compute_trim_and_voiced
+├── debug_tracer.py    # Tracer SER-DEBUG + profiler theo stage — chỉ cho dev, mặc định TẮT, xoá trước khi deploy
+└── service.py         # SpeechEmotionService — queue + worker + flush + dedup + gửi tới OS server
+```
+
+Các bên gọi và lân cận:
+
+| Mối quan tâm | Đường dẫn |
+|--------------|-----------|
+| Điểm submit + khởi tạo service | `hal/drivers/voice/_internal/speaker_decorate.py` (`_init_speech_emotion`, `identify_and_decorate`, `submit_speech_emotion_from_session`) |
+| Turn dispatch (cấp `user`) | `hal/drivers/voice/_internal/turn_dispatch.py` (`dispatch_turn`) |
+| Snapshot SER chưa cắt | `hal/drivers/voice/_internal/session_finalize.py` (`finalize_session`) |
+| Sidecar dedup theo boot | `hal/dedup_sidecar.py` |
+| Model Silero dùng chung | `hal/drivers/voice/resources/silero_vad.onnx` |
+| Model + phục vụ trên cloud | `integrations/perception-service/src/core/perception/audio_emotion/` |
+| Bên tiêu thụ ở OS server | `system/server/sensing/delivery/http/handler.go` |
+
+Thêm engine mới: kế thừa `BaseSpeechEmotionRecognizer` (một method: `recognize(wav_bytes) -> SpeechEmotionResult | None`) và tiêm vào qua `SpeechEmotionService(recognizer=...)` lúc khởi tạo. Factory mặc định dựng `Emotion2VecRecognizer` từ `config.SPEECH_EMOTION_API_URL`. **Lưu ý prefilter nằm trong engine, không phải trong service** — engine thay thế sẽ không thừa hưởng gì từ nó.
+
+### `SpeechEmotionService`
+
+Hai daemon thread, chỉ khởi động trong `__init__` khi `recognizer.available` là true:
+
+| Thread | Vòng lặp | Rút từ | Tạo ra |
+|--------|----------|--------|--------|
+| `speech-emotion-worker` | `_worker_loop` | hàng đợi submit (`queue.Queue`, maxsize 8) | các mục trong buffer theo user |
+| `speech-emotion-flush` | `_flush_loop` (chờ + đập mỗi `SPEECH_EMOTION_FLUSH_S`) | buffer theo user | các POST `speech_emotion.detected` tới OS server |
+
+Cả hai thoát sạch khi gọi `stop()` — worker bị "đầu độc" bằng sentinel `None`, flush thread quan sát stop event ngay trong `Event.wait` (và do đó bỏ qua lần flush cuối, có chủ đích). Mọi state có thể thay đổi (`_buffer`, `_last_sent_by_key`, `_last_flush_ts`) được bảo vệ bởi một `threading.RLock`.
+
+`submit()` là non-blocking theo thiết kế. Khi hàng đợi worker đầy (tồn đọng 8 job, `DEFAULT_QUEUE_MAXSIZE`), job **cũ nhất** trong hàng bị loại (`EVICT — queue full, dropped oldest job`) và job mới được đưa vào: với tín hiệu cảm xúc thời gian thực, câu vừa nói mới là câu có giá trị. Chỉ khi một producer khác lấp chỗ trống ngay giữa lúc đó thì job mới mới bị bỏ (`DROP submit — worker queue full`). Worker còn bỏ mọi job đã chờ quá `DEFAULT_JOB_MAX_AGE_S` (30 s) trong hàng (`DROP — stale job`), vì audio cũ không còn mô tả tâm trạng hiện tại và sẽ khiến dedup chặn mất cảm xúc hiện tại. Hàng đợi cố ý nhỏ: đầu ra bị giới hạn một sự kiện mỗi user mỗi bucket mỗi cửa sổ dedup, nên tồn đọng sâu chỉ sinh ra kết quả cũ.
+
+> `available` là `recognizer is not None and recognizer.available`, và với engine HTTP đó chỉ là `bool(url)` — kiểm tra **cấu hình**, không phải kiểm tra kết nối. Service có thể báo `available` trong khi backend chết; mọi lời gọi khi đó đều lỗi ở chặng HTTP và trả `None`.
+
+Config mức module được đọc **lúc import** (đầu `service.py`), nên test nào patch `hal.config` phải làm trước khi import module.
+
+### `_Job` vs `_Inference`
+
+| Kiểu | Tạo ở | Giữ gì |
+|------|-------|--------|
+| `_Job` | `submit()` | `user`, `wav_bytes`, `duration_s`, `ts` (mốc submit, để worker bỏ job quá cũ) — nằm trong hàng đợi chờ worker |
+| `_Inference` | `_process_job()` | `user`, `label`, `confidence`, `duration_s`, `ts`, `audio_path` — nằm trong buffer chờ flush |
+
+---
+
+## Prefilter Cục Bộ (model duy nhất ở edge trên đường này)
+
+Trước mọi I/O mạng, `Emotion2VecRecognizer.prefilter()` (`emotion2vec.py`) chặn clip. Mục đích là loại **audio dài-nhưng-thưa** — một clip 20 giây chứa hai giây tiếng TV — thứ mà emotion2vec sẽ gán nhãn tự tin và sai. Nó trả về WAV **đã trim và mã hóa lại**, nên cloud cũng nhận buffer sạch hơn.
+
+Giải mã yêu cầu PCM 16-bit đúng 16 kHz; đa kênh được lấy trung bình về mono.
+
+**Chặng 1 — RMS** (một lượt, `utils.compute_trim_and_voiced`). Một envelope RMS 20 ms phục vụ hai việc với hai ngưỡng có chủ đích: `PREFILTER_TRIM_RMS = 3500` (nghiêm) neo biên cắt đầu/đuôi, `PREFILTER_VOICED_RMS = 2500` (rộng rãi) đếm frame có tiếng bên trong vùng đó để giọng thì thầm/hơi vẫn được ghi nhận. Giữ 100 ms đệm quanh vết cắt. Drop khi clip sau trim `< 2.0 s`, tổng thời lượng có tiếng `< 1.0 s`, hoặc tỉ lệ voiced `< 0.30` (mẫu số là vùng trim đã đệm, nên đoạn im lặng dài ở đầu không làm giảm tỉ lệ).
+
+**Chặng 2 — Silero VAD** trên buffer đã trim (`emotion2vec.py`). Hợp đồng Silero v5: chunk 512 mẫu ở 16 kHz với context 64 mẫu đặt phía trước; `state` LSTM và `context` được dựng lại từ zero mỗi lần gọi, nên các lần gọi độc lập không lẫn trạng thái vào nhau. Drop khi thời lượng Silero-voiced `< 1.0 s`. Khi Silero không khả dụng (thiếu model, ORT hỏng), ngưỡng RMS **siết** từ 1.0 s lên 3.0 s thay vì cho qua tất cả.
+
+**Cắt clip gửi lên** — sau khi qua cả hai cổng lọc, `utils.select_voiced_span` chỉ giữ đoạn liên tục **8 giây** (`SER_MAX_CLIP_S`) có nhiều frame 20 ms có giọng nói nhất (`PREFILTER_VOICED_RMS`). Khi bằng nhau thì chọn đoạn muộn nhất. Clip ≤8 giây giữ nguyên. Đoạn được cắt nguyên khối, không ghép các mảnh có giọng nói lại với nhau. perception-service cũng giới hạn đầu vào SER ở 2–8 giây, nên phần dài hơn cũng sẽ bị cắt phía server (#492).
+
+Lỗi mã hóa lại thì fail-open: WAV gốc được gửi đi.
+
+Mọi ngưỡng là hằng số biên dịch trong khối `PREFILTER_*` của `constants.py` (cộng `SER_MAX_CLIP_S`) — **không** override được bằng env.
+
+> Prefilter không tự nạp model Silero riêng: `_load_silero()` lấy session dùng chung toàn tiến trình từ `vad_filters.shared_silero_session`, chung với đường capture voice. `state`/`context` LSTM được dựng riêng cho từng lần gọi, đó là điều khiến việc dùng chung an toàn.
+
+---
+
+## Tích Hợp `voice_service.py`
+
+Được gọi từ `dispatch_turn` (`_internal/turn_dispatch.py`), vốn chạy từ khối `finally` của `VoiceService._stream_session`. Speaker recognize chạy **một lần** mỗi phiên — ở speaker-ID prepass trong `voice_service.py` — và kết quả cấp cho cả phần trang trí message gửi OS server lẫn trường `user` của SER:
+
+```python
+# voice_service.py finally, sau finalize_session:
+
+# 1. Speaker-ID prepass — lần recognize DUY NHẤT của turn. Chạy ở đây vì voiceprint
+#    cần cả câu nói, nên đây là thời điểm sớm nhất có thể.
+if combined:
+    _final_text, _ = self._decorator.classify_wake_word(combined)
+    turn_identity = self._decorator.identify_and_decorate(_final_text, audio_buffer)
+
+# 2. Dispatch — tái dùng turn_identity, không bao giờ nhận dạng hai lần
+dispatch_turn(self._decorator, self._sensing_sender, combined,
+              audio_buffer, ser_audio_buffer, rt, identity=turn_identity)
+```
+
+```python
+# turn_dispatch.py
+user = UNKNOWN_USER_LABEL
+if combined:
+    final_msg, se_user, _ = identity          # hoặc identify_and_decorate(...) nếu None
+    user = se_user if se_user else UNKNOWN_USER_LABEL
+    sensing_sender.send(...)                  # định tuyến theo rt.handled / rt.delegated
+
+# Submit SER — dùng snapshot CHƯA CẮT để tiếng cười / thở dài còn nguyên.
+decorator.submit_speech_emotion_from_session(ser_audio_buffer, user=user)
+```
+
+`submit_speech_emotion_from_session` (`speaker_decorate.py`) là bên submit mỏng, không nhúng lời gọi speaker nào:
+
+```python
+session_audio = self._session_wav_for_ser(audio_buffer)
+if session_audio is None:
+    return                                          # buffer rỗng hoặc < SPEAKER_MIN_AUDIO_S
+wav_bytes, duration_s = session_audio
+self._speech_emotion.submit(user=user, wav_bytes=wav_bytes, duration_s=duration_s)
+```
+
+Toàn bộ lời gọi được bọc `try/except` — lỗi SER không bao giờ giết được một voice turn.
+
+### Gán `user` cho SER
+
+| Kết quả Speaker ID | `user` truyền vào `submit()` |
+|--------------------|------------------------------|
+| `match=True` với tên đã đăng ký | Nhãn speaker (ví dụ `alice`) |
+| `match=False` / dưới ngưỡng (API OK, không `error`) | `unknown` — đặt trực tiếp bởi `identify_and_decorate` (`speaker_decorate.py`) |
+| Recognize bị bỏ qua hoặc lỗi (`se_user` là `None`) | `unknown` — thay trong `dispatch_turn` (`turn_dispatch.py`) |
+| Hoàn toàn không có transcript (`if combined:` bị bỏ qua) | `unknown` — giá trị khởi tạo trong `dispatch_turn` còn nguyên |
+| Cổng wake-word từ chối turn | `unknown` — tham số mặc định của `submit_speech_emotion_from_session`, gọi từ `voice_service.py` |
+
+SER không bao giờ được gọi từ bên trong `identify_and_decorate`.
+
+> Năm trường hợp đó **không phân biệt được trên dây**. Vì vậy OS server **không** cho `speech_emotion.detected` cập nhật danh tính toàn thiết bị: `PostSensingEvent` (`system/server/sensing/delivery/http/handler.go`) bỏ qua `mood.SetCurrentUser` với loại sự kiện này, nên một sự kiện SER mà speaker-ID trả về `unknown` không thể ghi đè danh tính lấy từ khuôn mặt. Dòng `[context: current_user=…]` của chính sự kiện vẫn mang `user` của SER, nên mood của người lạ vẫn được ghi dưới `unknown`.
+
+### Chi phí dùng chung: một lần speaker recognize mỗi turn
+
+Speaker recognize bắn **một lần** mỗi phiên mic. Kết quả `(final_msg, se_user, display)` duy nhất được tái dùng bởi:
+
+1. POST tới OS server — khi STT có transcript.
+2. Submit SER — luôn luôn.
+
+Đó là lý do thứ tự là: finalize → phân loại wake-word → speaker-ID prepass (một lần) → dispatch (POST OS server → submit SER). `dispatch_turn` nhận kết quả prepass qua tham số `identity` và chỉ tính lại khi nó là `None`; SER không bao giờ tự phát lời gọi `/embed` riêng.
+
+---
+
+## Khi Nào **Không** Gọi SER
+
+- Thiết bị không khai báo capability `audio` — voice people-perception (speaker-ID + SER) phụ thuộc mic, nên `SpeakerDecorator` được dựng với `enable_people_perception=False` và service SER không bao giờ khởi tạo (`SpeakerDecorator._init_speech_emotion`). (Đây là capability `audio`, không phải `presence`: SER chỉ cần mic. Cảm xúc khuôn mặt trong vòng lặp sensing vẫn phụ thuộc `presence`.)
+- Chủ máy chưa bật opt-in `speech_emotion` (`SPEECH_EMOTION_ENABLED` false — chặn trong `SpeakerDecorator.submit_speech_emotion_from_session` và `Emotion2VecRecognizer.recognize`), hoặc `SpeechEmotionService` không `available` (thiếu `DL_BACKEND_URL`)
+- `ser_audio_buffer` rỗng hoặc ngắn hơn `SPEAKER_MIN_AUDIO_S` (chặn `_session_wav_for_ser`)
+- `duration_s < SPEECH_EMOTION_MIN_AUDIO_S` (chặn ngay trong `submit()` — mặc định 3.0 s, đây là sàn ràng buộc)
+- `submit()` drop (`user` rỗng sau normalize, mọi bucket vẫn còn trong cửa sổ dedup, hoặc — hiếm — hàng đợi bị lấp lại giữa lúc loại job cũ và lúc đưa job mới vào)
+- Prefilter từ chối clip (xem phần trên) — bị loại trước lời gọi cloud
+
+`wav_bytes` được dựng từ `ser_audio_buffer` — snapshot **chưa cắt** lấy trước khi `finalize_session` cắt im lặng đuôi khỏi bản dùng cho speaker-recognition. Đó là chủ đích: tiếng cười, thở dài và "hmm" ở đuôi mang sắc thái cảm xúc nhưng không phải từ ngữ, và phần trim của speaker-recognition sẽ cắt mất chúng.
+
+Khởi tạo một lần mỗi tiến trình trong `SpeakerDecorator.__init__`, theo đúng mẫu của speaker recognizer: instance được tạo một lần, các thread chỉ chạy khi engine báo `available`.
+
+---
+
+## Sự Kiện OS Server
+
+```http
+POST http://127.0.0.1:5000/api/sensing/event
+Content-Type: application/json
+```
+
+```json
+{
+  "type": "speech_emotion.detected",
+  "message": "Speech emotion detected: Sad. (weak voice cue; confidence=0.72; bucket=negative; treat as uncertain, do not assume the user is distressed.)",
+  "current_user": "alice",
+  "audio": "/tmp/hal-speech-emotion/1715587812413_alice_sad.wav"
+}
+```
+
+Tiền tố thô `Speech emotion detected: <Label>.` là mỏ neo cho parser định tuyến phía OS server. Phần trong ngoặc là mệnh đề rào đón để LLM không kết luận quá mạnh trên một tín hiệu SER nhiễu — cùng mẫu với message `Emotion detected: …` của khuôn mặt. Nội dung rào đón chọn theo bucket: `do not over-celebrate` (positive), `do not assume the user is distressed` (negative), `do not over-react` (other).
+
+Trường `audio` là một trường **riêng, tùy chọn** — đường dẫn trên đĩa của clip WAV tạo ra sự kiện này. Nó **không** được nhúng vào `message` và **không bao giờ** chuyển tiếp tới LLM (xem [Lưu Audio Để Gỡ Lỗi](#lưu-audio-để-gỡ-lỗi) bên dưới). Rỗng khi persistence bị tắt hoặc ghi lỗi.
+
+Chính sách retry: timeout 5 s, 3 lần thử với back-off 2 s khi gặp `ConnectionError` hoặc HTTP `503`. Các mã 4xx/5xx khác được log và bỏ (mẫu mất luôn — ta không dội bom OS server). Lần ngủ back-off nằm trên flush thread, nên OS server không truy cập được sẽ làm trễ nhịp flush kế tiếp tới ~4 s.
+
+### Lời gọi engine → perception-service
+
+```http
+POST {DL_BACKEND_URL}/hal/api/dl/ser/recognize
+Headers:
+  X-API-Key: <key>
+  Content-Type: application/json
+Body:
+  {"audio_b64": "<base64 WAV (mono 16 kHz, đã prefilter + trim)>", "return_scores": false}
+```
+
+```json
+{ "label": "happy", "confidence": 0.9981, "scores": null }
+```
+
+Bộ nhãn (emotion2vec_plus_large, từ `/api/dl/ser/labels`):
+
+```
+angry, disgusted, fearful, happy, neutral, other, sad, surprised, <unk>
+```
+
+Timeout là `SPEECH_EMOTION_API_TIMEOUT_S` (env `HAL_SPEECH_EMOTION_API_TIMEOUT_S`, mặc định 15 s), được `_build_default_recognizer()` truyền vào engine, và **không có retry ở chặng này** — mọi lỗi transport, non-200, body không phải JSON, hoặc thiếu `label` đều trả `None` và mẫu bị bỏ qua. Khi `DL_ENCRYPTION_ENABLED` (mặc định **true**), body request và response được bọc bởi `CryptoSession`; thiếu public key thì request bị bỏ qua chứ không gửi plaintext, và key được lấy lại sau 60 giây.
+
+---
+
+## Lưu Audio Để Gỡ Lỗi
+
+Để các kết quả SER nhiễu có thể truy vết được, service lưu lại clip WAV đứng sau mỗi sự kiện và hiện nó trong Flow Monitor UI dưới dạng player bấm-để-nghe. **Đây chỉ là công cụ gỡ lỗi — audio không bao giờ được gửi cho LLM.**
+
+### Phía ghi (HAL)
+
+Trong `_process_job`, mọi inference không phải neutral và vượt cổng confidence theo nhãn đều được `_persist_wav()` ghi ra đĩa trước khi vào buffer:
+
+- **Thư mục:** `SPEECH_EMOTION_AUDIO_DIR` (cấu hình trong `hal/config.py`, env `HAL_SPEECH_EMOTION_AUDIO_DIR`), mặc định `<tempdir>/hal-speech-emotion` (tức `/tmp/hal-speech-emotion`). Tạo bằng `os.makedirs(exist_ok=True)` lúc init; nếu tạo lỗi thì thư mục bị tắt và mọi POST mang trường `audio` rỗng (suy giảm êm — SER vẫn chạy).
+- **Nội dung:** WAV **trước prefilter**, tức thứ mic bắt được, không phải buffer đã trim gửi cho model.
+- **Tên file:** `<ms>_<user>_<label>.wav`, với `<ms>` là mốc thời gian inference tính bằng mili-giây và `<user>`/`<label>` được làm sạch về `[a-zA-Z0-9_-]` (ký tự khác gộp thành `_`). Chính việc làm sạch đó cho phép handler Go phục vụ các file này chỉ bằng basename.
+- **Chọn khi flush:** khi flush của một user phát ra nhãn không-neutral chiếm ưu thế, nó đính clip **mới nhất** trong các inference cùng nhãn đó — `max(dom_inferences, key=lambda i: i.ts).audio_path` — vào trường `audio` của POST.
+
+### Phía phục vụ (OS server)
+
+OS server chỉ để lộ clip cho Flow Monitor UI qua `GET /api/sensing/audio/:name` (`SensingHandler.GetAudio`, `system/server/sensing/delivery/http/handler.go`), route này cần admin auth (phiên web hoặc token của chủ máy). Nó phục vụ WAV theo **basename** (đường dẫn đầy đủ không bao giờ rời thiết bị) từ một trong:
+
+```
+/var/lib/hal/speech-emotion
+/tmp/hal-speech-emotion
+```
+
+Basename được kiểm tra (đuôi `.wav`, không có `/`, `\`, hay `..`) trước khi phục vụ. Ở `PostSensingEvent`, đường dẫn `audio` thô được `audioURLForPath` (cùng file) ánh xạ sang URL phục vụ được (`/api/sensing/audio/<name>`) và gắn vào detail của sự kiện Monitor `sensing_input`; item trong Monitor render nó thành player bấm được. Đường dẫn thô không bao giờ lộ ra UI, và trường `audio` không bao giờ được nối vào text chat gửi đi.
+
+### Giới hạn lưu giữ
+
+Kết quả neutral / other / `<unk>` bị worker bỏ **trước** cổng confidence và không bao giờ được ghi. Các clip không chiếm ưu thế (không bao giờ thành sự kiện) vẫn được ghi. Sau mỗi lần ghi, `_prune_audio_dir()` chỉ giữ **200** clip mới nhất (`DEFAULT_AUDIO_MAX_FILES`, tham số khởi tạo `audio_max_files`; `0` = không giới hạn; không override được bằng env). Tên file bắt đầu bằng mốc mili-giây nên thứ tự từ điển là thứ tự thời gian. Giới hạn này quan trọng vì thư mục mặc định nằm trên **tmpfs, tức RAM**, dùng chung với các writer khác như sidecar dedup. Lỗi khi prune bị nuốt để không bao giờ làm hỏng lần ghi.
+
+---
+
+## Debug Tracer (SER-DEBUG)
+
+Phần lưu audio ở trên chỉ giữ những clip **vượt** cổng confidence, và không giữ lại gì về **lý do** một clip bị loại. Tracer SER-DEBUG (`hal/drivers/voice/speech_emotion/debug_tracer.py`) lấp chỗ đó: với `HAL_SER_DEBUG=true`, nó ghi một thư mục cho mỗi câu nói và mỗi quyết định flush, chứa audio, mọi chỉ số đứng sau quyết định, cùng một profile latency/bộ nhớ theo từng stage. Nó phản chiếu tracer SPEAKER-DEBUG trong `speaker_recognizer.py` — cùng dạng env knob, cùng quy ước đặt tên thư mục, cùng cam kết "không bao giờ ném lỗi, không bao giờ đổi hành vi" — và cũng như nó, **đây là công cụ chỉ dành cho dev, dự kiến xoá trước khi deploy chính thức** (`grep -rn "SER-DEBUG" hal/drivers/voice/speech_emotion/`).
+
+**Mặc định tắt.** Công tắc chỉ được đọc một lần lúc import; đổi xong phải restart HAL. Khi tắt, mỗi lời gọi trace chỉ tốn một lần tra thuộc tính và một `nullcontext` — không timer, không sampler RSS, không giải mã audio.
+
+### Bố cục
+
+```
+<root>/recognize/<ts>_<label>_<confidence>/   một câu nói: submit → prefilter → HTTP → phán quyết
+<root>/recognize/<ts>_FAIL-<reason>/          bị loại trước khi có bất kỳ nhãn nào
+<root>/emit/<ts>_<label>_<confidence>/        một quyết định flush cho một user
+<root>/emit/<ts>_FAIL-<reason>/               flush không tạo ra gì để gửi
+```
+
+`<root>` mặc định là `speech_emotion_logs/` cạnh `debug_tracer.py` (đã git-ignore); nếu cây nguồn chỉ-đọc, nó rơi về `<tempdir>/hal-ser-debug` thay vì âm thầm tự tắt. `<ts>` có dạng `YYYYMMDD-HHMMSS-ffffff`; cách đặt tên khớp với log speaker và facial emotion, nên cả ba đọc theo cùng một kiểu.
+
+Thư mục được đặt tên theo nhãn **không** có nghĩa là sự kiện đã bắn — cả loại-vì-confidence-thấp lẫn loại-vì-dedup đều có một phân loại thật, và đặt tên theo nó chính là thứ khiến trace đáng mở ra xem. Trường `verdict` trong `result.json` mới mang kết cục thật (`buffered` / `emitted` / `dropped`, kèm `drop_reason`).
+
+Mỗi thư mục chứa:
+
+| File | Nội dung |
+|------|----------|
+| `input.wav` | WAV như lúc submit — thứ mic session bắt được, trước prefilter |
+| `prefiltered.wav` | WAV đã trim thực sự được upload; không có khi prefilter đã loại mẫu |
+| `result.json` | Toàn bộ quyết định: user, thống kê audio đầu vào, cấu hình engine (URL, mã hoá, Silero có nạp được không), mọi ngưỡng prefilter **và** các chỉ số đo được so với chúng, phiên HTTP, nhãn/confidence/ngưỡng/bucket, và phán quyết |
+| `profile.json` | Wall-clock / CPU / RSS theo từng stage — `recognize` → `prefilter` (→ `decode_wav`, `rms_trim`, `silero_vad`, `encode_wav`), `encode_b64`, `api_request`, `api_decode`, cộng `persist_wav` và `send_to_sensing` |
+
+Một câu nói tạo ra **một** thư mục dù phần code biết audio, biết phiên HTTP và biết phán quyết buffering nằm ở ba chỗ khác nhau: service mở một trace thread-local, engine điền vào đó khi audio đi qua, rồi service đóng lại. Các trường hợp loại ngay ở `submit()` xảy ra trên thread của caller, trước khi trace tồn tại, nên được ghi thành thư mục một-lần không kèm profile — chưa có gì chạy để mà profile.
+
+### Đọc profile
+
+`profile.json` trả lời "thời gian và bộ nhớ đi đâu". RSS được **lấy mẫu** trên một thread nền (~20 ms) và mỗi stage báo đỉnh trong cửa sổ của chính nó, vì cách chỉ đo hai đầu mút sẽ báo `0.0` cho một stage cấp phát rồi giải phóng ngay trong cửa sổ của nó. Hãy đọc `rss_peak_delta_mb` (stage đó tốn bao nhiêu ở lúc tệ nhất); `rss_end_delta_mb` là phần nó **giữ lại** và âm là hợp lệ khi allocator trả trang về OS. `cpu_pct > 100%` nghĩa là dùng hơn một core; `api_request` gần 0% là đúng — nó đang chờ mạng. Cả RSS lẫn `cpu_ms` đều tính trên toàn tiến trình, nên một thread HAL khác đang bận sẽ làm phồng số liệu; hãy đọc một stage như một cận trên và ưu tiên nhìn hình dạng qua nhiều lần gọi. Mỗi lần gọi cũng ghi một dòng tóm tắt vào log (`SER-DEBUG profile [recognize]: total=… recognize.prefilter.silero_vad=…ms/…%cpu/+…MB …`).
+
+### Biến môi trường
+
+| Biến env | Mặc định | Tác dụng |
+|----------|----------|----------|
+| `HAL_SER_DEBUG` | `false` | `true` để bật (áp dụng cho **cả** trace lẫn profile). Chỉ đọc một lần lúc import — đổi xong phải restart HAL |
+| `HAL_SER_DEBUG_DIR` | `speech_emotion_logs/` cạnh `debug_tracer.py` | Thư mục gốc đầu ra |
+| `HAL_SER_DEBUG_MAX_ENTRIES` | `1000` | Giới hạn thư mục theo từng loại, xoá cũ nhất; `0` = không giới hạn |
+
+Các knob này được đọc thẳng từ `os.environ` bên trong `debug_tracer.py`, **không** đi qua `hal/config.py` — để cả khối vẫn xoá được mà không đụng tới config.
+
+---
+
+## Nhóm Phân Cực (Polarity Buckets)
+
+Cách phân nhóm phản chiếu pipeline khuôn mặt để các key dedup `(user, bucket)` diễn giải được xuyên phương thức:
+
+| Bucket | Nhãn |
+|--------|------|
+| `positive` | happy, surprised |
+| `negative` | angry, disgusted, fearful, sad |
+| `other` | neutral, other, `<unk>` (bị **bỏ trước khi phân nhóm** — xem cổng chống spam #6, nên bucket này thực tế không chạm tới được) |
+
+Vì sao dedup theo bucket chứ không theo nhãn: emotion2vec trên câu nói ngắn lật qua lại giữa sad/fearful/angry trong cùng một trạng thái cảm xúc. Dedup theo nhãn sẽ gửi quá nhiều. Dedup theo bucket gộp nhiễu trong cùng nhóm (sad ↔ fearful ↔ angry) thành một sự kiện negative mỗi cửa sổ; còn lật chéo nhóm (sad → happy) vẫn bắn như một thay đổi tâm trạng thật.
+
+---
+
+## Các Cổng Chống Spam
+
+Xếp lớp, khớp với bộ xử lý cảm xúc khuôn mặt:
+
+| # | Chặng | Điều kiện drop |
+|---|-------|----------------|
+| 1 | `submit()` | `wav_bytes` rỗng / `duration_s < SPEECH_EMOTION_MIN_AUDIO_S` |
+| 2 | `submit()` | `user` rỗng sau normalize (không có chủ thể để gán cảm xúc — phản chiếu `current_user==""` của khuôn mặt) |
+| 3 | `submit()` | mọi bucket có thể phát (`positive`, `negative`) của user này vẫn còn trong cửa sổ dedup, cộng biên cho thời gian chờ hàng đợi + lời gọi cloud + một nhịp flush (`_buckets_saturated`, `DROP submit — every bucket … is still inside the dedup window`) |
+| 4 | worker | job đã chờ quá `DEFAULT_JOB_MAX_AGE_S` (30 s) trong hàng đợi |
+| 5 | engine | **prefilter** — cổng RMS trim/voiced/ratio, rồi Silero VAD (xem trên) |
+| 6 | worker | nhãn là `neutral` / `other` / `<unk>` (kiểm trước cổng confidence; flush kiểm lại để phòng thủ) |
+| 7 | worker | `confidence < CONFIDENCE_THRESHOLD_BY_LABEL[label]` (cổng theo nhãn, xem Cấu Hình) |
+| 8 | flush | `(user, bucket)` đã gửi cách đây chưa tới `SPEECH_EMOTION_DEDUP_WINDOW_S` giây |
+
+Mỗi bucket giữ entry TTL độc lập của riêng nó trong `_last_sent_by_key`. Gửi một sự kiện positive KHÔNG reset cửa sổ negative (và ngược lại). Cùng ngữ nghĩa với cảm xúc khuôn mặt.
+
+Map TTL được lưu vào sidecar theo boot (`/tmp/hal-ser-state.json`, `hal/dedup_sidecar.py`) để restart service HAL khôi phục cửa sổ dedup thay vì bắn lại cảm xúc gần nhất ở lần flush đầu sau deploy/OTA. Reboot toàn thiết bị thì khởi động sạch (tmpfs + kiểm tra `boot_id` của kernel). Cảm xúc khuôn mặt dùng cùng cơ chế với file riêng (`/tmp/hal-emotion-state.json`, `drivers/sensing/perceptions/processors/emotion.py`).
+
+Còn **ba** lớp giới hạn tốc độ nữa ở phía server, sau dedup của chính SER: `speech_emotion.detected` thuộc `ambientFloorTypes` (`SensingTurnFloorSeconds`, mặc định 120 s), nó hết hạn khỏi hàng chờ của runtime sau 60 s, và nó gộp về bản cuối cùng của loại đó (`runtimes/hermes/events.go`). Một sự kiện sống sót ở edge vẫn có thể bị loại trước khi tới agent.
+
+> **Thứ tự cổng và chi phí.** Cổng 3 bỏ qua lượt Silero và lời gọi cloud khi không nhãn nào có thể phát được, và cổng 6 bỏ qua lần ghi đĩa và việc thêm vào buffer cho kết quả neutral. Các kiểm tra phụ thuộc nhãn (cổng 6–8) vẫn cần kết quả cloud, nên khi còn ít nhất một bucket mở thì mọi clip qua được prefilter vẫn tốn một lời gọi cloud.
+
+---
+
+## Cấu Hình (`hal/config.py`)
+
+Mọi knob nằm trong `hal/config.py` dưới dạng `SPEECH_EMOTION_*`, override được qua biến môi trường (trừ `SPEECH_EMOTION_ENABLED`). Các mặc định phản chiếu `EMOTION_*` để hai phương thức hành xử giống nhau ngay từ đầu.
+
+| Hằng số | Biến env | Mặc định | Mục đích |
+|---------|----------|----------|----------|
+| `SPEECH_EMOTION_ENABLED` | _(không đọc env)_ | `false` | Công tắc tổng; lấy từ key `speech_emotion` của `cloud_perception` (opt-in của chủ máy trong Settings > Privacy, thiếu key là tắt), áp dụng live qua `POST /sensing/cloud-perception`. Bật thì service khởi tạo lazy, có hiệu lực từ câu nói kế tiếp. Xem [sensing-behavior_vi.md](../../robots/lamp/docs/vi/sensing-behavior_vi.md#nhận-thức-camera-qua-cloud-mặc-định-tắt) |
+| `SPEECH_EMOTION_FLUSH_S` | `HAL_SPEECH_EMOTION_FLUSH_S` | `10.0` | Nhịp rút buffer |
+| `SPEECH_EMOTION_DEDUP_WINDOW_S` | `HAL_SPEECH_EMOTION_DEDUP_WINDOW_S` | `300.0` | TTL cho `(user, bucket)` |
+| `SPEECH_EMOTION_MIN_AUDIO_S` | `HAL_SPEECH_EMOTION_MIN_AUDIO_S` | `3.0` | Độ dài câu nói tối thiểu |
+| `SPEECH_EMOTION_API_TIMEOUT_S` | `HAL_SPEECH_EMOTION_API_TIMEOUT_S` | `15` | Timeout HTTP của lời gọi recognize trên cloud; cũng dùng để tính biên cho cổng bucket-bão-hoà (cổng 3) |
+| `SPEECH_EMOTION_AUDIO_DIR` | `HAL_SPEECH_EMOTION_AUDIO_DIR` | `/tmp/hal-speech-emotion` | Thư mục WAV debug; `""` để tắt |
+| `DL_SER_ENDPOINT` | `DL_SER_ENDPOINT` | `/hal/api/dl/ser/recognize` | Hậu tố path trên `DL_BACKEND_URL` |
+| `SPEECH_EMOTION_API_URL` | — | dẫn xuất | `DL_BACKEND_URL` + `DL_SER_ENDPOINT` |
+| `SPEECH_EMOTION_API_KEY` | — | sao từ `DL_API_KEY` | Gửi dưới dạng `X-API-Key` |
+| `DL_ENCRYPTION_ENABLED` | `HAL_DL_ENCRYPTION` | `true` | Bọc body request/response; khi bật, request thiếu public key bị bỏ qua, không bao giờ gửi plaintext |
+| `SPEAKER_MIN_AUDIO_S` | `HAL_SPEAKER_MIN_AUDIO_S` | `0.8` | Cũng chặn việc dựng WAV cho SER; vô hiệu ở đây vì sàn 3.0 s của `submit()` cao hơn |
+
+Bộ nhãn, bản đồ bucket, ngưỡng prefilter, và **ngưỡng confidence theo từng nhãn** được khai báo trong `hal/drivers/voice/speech_emotion/constants.py` (không override được bằng env — sửa chúng cần thay code). Dict ngưỡng:
+
+```python
+# constants.py
+CONFIDENCE_THRESHOLD_BY_LABEL: dict[str, float] = {
+    SpeechEmotionLabel.HAPPY:     0.5,
+    SpeechEmotionLabel.SURPRISED: 0.6,
+    SpeechEmotionLabel.SAD:       0.7,
+    SpeechEmotionLabel.ANGRY:     0.6,
+    SpeechEmotionLabel.FEARFUL:   0.6,
+    SpeechEmotionLabel.DISGUSTED: 0.6,
+}
+DEFAULT_CONFIDENCE_THRESHOLD: float = 0.5  # dự phòng cho nhãn không có trong bảng
+```
+
+Cảm xúc tiêu cực có ngưỡng cao hơn để tránh báo động giả; `happy` lỏng nhất vì bắn nhầm tích cực thì rẻ; `sad` có ngưỡng cao nhất (code chỉ nêu giá trị, không nêu lý do). Tra cứu đi qua `utils.threshold_for(label)`, rơi về `DEFAULT_CONFIDENCE_THRESHOLD` cho nhãn không ánh xạ. Neutral / other / `<unk>` không bao giờ tới cổng này — chúng bị bỏ ngay trước đó.
+
+Cũng không cấu hình được qua env (chỉ qua tham số khởi tạo hoặc hằng số): `DEFAULT_QUEUE_MAXSIZE = 8`, `DEFAULT_JOB_MAX_AGE_S = 30.0`, `DEFAULT_AUDIO_MAX_FILES = 200`, các chuỗi rào đón, 3 lần retry OS server, và đường sidecar `/tmp/hal-ser-state.json`.
+
+---
+
+## Chế Độ Lỗi
+
+| Lỗi | Hệ quả | Khắc phục |
+|-----|--------|-----------|
+| Chưa cấu hình `DL_BACKEND_URL` | `recognizer.available` là False, thread không bao giờ chạy, `submit()` là no-op (`SERVICE IDLE` lúc boot) | Đặt `llm_base_url` trong config OS server |
+| perception-service chết (connection refused) | Worker log cảnh báo, bỏ mẫu, không retry ở chặng này | Câu nói kế tiếp tự thử lại |
+| perception-service trả non-200 / không phải JSON / thiếu `label` | Worker log cảnh báo, bỏ mẫu | Như trên |
+| Đang bật mã hoá nhưng thiếu public key | `recognize()` bỏ qua request (không gửi plaintext); key được lấy lại sau 60 giây (`DLCrypto` trong `hal/drivers/sensing/crypto.py`) | Sửa `DL_PUBLIC_KEY_URL`/`DL_PUBLIC_KEY_FILE`; mẫu chạy lại khi lấy được key |
+| Thiếu model Silero / ORT hỏng | Prefilter rơi về ngưỡng RMS **nghiêm hơn** (3.0 s voiced) | Khôi phục `resources/silero_vad.onnx`; xem cảnh báo nạp model một lần |
+| Prefilter từ chối clip | Bỏ mẫu trước lời gọi cloud, kèm log các chỉ số dẫn tới quyết định | Bình thường với TV/nhạc/audio thưa; chỉnh các hằng số `PREFILTER_*` trong `constants.py` nếu tiếng nói thật đang bị cắt |
+| Hàng đợi worker đầy | `submit()` log `EVICT`, loại job **cũ nhất** và đưa job mới vào | Dấu hiệu backend quá tải; job cũ hơn 30 s cũng bị worker bỏ |
+| Endpoint sensing của OS server chết | 3 lần thử với back-off 2 s, rồi bỏ mẫu | Buffer tiếp tục đầy cho lần flush sau |
+| `duration_s < MIN_AUDIO_S` | Bỏ trong `submit()` kèm một dòng log | Bình thường — câu quá ngắn không đáng phân loại |
+| `mkdir` thư mục audio lỗi | Tắt persistence cho cả tiến trình; mọi POST mang `audio` rỗng | Kiểm tra quyền trên `HAL_SPEECH_EMOTION_AUDIO_DIR` |
+
+Không thứ nào ở đây chặn đường STT hay speaker recognition — lỗi SER im lặng ở mức người dùng và chỉ thấy được trong log HAL.
+
+---
+
+## Gỡ Lỗi
+
+Mọi lý do drop đều có dòng log `[speech_emotion]` (`DROP` / `EVICT`); `HAL_SER_DEBUG=true` ghi lại lý do của từng lần drop (xem phần SER-DEBUG). Tóm tắt nhanh:
+
+1. `SERVICE IDLE` lúc khởi động → chưa set `DL_BACKEND_URL`.
+2. Có `SERVICE STARTED` nhưng không có `submit() called` → turn ngắn hơn 3.0 s, hoặc thiếu capability `audio`.
+3. Có `submit() called` nhưng không có `POST` → đọc dòng `[prefilter]`; drop do audio thưa là phổ biến trong phòng yên tĩnh hoặc vang.
+4. Có `recognize OK` nhưng không có `EMIT` → toàn `neutral` (`DROP — neutral label`), confidence thấp, hoặc còn trong cửa sổ dedup (thử `HAL_SPEECH_EMOTION_DEDUP_WINDOW_S=5`).
+5. Có `SENT -> OS server 200 OK` nhưng agent không phản ứng → phía server: sàn ambient 120 s, hết hạn hàng đợi 60 s, hoặc gộp-về-bản-cuối.
+
+### Kiểm chứng bằng tay
+
+Hai script (thủ công, không phải unit test — cần mic và backend truy cập được):
+
+```bash
+python -m hal.test.test_speech_emotion_engine     # chỉ chặng cloud
+python -m hal.test.test_speech_emotion_service    # toàn pipeline + OS server giả trên :5000
+```
+
+### Ảnh chụp chẩn đoán
+
+`SpeechEmotionService.to_dict()` trả về ảnh chụp runtime cho các endpoint introspection:
+
+```json
+{
+  "type": "speech_emotion",
+  "available": true,
+  "buffered_users": 2,
+  "dedup_keys": 3,
+  "queue_size": 0,
+  "last_flush_ts": 1715587812.41
+}
+```
+
+`dedup_keys` bị chặn bởi (số user đã thấy) × 2 bucket. Nó báo dư khi rảnh, vì key hết hạn chỉ được prune ở các nhịp flush có việc.
+
+---
+
+## Quan Hệ Với Các Hệ Thống Khác
+
+| Pipeline | Phương thức | Kích hoạt | Loại sự kiện | Cùng skill tiêu thụ? |
+|----------|-------------|-----------|--------------|----------------------|
+| Cảm xúc khuôn mặt (`drivers/sensing/perceptions/processors/emotion.py`) | Frame camera → crop mặt | Mỗi khuôn mặt thấy được | `emotion.detected` | có — `user-emotion-detection/SKILL.md` |
+| **Cảm xúc giọng nói (tài liệu này)** | Mic → WAV cuối phiên | Mỗi phiên mic có ≥ 3.0 s audio vượt prefilter — **độc lập với transcript STT** | `speech_emotion.detected` | có — cùng `user-emotion-detection/SKILL.md` (router nhận cả hai tiền tố) |
+| Tổng hợp mood (skill Mood) | — | Bất kỳ tín hiệu cảm xúc nào | các dòng mood `signal` / `decision` | — |
+| Sound (`sound.py` perception) | RMS mic | Tiếng ồn lớn | `sound` | leo thang tiếng chó sủa, skill riêng |
+
+Cảm xúc giọng nói dùng chung từ vựng phân cực với cảm xúc khuôn mặt một cách có chủ đích. Sensing handler của OS server gắn tiền tố `[speech_emotion]` cho sự kiện đến (so với `[emotion]` cho khuôn mặt) tại `system/lib/sensingmsg/sensingmsg.go`, pre-fetch cùng khối `[emotion_context: …]` qua `skillcontext.BuildEmotionContext` (một `case` trong `sensingmsg.go` phục vụ cả hai loại), và định tuyến tới `user-emotion-detection/SKILL.md`. Bản đồ nhãn→mood bao phủ cả hai từ vựng (`Fear`/`Fearful → stressed`, `Surprise`/`Surprised → excited`, `Disgust`/`Disgusted → frustrated`); hành vi khác biệt duy nhất theo phương thức trong skill là `source:"voice"` so với `source:"camera"` trên dòng mood signal. Cooldown gợi ý nhạc dùng chung xuyên phương thức nên voice không thể vượt qua một gợi ý gần đây do camera kích hoạt, và ngược lại.
+
+`[speech_emotion]` cũng nằm trong `ackSkipPrefixes` của mọi runtime (`runtimes/*/emotion_ack.go`), nên các turn này **không** kích hoạt mặt "thinking" — chúng thường kết thúc bằng `NO_REPLY`, vốn sẽ làm khuôn mặt kẹt lại.
+
+---
+
+## Xem thêm
+
+- [perception-service: Speech emotion (SER)](../../integrations/perception-service/docs/perceptions.md#4-speech-emotion-ser) — endpoint emotion2vec, tiền xử lý và chuỗi phục vụ ONNX/TensorRT (tiếng Anh).
+- [docs/vi/perception-service_vi.md](perception-service_vi.md) — dịch vụ cloud DL inference, load balancer, mã hóa.
+- [perception-service: Facial emotion (FER)](../../integrations/perception-service/docs/perceptions.md#2-facial-emotion-fer) — model cloud của bản sinh đôi phía camera (tiếng Anh).
+- [docs/vi/realtime-voice_vi.md](realtime-voice_vi.md) — pipeline voice turn mà SER gắn vào.

@@ -1,0 +1,125 @@
+package server
+
+import (
+	"bytes"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
+	"strings"
+
+	"github.com/gin-gonic/gin"
+
+	"go.autonomous.ai/os/system/server/config"
+	"go.autonomous.ai/os/system/server/session"
+)
+
+// hardwareProxy is a wildcard reverse proxy from /api/hardware/* to HAL on
+// loopback (127.0.0.1:5001).
+var openapiProxy = func() http.Handler {
+	target, _ := url.Parse("http://127.0.0.1:5001")
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	origDirector := proxy.Director
+	proxy.Director = func(req *http.Request) {
+		origDirector(req)
+		stripProxyCredential(req)
+		req.Header.Del("X-Forwarded-For")
+		req.Header.Del("X-Real-IP")
+	}
+	return proxy
+}()
+
+// ambientLEDGate mirrors the intent/agent paths' led_set/led_off ambient
+// signals for LED writes that arrive through the hardware proxy (web UI →
+// /api/hardware/* → HAL).
+func (s *Server) ambientLEDGate() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// A new resting look clears HAL's saved colour, so ambient restore resumes.
+		if s.ambientService != nil && c.Request.Method == http.MethodPut && c.Param("path") == "/led/resting" {
+			s.ambientService.UnlockLED()
+		}
+		if s.ambientService != nil && c.Request.Method == http.MethodPost {
+			switch c.Param("path") {
+			case "/led/solid", "/led/effect", "/scene":
+				if !transientBody(c) {
+					s.ambientService.LockLED()
+				}
+			case "/led/paint":
+				s.ambientService.LockLED()
+			case "/led/off":
+				if !transientBody(c) {
+					s.ambientService.UnlockLED()
+				}
+			case "/scene/off":
+				s.ambientService.UnlockLED()
+			}
+		}
+		c.Next()
+	}
+}
+
+// transientBody peeks at the JSON body for `"transient": true`, restoring the
+// body for the proxy. A missing/unreadable body counts as non-transient.
+func transientBody(c *gin.Context) bool {
+	if c.Request.Body == nil {
+		return false
+	}
+	body, err := io.ReadAll(io.LimitReader(c.Request.Body, 1<<20))
+	if err != nil {
+		c.Request.Body = io.NopCloser(bytes.NewReader(nil))
+		return false
+	}
+	c.Request.Body = io.NopCloser(bytes.NewReader(body))
+	var probe struct {
+		Transient bool `json:"transient"`
+	}
+	_ = json.Unmarshal(body, &probe)
+	return probe.Transient
+}
+
+var hardwareProxy = func() http.Handler {
+	target, _ := url.Parse("http://127.0.0.1:5001")
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	origDirector := proxy.Director
+	proxy.Director = func(req *http.Request) {
+		req.URL.Path = strings.TrimPrefix(req.URL.Path, "/api/hardware")
+		if req.URL.Path == "" {
+			req.URL.Path = "/"
+		}
+		origDirector(req)
+		stripProxyCredential(req)
+		// Stop leaking the original LAN client IP downstream: HAL's
+		// same-origin/local check trusts loopback, so we present as one.
+		req.Header.Del("X-Forwarded-For")
+		req.Header.Del("X-Real-IP")
+	}
+	return proxy
+}()
+
+// Authentication has already run in Go. HAL must never receive the browser's
+// legacy admin credential, including through its access log query string.
+func stripProxyCredential(req *http.Request) {
+	query := req.URL.Query()
+	if _, present := query["token"]; present {
+		query.Del("token")
+		req.URL.RawQuery = query.Encode()
+	}
+}
+
+// ownerActionHeader tells HAL a hardware call came from a logged-in owner (session
+// cookie or session token). A Bearer LLM key (scripts, the agent) does not count, and
+// any client-supplied value is dropped so it cannot be forged through the proxy.
+func ownerActionHeader(cfg *config.Config) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Request.Header.Del(halOwnerActionHeader)
+		bearer := strings.TrimSpace(strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer "))
+		if session.HasValid(c, cfg) || session.VerifyToken(bearer, cfg) {
+			c.Request.Header.Set(halOwnerActionHeader, "1")
+		}
+		c.Next()
+	}
+}
+
+// halOwnerActionHeader mirrors OWNER_ACTION_HEADER in hal/routes/camera.py.
+const halOwnerActionHeader = "X-OS-Owner-Action"

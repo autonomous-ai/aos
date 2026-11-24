@@ -1,0 +1,13 @@
+.build/
+.swiftpm/
+Package.resolved
+DerivedData/
+*.xcodeproj/
+*.xcworkspace/
+.DS_Store
+xcuserdata/
+dist/
+
+# mock-device build output
+mock-device/autonomous-buddy-mock-device
+mock-device/mock-device

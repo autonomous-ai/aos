@@ -1,0 +1,531 @@
+import { SettingsSelect } from "@/components/SettingsSelect";
+import { useEffect, useRef, useState } from "react";
+import "./settings-details.css";
+import { RuntimeAccountLogin } from "./RuntimeAccountLogin";
+import { toast } from "sonner";
+import { C, SectionCard } from "@/components/setup/shared";
+import { getAgentRuntime, setAgentRuntime, type LLMConfigMode } from "@/lib/api";
+
+// Runtime switch sits outside the form Save flow: POST means accepted, then poll until the target is reported.
+const FALLBACK = ["openclaw", "hermes", "picoclaw", "codex", "claudecode", "opencode", "remote"];
+
+const REMOTE = "remote";
+
+const RUNTIME_BLURB: Record<string, string> = {
+  openclaw: "OpenClaw — persistent WebSocket gateway (default).",
+  hermes: "Hermes — local HTTP+SSE agent server (Nous Research).",
+  picoclaw: "PicoClaw — lightweight Go agent gateway (WebSocket).",
+  codex: "Codex — OpenAI Codex CLI behind the os-server bridge (WebSocket).",
+  claudecode: "Claude Code — Anthropic CLI agent behind a local bridge.",
+  opencode: "OpenCode — open-source coding agent behind the os-server bridge (WebSocket).",
+  remote: "Remote (Hermes-over-LAN) — the robot reuses its Hermes runtime pointing at a Hermes server on another machine (typically your Mac). Requires the target Hermes to bind on 0.0.0.0, not just 127.0.0.1, so the robot can reach it.",
+};
+
+const RUNTIME_LABEL: Record<string, string> = {
+  openclaw: "OpenClaw",
+  hermes: "Hermes",
+  picoclaw: "PicoClaw",
+  codex: "Codex",
+  claudecode: "Claude Code",
+  opencode: "OpenCode",
+  remote: "Remote (external)",
+};
+const displayRuntime = (v: string): string =>
+  RUNTIME_LABEL[v] ?? (v ? v[0].toUpperCase() + v.slice(1) : v);
+
+const selectStyle = {
+  width: "100%", boxSizing: "border-box" as const,
+  background: C.surface, border: `1px solid ${C.border}`,
+  borderRadius: 7, padding: "8px 11px",
+  fontSize: 12.5, color: C.text, outline: "none", cursor: "pointer",
+};
+const labelStyle = { display: "block", fontSize: 12, color: C.textDim, marginBottom: 5 };
+
+export function AgentRuntimeSection({ active, llmConfigMode, savedLlmConfigMode, llmModeApplyPending, onLlmConfigModeChange, onAccountConnected, onLoginBusyChange, saving }: {
+  active: boolean;
+  llmConfigMode: LLMConfigMode;
+  savedLlmConfigMode: LLMConfigMode;
+  llmModeApplyPending: boolean;
+  onLlmConfigModeChange: (mode: LLMConfigMode) => void;
+  onAccountConnected: (historical: boolean) => void;
+  onLoginBusyChange: (busy: boolean) => void;
+  saving: boolean;
+}) {
+  const [wantsAccount, setWantsAccount] = useState(false);
+  const [loginBusy, setLoginBusy] = useState(false);
+  useEffect(() => {
+    onLoginBusyChange(loginBusy);
+    return () => onLoginBusyChange(false);
+  }, [loginBusy, onLoginBusyChange]);
+  const chosenMode = wantsAccount ? "runtime" : llmConfigMode;
+  const [current, setCurrent] = useState<string>("");
+  const [options, setOptions] = useState<string[]>(FALLBACK);
+  const [selected, setSelected] = useState<string>("");
+  const [loading, setLoading] = useState(true);
+  const [switching, setSwitching] = useState(false);
+  // Label follows the gateway's readiness probe, not just the selected runtime.
+  const [ready, setReady] = useState(true);
+  const [remoteURL, setRemoteURL] = useState<string>("");
+  const [remoteToken, setRemoteToken] = useState<string>("");
+  const [showRemoteHelp, setShowRemoteHelp] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    const poll = () => {
+      getAgentRuntime()
+        .then((r) => {
+          if (!alive) return;
+          setCurrent(r.current);
+          setSelected((sel) => sel || r.current);
+          if (r.options?.length) setOptions(r.options);
+          setReady(r.ready);
+          // Only seed when empty so a poll never clobbers typing.
+          setRemoteURL((v) => v || r.remote_url || "");
+          setRemoteToken((v) => v || r.remote_token || "");
+          if (!r.ready) timer = setTimeout(poll, 3000);
+        })
+        .catch(() => { if (alive) timer = setTimeout(poll, 3000); })
+        .finally(() => { if (alive) setLoading(false); });
+    };
+    poll();
+    return () => { alive = false; if (timer) clearTimeout(timer); };
+  }, []);
+
+  const modeNeedsSave = llmModeApplyPending || llmConfigMode !== savedLlmConfigMode;
+
+  async function onSwitch() {
+    if (switching || saving || modeNeedsSave || loginBusy) return;
+    let remoteOpts: { url: string; token: string } | undefined;
+    if (selected === REMOTE) {
+      const url = remoteURL.trim();
+      if (!url) {
+        toast.error("Gateway URL is required.");
+        return;
+      }
+      if (!/^https?:\/\//i.test(url)) {
+        toast.error("Gateway URL must start with http:// or https://.");
+        return;
+      }
+      remoteOpts = { url, token: remoteToken.trim() };
+    }
+    if (selected === current && selected !== REMOTE) return;
+    if (!window.confirm(
+      selected === REMOTE
+        ? `Switch to Remote Hermes at ${remoteOpts?.url}?\n\n` +
+          `This restarts os-server — the robot will be briefly unavailable while it reconnects to the external Hermes.`
+        : `Switch agentic backend to "${displayRuntime(selected)}"?\n\n` +
+          `This stops the other backend and restarts os-server — the robot will ` +
+          `be briefly unavailable while it reconnects.`,
+    )) return;
+
+    setSwitching(true);
+    const target = selected;
+    try {
+      await setAgentRuntime(target, remoteOpts);
+    } catch (err) {
+      if ((err as Error & { status?: number }).status === 409) {
+        toast.error("Another runtime switch is already in progress. Wait for it to finish before trying again.");
+        setSwitching(false);
+        return;
+      }
+      // A dropped connection usually means os-server restarted after accepting.
+    }
+    toast.message(`Switching to ${displayRuntime(target)} — waiting for the robot to confirm…`);
+
+    // GET is the source of truth: the runtime persists only after a successful switch.
+    const deadline = Date.now() + 5 * 60_000;
+    let landed = false;
+    let lastSeen = "";
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 3000));
+      try {
+        const r = await getAgentRuntime();
+        lastSeen = r.current;
+        setReady(r.ready);
+        // Wait for both: the name lands first, the gateway answers later.
+        if (r.current === target && r.ready) { landed = true; break; }
+      } catch { /* os-server restarting — keep polling */ }
+    }
+
+    if (landed) {
+      setCurrent(target);
+      toast.success(`Switched to ${displayRuntime(target)} — backend is active.`);
+    } else {
+      if (lastSeen) { setCurrent(lastSeen); setSelected(lastSeen); }
+      toast.error(
+        lastSeen && lastSeen !== target
+          ? `Switch to ${displayRuntime(target)} not confirmed — robot still reports "${displayRuntime(lastSeen)}" (likely failed and rolled back; check journalctl -u os-runtime-switch).`
+          : `Switch to ${displayRuntime(target)} not confirmed within 5 minutes — reload this page to re-check.`,
+      );
+    }
+    setSwitching(false);
+  }
+
+  const manualConfiguration = <>
+    <a href={`/monitor${window.location.search}#cli`} style={{ color: C.amber }}>Open Terminal</a>
+    {llmConfigMode !== "runtime" ? (
+      <button type="button" disabled={saving || loginBusy} onClick={(event) => { event.preventDefault(); onLlmConfigModeChange("runtime"); }} style={{ padding: "8px 16px", background: C.surface, color: C.text, border: `1px solid ${C.border}`, borderRadius: 7 }}>Use this configuration</button>
+    ) : modeNeedsSave ? (
+      <button type="submit" form="edit-form" disabled={saving || loginBusy} style={{ padding: "8px 16px", background: C.amber, color: "var(--lm-on-amber)", border: 0, borderRadius: 7 }}>Save Changes</button>
+    ) : <p style={{ margin: 0, color: C.textDim }}>Runtime configuration mode is saved. Check Chat to verify account access.</p>}
+  </>;
+
+  return (
+    <SectionCard id="runtime" title="Agent Runtime" active={active}>
+      {loading ? (
+        <div style={{ fontSize: 12, color: C.textDim }}>Loading…</div>
+      ) : (
+        <>
+          <div style={{ fontSize: 12.5, color: C.textDim, marginBottom: 12, lineHeight: 1.6 }}>
+            Choose a runtime first, then choose how it connects to an AI provider.
+          </div>
+
+          <div style={{ marginBottom: 6 }}>
+            <label htmlFor="agent_runtime" style={labelStyle}>
+              1. Choose runtime (active: <span style={{ color: C.amber }}>{current ? displayRuntime(current) : "?"}</span>
+              {current && !ready && <span style={{ color: C.textDim }}> — starting…</span>})
+            </label>
+            <SettingsSelect
+              id="agent_runtime"
+              value={selected}
+              onValueChange={(value) => setSelected(value)}
+              disabled={switching || saving || modeNeedsSave || loginBusy}
+              style={selectStyle}
+            >
+              {options.map((o) => <option key={o} value={o}>{displayRuntime(o)}</option>)}
+            </SettingsSelect>
+          </div>
+
+          {RUNTIME_BLURB[selected] && (
+            <div style={{ fontSize: 12, color: C.textDim, marginBottom: 14 }}>
+              {RUNTIME_BLURB[selected]}
+            </div>
+          )}
+
+          {selected === REMOTE && (
+            <div style={{ marginBottom: 14 }}>
+              <div style={{ marginBottom: 10 }}>
+                <button
+                  type="button"
+                  onClick={() => setShowRemoteHelp(true)}
+                  style={{
+                    background: "none", border: "none", padding: 0, marginBottom: 10,
+                    color: C.amber, fontSize: 12.5, cursor: "pointer",
+                    textDecoration: "underline", textUnderlineOffset: 3,
+                  }}
+                >
+                  ▸ How do I get the URL + API Key from my Mac?
+                </button>
+              </div>
+              <div style={{ marginBottom: 10 }}>
+                <label htmlFor="agent_remote_url" style={labelStyle}>
+                  Hermes URL <span style={{ color: C.textDim }}>(http:// or https://, on the Mac's LAN address, e.g. http://192.168.1.42:8642)</span>
+                </label>
+                <input
+                  id="agent_remote_url"
+                  type="text"
+                  value={remoteURL}
+                  onChange={(e) => setRemoteURL(e.target.value)}
+                  placeholder="http://192.168.1.42:8642"
+                  disabled={switching}
+                  autoComplete="off"
+                  spellCheck={false}
+                  style={{ ...selectStyle, cursor: "text", fontFamily: "monospace" }}
+                />
+              </div>
+              <div>
+                <label htmlFor="agent_remote_token" style={labelStyle}>
+                  API Key <span style={{ color: C.textDim }}>(optional; sent as Bearer — leave blank if Hermes is open)</span>
+                </label>
+                <input
+                  id="agent_remote_token"
+                  type="password"
+                  value={remoteToken}
+                  onChange={(e) => setRemoteToken(e.target.value)}
+                  placeholder="leave blank if not required"
+                  disabled={switching}
+                  autoComplete="off"
+                  spellCheck={false}
+                  style={{ ...selectStyle, cursor: "text", fontFamily: "monospace" }}
+                />
+              </div>
+            </div>
+          )}
+
+          {modeNeedsSave && (
+            <p style={{ fontSize: 11.5, color: C.amber, lineHeight: 1.6 }}>
+              Save your AI configuration in step 2 before switching runtimes.
+            </p>
+          )}
+          {(() => {
+            const isRemote = selected === REMOTE;
+            const disabled = switching || saving || modeNeedsSave || loginBusy || (selected === current && !isRemote);
+            let label: string;
+            if (switching) label = "Switching…";
+            else if (isRemote && selected === current) label = "Update Remote Config";
+            else if (selected === current) label = ready ? "Active" : "Starting…";
+            else label = `Switch to ${displayRuntime(selected)}`;
+            return (
+              <button
+                type="button"
+                onClick={onSwitch}
+                disabled={disabled}
+                style={{
+                  padding: "7px 18px", borderRadius: 7, fontSize: 12, fontWeight: 600,
+                  border: "none",
+                  cursor: disabled ? "not-allowed" : "pointer",
+                  background: disabled ? C.surface : C.amber,
+                  color: disabled ? C.textMuted : "#0C0B09",
+                  opacity: disabled ? 0.6 : 1,
+                  transition: "all 0.15s",
+                }}
+              >
+                {label}
+              </button>
+            );
+          })()}
+
+          {current !== REMOTE && selected !== REMOTE && (
+            <div style={{ marginTop: 22, paddingTop: 18, borderTop: `1px solid ${C.border}` }}>
+              <div id="llm-config-label" style={labelStyle}>
+                2. Configure AI for {displayRuntime(current)}
+              </div>
+              {switching || selected !== current ? (
+                <p role="status" style={{ fontSize: 12, color: C.amber, lineHeight: 1.6 }}>
+                  {switching
+                    ? `Switching to ${displayRuntime(selected)}. AI configuration will be available when the switch finishes.`
+                    : `Click “Switch to ${displayRuntime(selected)}” above to configure its AI connection.`}
+                </p>
+              ) : null}
+              <fieldset
+                aria-labelledby="llm-config-label"
+                disabled={switching || saving || loginBusy || selected !== current}
+                style={{ border: 0, padding: 0, margin: "10px 0 0", minWidth: 0, display: "flex", flexDirection: "column", gap: 10 }}
+              >
+                {([
+                  ["os", "Use OS AI Brain"],
+                  ["runtime", "Use my own account / configure in runtime"],
+                ] as const).map(([mode, label]) => (
+                  <label key={mode} style={{
+                    display: "flex", alignItems: "center", gap: 10,
+                    padding: "12px", borderRadius: 7, fontSize: 12.5,
+                    border: `1px solid ${(chosenMode || "os") === mode ? C.amber : C.border}`,
+                    background: C.surface, color: C.text,
+                    opacity: switching || saving || loginBusy || selected !== current ? 0.5 : 1,
+                    cursor: switching || saving || loginBusy || selected !== current ? "not-allowed" : "pointer",
+                  }}>
+                    <input
+                      type="radio"
+                      name="llm_config_mode"
+                      value={mode}
+                      checked={(chosenMode || "os") === mode}
+                      onChange={() => {
+                        setWantsAccount(mode === "runtime");
+                        onLlmConfigModeChange(mode === "os" ? mode : savedLlmConfigMode);
+                      }}
+                      style={{ margin: 0, accentColor: C.amber, flexShrink: 0 }}
+                    />
+                    {label}
+                  </label>
+                ))}
+              </fieldset>
+              {!switching && selected === current && (
+                <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-start", gap: 12, marginTop: 12 }}>
+                  <RuntimeAccountLogin
+                      key={current}
+                      runtime={current}
+                      visible={chosenMode === "runtime"}
+                      onResume={() => setWantsAccount(true)}
+                      disabled={saving}
+                      onBusyChange={setLoginBusy}
+                      onConnected={onAccountConnected}
+                      fallback={<>
+                        <p style={{ margin: 0, color: C.textDim }}>Web sign-in is not available for {displayRuntime(current)}. Configure its account and model in Terminal, then apply the configuration here.</p>
+                        {manualConfiguration}
+                      </>}
+                      advanced={<details style={{ width: "100%" }}>
+                        <summary style={{ cursor: "pointer", color: C.textDim }}>Use existing runtime configuration</summary>
+                        <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-start", gap: 12, marginTop: 12 }}>
+                          <p style={{ margin: 0, color: C.textDim }}>For accounts and models already configured in this runtime. This changes configuration mode without signing in or checking account access.</p>
+                          {manualConfiguration}
+                        </div>
+                      </details>}
+
+                    />
+                  {chosenMode !== "runtime" && <>
+                    <p style={{ margin: 0, fontSize: 11.5, color: C.textDim, lineHeight: 1.6 }}>Use the provider and model saved in Settings → AI Brain.</p>
+                    <button
+                      type="submit"
+                      form="edit-form"
+                      disabled={saving || !modeNeedsSave}
+                      style={{
+                        padding: "7px 18px", borderRadius: 7, fontSize: 12, fontWeight: 600,
+                        border: "none",
+                        cursor: saving || !modeNeedsSave ? "not-allowed" : "pointer",
+                        background: saving || !modeNeedsSave ? C.surface : C.amber,
+                        color: saving || !modeNeedsSave ? C.textMuted : "var(--lm-on-amber)",
+                      }}
+                    >
+                      {saving ? "Saving…" : modeNeedsSave ? "Save Changes" : "Saved"}
+                    </button>
+                    {modeNeedsSave && <p role="status" style={{ margin: 0, fontSize: 12, color: C.amber }}>Click Save Changes to apply your choice.</p>}
+                  </>}
+                  <p style={{ margin: 0, fontSize: 11.5, color: C.textDim, lineHeight: 1.6 }}>
+                    This choice also applies when you switch runtimes. Sign in separately for each runtime.
+                  </p>
+                </div>
+              )}
+            </div>
+          )}
+        </>
+      )}
+      {showRemoteHelp && <RemoteHelpModal onClose={() => setShowRemoteHelp(false)} />}
+    </SectionCard>
+  );
+}
+
+// One-page guide for getting a Hermes URL + API key off the operator's Mac.
+function RemoteHelpModal({ onClose }: { onClose: () => void }) {
+  const setupCmd =
+    'curl -fsSL https://cdn.autonomous.ai/os/tools/setup-remote-hermes.sh | bash';
+  const [copied, setCopied] = useState(false);
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    dialog?.showModal();
+    return () => dialog?.close();
+  }, []);
+  // navigator.clipboard requires a secure context (https or localhost)
+  const copyCmd = () => {
+    let ok = false;
+    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const ta = document.createElement("textarea");
+    try {
+      ta.value = setupCmd;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      // Keep the temporary selection inside the modal's active focus scope.
+      (dialogRef.current ?? document.body).appendChild(ta);
+      ta.focus(); ta.select();
+      ok = document.execCommand("copy");
+    } catch {
+      ok = false;
+    } finally {
+      ta.remove();
+      previousFocus?.focus();
+    }
+    if (!ok) {
+      navigator.clipboard?.writeText(setupCmd).then(() => {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1500);
+      }).catch(() => undefined);
+      return;
+    }
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1500);
+  };
+  return (
+    <dialog
+      ref={dialogRef}
+      className="lm-runtime-help"
+      aria-labelledby="runtime-help-title"
+      onCancel={(event) => { event.preventDefault(); onClose(); }}
+      onClick={(event) => { if (event.target === event.currentTarget) onClose(); }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10,
+          maxWidth: 640, width: "100%", maxHeight: "85vh", overflow: "auto",
+          padding: "22px 26px", color: C.text, fontSize: 13, lineHeight: 1.6,
+          position: "relative",
+        }}
+      >
+        <button
+          type="button"
+          onClick={onClose}
+          aria-label="Close"
+          style={{
+            position: "absolute", top: 10, right: 12,
+            background: "none", border: "none", color: C.textDim,
+            fontSize: 22, lineHeight: 1, cursor: "pointer", padding: 4,
+          }}
+        >
+          ×
+        </button>
+        <div id="runtime-help-title" style={{ fontSize: 16, fontWeight: 600, marginBottom: 6, paddingRight: 26, color: C.amber }}>
+          Get the Hermes URL + API Key
+        </div>
+        <div style={{ fontSize: 12.5, color: C.textDim, marginBottom: 16 }}>
+          Runs on your Mac. Enables Hermes's built-in API server on the LAN so the robot can reach it, and prints the two fields to paste back here.
+        </div>
+
+        <div style={{ marginBottom: 6, fontSize: 12.5, color: C.textDim }}>
+          1. Open <b>Terminal</b> on your Mac (same Wi-Fi as this robot).
+        </div>
+        <div style={{ marginBottom: 6, fontSize: 12.5, color: C.textDim }}>
+          2. Paste this command and press Enter:
+        </div>
+        <pre
+          style={{
+            background: "#0C0B09", border: `1px solid ${C.border}`, borderRadius: 6,
+            padding: "10px 12px", fontSize: 12, fontFamily: "monospace",
+            whiteSpace: "pre-wrap", wordBreak: "break-all", margin: "0 0 10px",
+            color: C.text,
+          }}
+        >
+          {setupCmd}
+        </pre>
+        <button
+          type="button"
+          onClick={copyCmd}
+          style={{
+            background: copied ? C.amber : C.surface,
+            border: `1px solid ${copied ? C.amber : C.border}`,
+            borderRadius: 6,
+            padding: "4px 10px", fontSize: 12,
+            color: copied ? "#0C0B09" : C.textDim,
+            cursor: "pointer", marginBottom: 16,
+            transition: "all 0.15s",
+          }}
+        >
+          {copied ? "✓ Copied" : "Copy command"}
+        </button>
+
+        <div style={{ marginBottom: 6, fontSize: 12.5, color: C.textDim }}>
+          3. The script installs a small dependency, starts the Hermes API server on <code style={{ fontSize: 12 }}>0.0.0.0:8642</code>, and prints something like:
+        </div>
+        <pre
+          style={{
+            background: "#0C0B09", border: `1px solid ${C.border}`, borderRadius: 6,
+            padding: "10px 12px", fontSize: 12, fontFamily: "monospace",
+            whiteSpace: "pre-wrap", margin: "0 0 10px", color: C.textDim,
+          }}
+        >
+{`Hermes URL : http://192.168.1.42:8642
+API Key    : intern2-hermes-a1b2c3d4e5f6a7b8`}
+        </pre>
+        <div style={{ marginBottom: 16, fontSize: 12.5, color: C.textDim }}>
+          4. Copy those two values into the <b>Hermes URL</b> + <b>API Key</b> fields on this page, then click <b>Switch to Remote (external)</b>.
+        </div>
+
+        <div style={{ fontSize: 12, color: C.textDim, borderTop: `1px solid ${C.border}`, paddingTop: 12, marginTop: 8 }}>
+          Auto-detect fails? Firewall blocks the port? Chat works then stops on sleep? The full guide covers all of it — including how to override the Hermes install path if the script can't find it.
+          <br />
+          <span style={{ color: C.textDim }}>
+            <a
+              href="https://github.com/anthropics/autonomous/blob/main/docs/agentic/remote-hermes.md"
+              target="_blank"
+              rel="noreferrer"
+              style={{ color: C.amber }}
+            >
+              docs/agentic/remote-hermes.md
+            </a>
+          </span>
+        </div>
+      </div>
+    </dialog>
+  );
+}

@@ -1,0 +1,60 @@
+name: Publish skills
+
+# On merge to main: upload skill zips and update ota/metadata.json.
+# Kept out of ci.yml so a skipped publish never blocks a required check.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'skills/**'
+      - 'scripts/release/upload-skills.sh'
+      - 'scripts/release/ota-config.sh'
+      - '.github/workflows/publish-skills.yml'
+  workflow_dispatch:
+
+# Serialized and never cancelled: metadata.json is read-modify-write.
+concurrency:
+  group: publish-skills
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish skills — zips + metadata.json
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: skill catalog matches the skills/ tree
+        run: python3 scripts/skills/gen_catalog.py --check
+
+      # Skip with a warning until the GCS secret is configured.
+      - name: credentials present?
+        id: creds
+        env:
+          KEY: ${{ secrets.GCS_SERVICE_ACCOUNT_KEY }}
+        run: |
+          if [ -z "$KEY" ]; then
+            echo "have=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=Skills not published::GCS_SERVICE_ACCOUNT_KEY is unset — the skill feed was NOT updated. Run 'make upload-skills' by hand, or add the secret."
+          else
+            echo "have=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: google-github-actions/auth@v2
+        if: steps.creds.outputs.have == 'true'
+        with:
+          credentials_json: ${{ secrets.GCS_SERVICE_ACCOUNT_KEY }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+        if: steps.creds.outputs.have == 'true'
+
+      - name: upload skill zips + metadata.json
+        if: steps.creds.outputs.have == 'true'
+        run: bash scripts/release/upload-skills.sh

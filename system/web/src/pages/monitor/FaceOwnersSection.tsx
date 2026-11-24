@@ -1,0 +1,376 @@
+import { useState } from "react";
+import "./face-owners/face-owners.css";
+import { Users, Mic, ScanFace, UserCheck, UserPlus, RefreshCw } from "lucide-react";
+import { S } from "./styles";
+import { useTheme } from "@/lib/useTheme";
+import { hwUrl } from "@/lib/api";
+import { UserTimelineModal } from "./UserTimelineModal";
+import { useStrangers } from "./face-owners/useStrangers";
+import { useFilePreview } from "./face-owners/useFilePreview";
+import { useFaceData } from "./face-owners/useFaceData";
+import { useOwnerActions } from "./face-owners/useOwnerActions";
+import { HeroStat } from "./face-owners/HeroStat";
+import { EmptyState } from "./face-owners/EmptyState";
+import { ConfirmDialog } from "./face-owners/ConfirmDialog";
+import { RenameModal } from "./face-owners/RenameModal";
+import { EnrollModal } from "./face-owners/EnrollModal";
+import { UnknownFacesCard } from "./face-owners/UnknownFacesCard";
+import { CooldownsCard } from "./face-owners/CooldownsCard";
+import { StrangerClustersCard } from "./face-owners/StrangerClustersCard";
+import { PersonCard } from "./face-owners/PersonCard";
+
+export function FaceOwnersSection() {
+  const [, , themeClass] = useTheme();
+
+  const {
+    data, error, currentUser,
+    cooldowns, cdError, resetting, manualRefreshing,
+    refresh, handleManualRefresh, handleResetCooldowns,
+  } = useFaceData();
+
+  const {
+    showEnroll, setShowEnroll,
+    enrollName, setEnrollName,
+    enrollTgUsername, setEnrollTgUsername,
+    enrollTgId, setEnrollTgId,
+    enrollFile, setEnrollFile,
+    enrollPreview, enrolling, enrollError,
+    enrollDragging, setEnrollDragging,
+    fileInputRef,
+    handleEnroll,
+    renaming, setRenaming,
+    renameValue, setRenameValue,
+    renameError, setRenameError,
+    renameSaving,
+    handleRename, submitRename,
+    confirmDelete, setConfirmDelete,
+    confirmPhoto, setConfirmPhoto,
+    confirmVoice, setConfirmVoice,
+    deleting, deletingPhoto,
+    handleRemove, confirmRemove,
+    handleRemovePhoto, confirmRemovePhoto,
+    handleRemoveVoiceFile, confirmRemoveVoice,
+  } = useOwnerActions(refresh);
+
+  const [timelineUser, setTimelineUser] = useState<string | null>(null);
+
+  const [expandedPerson, setExpandedPerson] = useState<Record<string, boolean>>({});
+  const [hoveredPerson, setHoveredPerson] = useState<string | null>(null);
+  const [hoveredPhoto, setHoveredPhoto] = useState<string | null>(null);
+
+  const {
+    strangers, strangersError,
+    expandedCluster, setExpandedCluster,
+    deletingCluster, deletingStrangerFile,
+    faceStrangers, faceStrangersError,
+    confirmCluster, setConfirmCluster,
+    confirmStrangerFile, setConfirmStrangerFile,
+    handleDeleteCluster, confirmDeleteCluster,
+    handleDeleteStrangerFile, confirmDeleteStrangerFile,
+    confirmFaceForget, setConfirmFaceForget, forgettingFace, confirmForgetFace,
+  } = useStrangers();
+
+  const {
+    expanded, toggleDir,
+    preview, setPreview, previewLoading,
+    playingAudio,
+    openFile,
+  } = useFilePreview();
+
+
+  const monCard = { ...S.card, boxShadow: undefined };
+
+  const inputStyle: React.CSSProperties = {
+    fontSize: 12,
+    padding: "8px 11px",
+    borderRadius: 7,
+    width: "100%",
+  };
+
+  const fieldLabel: React.CSSProperties = {
+    display: "block", fontSize: 12, fontWeight: 600, letterSpacing: "0.02em",
+    textTransform: "uppercase", color: "var(--lm-text-dim)", marginBottom: 5,
+  };
+
+  const btnStyle: React.CSSProperties = {
+    fontSize: 12,
+    padding: "7px 12px",
+    borderRadius: 6,
+    fontWeight: 600,
+  };
+
+  const cardHeader: React.CSSProperties = {
+    display: "flex", justifyContent: "space-between", alignItems: "center",
+    marginBottom: 16, gap: 12, flexWrap: "wrap",
+  };
+
+  const iconBtnStyle: React.CSSProperties = {
+    width: 36, height: 36,
+    display: "inline-flex", alignItems: "center", justifyContent: "center",
+    padding: 0, borderRadius: 5,
+    color: "var(--lm-text-dim)",
+    fontSize: 13,
+    lineHeight: 1,
+  };
+
+  const allCooldownEntries = [
+    ...(cooldowns?.owners ?? []),
+    ...(cooldowns?.strangers ?? []),
+  ];
+  const hasActiveCooldowns = allCooldownEntries.some((e) => e.cooldown_remaining > 0);
+
+  const hereNow = currentUser && currentUser !== "unknown" ? currentUser : null;
+  const hereNowPhoto = hereNow
+    ? data?.persons.find((p) => p.label === hereNow)?.photos?.[0] ?? null
+    : null;
+
+  return (
+    <div className="lm-users-page">
+      <div className="lm-mon-hero">
+        <div style={{ position: "relative", zIndex: 1, display: "flex", flexDirection: "column", gap: 14 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 12 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+              <div style={{
+                width: 44, height: 44, borderRadius: 12, flexShrink: 0,
+                display: "flex", alignItems: "center", justifyContent: "center",
+                background: "var(--lm-amber-dim)", color: "var(--lm-amber)",
+                boxShadow: "inset 0 0 0 1px var(--lm-amber-glow)",
+              }} aria-hidden><Users size={22} /></div>
+              <div style={{ minWidth: 0 }}>
+                <div style={{ fontSize: 19, fontWeight: 700, color: "var(--lm-text)", letterSpacing: "-0.3px", lineHeight: 1.2 }}>
+                  Users
+                </div>
+                <div style={{ fontSize: 12, color: "var(--lm-text-muted)", marginTop: 2 }}>
+                  {error
+                    ? <span style={{ color: "var(--lm-red)" }}>User recognizer unavailable</span>
+                    : "Enrolled people, unknown voices & faces seen by the robot"}
+                </div>
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 6 }}>
+              <button
+                onClick={() => setShowEnroll(!showEnroll)}
+                className={"lm-u-btn" + (showEnroll ? "" : " lm-u-btn-primary")}
+                style={{
+                  ...btnStyle, fontSize: 12, padding: "7px 14px",
+                  display: "inline-flex", alignItems: "center", gap: 5,
+                  ...(showEnroll ? { background: "var(--lm-amber-dim)", color: "var(--lm-amber)", borderColor: "var(--lm-amber)" } : {}),
+                }}
+              >
+                <UserPlus size={13} /> Enroll
+              </button>
+              <button
+                onClick={handleManualRefresh}
+                disabled={manualRefreshing}
+                className="lm-u-btn"
+                title="Refresh"
+                aria-label="Refresh"
+                style={{ ...btnStyle, fontSize: 12, padding: "7px 11px", color: "var(--lm-text-muted)", display: "inline-flex", alignItems: "center" }}
+              >
+                <RefreshCw size={13} className={manualRefreshing ? "lm-spin" : undefined} />
+              </button>
+            </div>
+          </div>
+
+          <div className="lm-users-stats">
+            <HeroStat icon={<Users size={16} />} label="Enrolled" tone="amber"
+              value={data ? data.enrolled_count : "—"} />
+            <HeroStat
+              icon={hereNowPhoto && hereNow ? (
+                <img
+                  src={hwUrl(`/face/photo/${encodeURIComponent(hereNow)}/${encodeURIComponent(hereNowPhoto)}`)}
+                  alt=""
+                  style={{ width: "100%", height: "100%", objectFit: "cover", borderRadius: "inherit" }}
+                  onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = "none"; }}
+                />
+              ) : <UserCheck size={16} />}
+              label="Here now" tone="teal" pulse={!!hereNow}
+              value={<span style={{ textTransform: "capitalize" }}>{hereNow ?? "—"}</span>} />
+            <HeroStat icon={<Mic size={16} />} label="Unknown voices" tone="purple"
+              value={strangers ? strangers.total : "—"} />
+            <HeroStat icon={<ScanFace size={16} />} label="Unknown faces" tone="red"
+              value={faceStrangers ? faceStrangers.length : "—"} />
+          </div>
+        </div>
+      </div>
+
+      {showEnroll && (
+        <EnrollModal
+          themeClass={themeClass}
+          enrollName={enrollName} setEnrollName={setEnrollName}
+          enrollTgUsername={enrollTgUsername} setEnrollTgUsername={setEnrollTgUsername}
+          enrollTgId={enrollTgId} setEnrollTgId={setEnrollTgId}
+          enrollFile={enrollFile} setEnrollFile={setEnrollFile}
+          enrollPreview={enrollPreview}
+          enrolling={enrolling} enrollError={enrollError}
+          enrollDragging={enrollDragging} setEnrollDragging={setEnrollDragging}
+          fileInputRef={fileInputRef}
+          onClose={() => setShowEnroll(false)}
+          onSubmit={handleEnroll}
+          inputStyle={inputStyle} fieldLabel={fieldLabel} btnStyle={btnStyle}
+        />
+      )}
+
+      {renaming != null && (
+        <RenameModal
+          themeClass={themeClass}
+          renameValue={renameValue} setRenameValue={setRenameValue}
+          renameError={renameError} setRenameError={setRenameError}
+          renameSaving={renameSaving}
+          onClose={() => setRenaming(null)}
+          onSubmit={submitRename}
+          inputStyle={inputStyle} fieldLabel={fieldLabel} btnStyle={btnStyle}
+        />
+      )}
+
+      {confirmDelete != null && (
+        <ConfirmDialog
+          danger
+          title={`Remove "${confirmDelete}"?`}
+          message="All enrolled photos for this user will be permanently deleted."
+          confirmLabel="Remove"
+          onConfirm={confirmRemove}
+          onCancel={() => setConfirmDelete(null)}
+        />
+      )}
+
+      {confirmPhoto != null && (
+        <ConfirmDialog
+          danger
+          title="Delete this photo?"
+          message={<>Remove <code style={{ color: "var(--lm-text)" }}>{confirmPhoto.filename}</code> from <span style={{ color: "var(--lm-text)", textTransform: "capitalize" }}>{confirmPhoto.label}</span>.</>}
+          confirmLabel="Delete"
+          onConfirm={confirmRemovePhoto}
+          onCancel={() => setConfirmPhoto(null)}
+        />
+      )}
+
+      {confirmVoice != null && (
+        <ConfirmDialog
+          danger
+          title="Delete this voice sample?"
+          message={<>Remove <code style={{ color: "var(--lm-text)" }}>{confirmVoice.filename}</code> from <span style={{ color: "var(--lm-text)", textTransform: "capitalize" }}>{confirmVoice.label}</span>.</>}
+          confirmLabel="Delete"
+          onConfirm={confirmRemoveVoice}
+          onCancel={() => setConfirmVoice(null)}
+        />
+      )}
+
+      {confirmCluster != null && (
+        <ConfirmDialog
+          danger
+          title="Delete this cluster?"
+          message={<>Cluster <code style={{ color: "var(--lm-text)" }}>{confirmCluster.hash}</code> ({confirmCluster.sampleCount} sample{confirmCluster.sampleCount !== 1 ? "s" : ""}) and its centroid will be removed.</>}
+          confirmLabel="Delete"
+          onConfirm={confirmDeleteCluster}
+          onCancel={() => setConfirmCluster(null)}
+        />
+      )}
+
+      {confirmFaceForget != null && (
+        <ConfirmDialog
+          danger
+          title={confirmFaceForget === "all" ? "Delete every unknown face?" : "Delete this unknown face?"}
+          message={confirmFaceForget === "all"
+            ? "The face data, visit counts and snapshots of every unknown face are deleted from the lamp. Anyone who comes back is treated as new."
+            : <>The face data, visit count and snapshots of <code style={{ color: "var(--lm-text)" }}>{confirmFaceForget}</code> are deleted from the lamp. If they come back they are treated as new.</>}
+          confirmLabel="Delete"
+          onConfirm={confirmForgetFace}
+          onCancel={() => setConfirmFaceForget(null)}
+        />
+      )}
+
+      {confirmStrangerFile != null && (
+        <ConfirmDialog
+          danger
+          title="Delete this sample?"
+          message={<>Remove <code style={{ color: "var(--lm-text)" }}>{confirmStrangerFile.filename}</code> from <code style={{ color: "var(--lm-text)" }}>{confirmStrangerFile.hash}</code>.</>}
+          confirmLabel="Delete"
+          onConfirm={confirmDeleteStrangerFile}
+          onCancel={() => setConfirmStrangerFile(null)}
+        />
+      )}
+
+      {data && data.persons.length > 0 && (
+        <section aria-label="Enrolled people" className="lm-users-people">
+          {data.persons.map((person, idx) => (
+            <PersonCard
+              key={person.label}
+              person={person}
+              idx={idx}
+              currentUser={currentUser}
+              expandedPerson={expandedPerson}
+              setExpandedPerson={setExpandedPerson}
+              hoveredPerson={hoveredPerson}
+              setHoveredPerson={setHoveredPerson}
+              hoveredPhoto={hoveredPhoto}
+              setHoveredPhoto={setHoveredPhoto}
+              expanded={expanded}
+              toggleDir={toggleDir}
+              deleting={deleting}
+              deletingPhoto={deletingPhoto}
+              preview={preview}
+              previewLoading={previewLoading}
+              setPreview={setPreview}
+              playingAudio={playingAudio}
+              onRename={handleRename}
+              onRemove={handleRemove}
+              onRemovePhoto={handleRemovePhoto}
+              onRemoveVoiceFile={handleRemoveVoiceFile}
+              onOpenFile={openFile}
+              onTimeline={setTimelineUser}
+              monCard={monCard}
+              iconBtnStyle={iconBtnStyle}
+            />
+          ))}
+        </section>
+      )}
+
+      {data && data.persons.length === 0 && !showEnroll && (
+        <div className="lm-mon-card" style={monCard}>
+          <EmptyState icon={<UserPlus size={20} />} text={`No users enrolled yet. Click "Enroll" above or send a photo via Telegram.`} />
+        </div>
+      )}
+
+      <div className="lm-users-observations">
+
+      <StrangerClustersCard
+        strangers={strangers}
+        strangersError={strangersError}
+        expandedCluster={expandedCluster}
+        setExpandedCluster={setExpandedCluster}
+        deletingCluster={deletingCluster}
+        deletingStrangerFile={deletingStrangerFile}
+        onDeleteCluster={handleDeleteCluster}
+        onDeleteStrangerFile={handleDeleteStrangerFile}
+        monCard={monCard}
+        cardHeader={cardHeader}
+      />
+
+      <UnknownFacesCard
+        faceStrangers={faceStrangers}
+        faceStrangersError={faceStrangersError}
+        forgetting={forgettingFace}
+        onForget={setConfirmFaceForget}
+        monCard={monCard}
+        cardHeader={cardHeader}
+      />
+
+      </div>
+
+      <CooldownsCard
+        allCooldownEntries={allCooldownEntries}
+        cdError={cdError}
+        hasActiveCooldowns={hasActiveCooldowns}
+        resetting={resetting}
+        onReset={handleResetCooldowns}
+        monCard={monCard}
+        cardHeader={cardHeader}
+      />
+
+      {timelineUser && (
+        <UserTimelineModal user={timelineUser} onClose={() => setTimelineUser(null)} />
+      )}
+    </div>
+  );
+}

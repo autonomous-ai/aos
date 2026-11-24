@@ -1,0 +1,140 @@
+# DL Backend
+
+GPU-accelerated perception backend for Autonomous devices. It runs the
+deep-learning models a device's HAL can't run locally (action recognition, facial
+and speech emotion, pose + ergonomics, object detection, speaker embedding) and
+exposes them over WebSocket and HTTP behind an optional encrypting load balancer.
+
+On the device, the camera perceptions that call this backend (motion, facial
+emotion, pose, fire hazard) are opt-in and default off; see
+[Sensing Behavior](../robots/lamp/docs/sensing-behavior.md#cloud-camera-perceptions-are-off-by-default).
+
+This page is the **platform overview** — what the backend is and where it sits.
+The **full reference lives next to the code** in
+[`integrations/perception-service/docs/`](../integrations/perception-service/docs/); schemas, model lists, endpoints and env
+vars stay there, not here.
+
+| Want… | Read |
+|-------|------|
+| Process topology, ports, URL prefixes, request lifecycle | [`integrations/perception-service/docs/architecture.md`](../integrations/perception-service/docs/architecture.md) |
+| Every endpoint with request/response schemas | [`integrations/perception-service/docs/api.md`](../integrations/perception-service/docs/api.md) |
+| Perception models, enums, output types | [`integrations/perception-service/docs/perceptions.md`](../integrations/perception-service/docs/perceptions.md) |
+| Load balancer + RSA/AES encryption + nginx | [`integrations/perception-service/docs/crypto-and-loadbalancer.md`](../integrations/perception-service/docs/crypto-and-loadbalancer.md) |
+| Deploy: install, GPU scaling, RunPod, Docker, TLS | [`integrations/perception-service/docs/deployment.md`](../integrations/perception-service/docs/deployment.md) |
+| All environment variables with defaults | [`integrations/perception-service/docs/configuration.md`](../integrations/perception-service/docs/configuration.md) |
+
+## Architecture at a glance
+
+Two FastAPI processes behind an nginx front door:
+
+```
+HAL / clients
+   │  https / wss  :8899
+   ▼
+┌─────────┐   /lelamp/ → /hal/      ┌──────────┐  round-robin   ┌──────────┐
+│  nginx  │ ─────────────────────▶ │ lbserver │ ─────────────▶ │ dlserver │
+│  :8899  │     (WS upgrade)        │  :7999   │  decrypt →      │  :8001   │
+└─────────┘                         └──────────┘   plaintext     └──────────┘
+```
+
+- **`dlserver`** (`:8001`) — loads the ML models, serves the perception endpoints.
+- **`lbserver`** (`:7999`) — round-robin proxy over one or more `dlserver`
+  instances; terminates RSA+AES encryption so `dlserver` stays plaintext.
+- **`nginx`** (`:8899`) — public front door; passes `/hal/...` (the prefix
+  current HAL defaults use, e.g. `/hal/api/dl/ser/recognize`) straight through,
+  maps the legacy `/lelamp/` prefix onto `/hal/`, and upgrades WebSockets.
+
+For single-node dev you can hit `dlserver:8001` directly with encryption off.
+
+## What it provides
+
+Perception subsystems exposed to devices: action recognition, facial emotion,
+speech emotion (SER), pose estimation (with RULA ergonomics), object detection and
+speaker embedding. `/emotion-recognize` accepts `raw: true`, which returns the
+ungated argmax and every class probability; HAL uses it and applies the
+per-label gate on the device. Face and person detection run internally to feed
+those pipelines. Requests from concurrent sessions are batched before GPU dispatch —
+tune `BATCH_SIZE` and `BATCH_TIMEOUT` per model. SER input is bounded to 2–8 s
+at batch 1 server-side, which stays inside the cached TensorRT engine's shape
+range, so no clip length can trigger an engine rebuild during a request.
+Speaker-embedding input is likewise cropped to 3000 frames (30 s) before
+inference, below the cached engine's 5546-frame limit, so a long clip is
+embedded from its first 30 s instead of rebuilding the engine (#555).
+OWLv2 object detection runs as two ONNX graphs: a text graph turns prompts into query
+embeddings and an image graph detects with them. Named prompt presets (today only
+`fire_hazard_v1`, the 46 fire-hazard prompts HAL uses) are encoded once when dlserver
+starts and kept in memory, not on disk, so they are re-encoded on every restart and a
+preset request runs only the image graph. The HTTP detect request takes an optional
+`preset` (up to 64 characters): a known preset wins over `classes`, an unknown one gets
+a 400. Changing the prompts means a new preset name shipped with a server deploy, and the
+server must be deployed before a HAL build that sends the new name (an older server
+ignores `preset` and answers 200 with its default classes). Both graphs use explicit
+TensorRT profiles (1–500 queries, optimized for 46) and are warmed at 46 and 1 queries,
+so engines are built at startup, on the idle slot during a two-slot deploy (about 97 s
+on the current GPU), never in the middle of a request. Image models (FER, pose 2D/3D,
+action, ONNX object detectors) warm up at batch 1 and at their max batch, so TensorRT
+builds the full batch range at startup instead of on the first lone request. Request schema:
+[`integrations/perception-service/docs/api.md`](../integrations/perception-service/docs/api.md#object-detection--websocket--http).
+Model choices and outputs:
+[`integrations/perception-service/docs/perceptions.md`](../integrations/perception-service/docs/perceptions.md).
+
+**Overload.** Each model's batcher refuses work instead of queueing it without
+limit: when its backlog passes max(32, batch × 8), or a request has waited over
+8 s for the GPU, the server answers `503` with `Retry-After: 2` (WebSocket frames
+get `{"error": "busy"}`), and HAL backs off 2–30 s. Speaker embedding is not
+batched and is not limited this way. Knobs: `OVERLOAD__*` in
+[`configuration.md`](../integrations/perception-service/docs/configuration.md#overload-overload__).
+
+**Two-slot mode (optional).** A second dlserver slot can serve next to the first on
+the same GPU, turned on and off by hand (`make dlserver-two-slot`,
+`make dlserver-single`, `make dlserver-mode`). It needs about 9.7 GB more GPU memory,
+always runs the same code as the first slot, and a container restart returns to one
+slot. A deploy in two-slot mode drops to one slot, deploys, then restores both; the
+in-place restart (`make start-runpod-master`) refuses until `make dlserver-single`.
+lbserver skips a slot that refuses connections for 10 s. Measured: +26 % OWLv2
+throughput but slower voice under load and double the GPU memory, so it is
+available but not recommended for normal traffic. Details:
+[Two-slot mode](../integrations/perception-service/docs/deployment.md#two-slot-mode-optional).
+
+## Using it from a device
+
+HAL is the main client. Point it at the backend with `DL_BACKEND_URL` and the
+shared `DL_API_KEY` (sent as `X-API-Key`), and optionally enable client-side
+encryption. Sensing streams camera frames to the action/pose/emotion endpoints;
+voice posts end-of-utterance audio to the speech-emotion endpoint. For the
+speaker-embedding path, HAL runs the audio filter/VAD/normalize pipeline
+**on-device** and calls `/audio-recognizer/embed` with `preprocess=false`, so
+the server only computes the embedding (the endpoint is embed-only and defaults
+to `preprocess=false`; pass `true` only to upload raw audio for server-side
+cleaning). HAL also sets `use_sliding_window`: enroll sends `false` so the whole
+reference is embedded in a single shot (one clean vector), while recognize sends
+`true` to slide overlapping windows and vote per chunk. The embed response
+(`embed_model_version`) and `/health` (`audio_embedder_version`) also report a
+fingerprint of the loaded weights, so HAL can tell when the
+server model changed and re-embed its stored voice profiles instead of matching
+against stale vectors (see
+[`robots/lamp/docs/speaker-enrollment.md`](../robots/lamp/docs/speaker-enrollment.md)). Exact endpoints
+and payloads are in [`integrations/perception-service/docs/api.md`](../integrations/perception-service/docs/api.md); every
+config knob is in
+[`integrations/perception-service/docs/configuration.md`](../integrations/perception-service/docs/configuration.md).
+
+## Deployment
+
+`integrations/perception-service/` ships a `Dockerfile` (CUDA + nginx), `nginx.conf` / `nginx-ssl.conf`
+and a `Makefile`; the two processes launch via `python -m dlserver` and
+`python -m lbserver`. Install, single-node vs master/slave GPU scaling, RunPod,
+Docker and TLS: [`integrations/perception-service/docs/deployment.md`](../integrations/perception-service/docs/deployment.md).
+
+New dlserver code is deployed with `make deploy-dlserver`: it starts the new code
+on a second port on the same GPU and switches lbserver over (state file +
+`SIGHUP`) only once every model is loaded, so devices see no errors. Dependency
+changes still use a planned in-place restart. Details:
+[Zero-downtime deploy](../integrations/perception-service/docs/deployment.md#zero-downtime-deploy-two-slots).
+
+---
+
+> **Doc-sync:** this page is an overview only. When code changes, update the
+> detailed docs under [`integrations/perception-service/docs/`](../integrations/perception-service/docs/) **and** the
+> Vietnamese overview [`docs/vi/perception-service_vi.md`](vi/perception-service_vi.md). Code is the
+> source of truth.
+</content>

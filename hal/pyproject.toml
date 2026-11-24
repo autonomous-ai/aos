@@ -1,0 +1,178 @@
+[project]
+name = "hal-runtime"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+license = "GPL-3.0-only"
+# Device provisioning and native wheels target CPython 3.12. Bound universal
+# resolution too: --python 3.12 alone still resolves newer supported Pythons.
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "deepgram-sdk>=6.0.0",
+    "onnxruntime>=1.16.0; sys_platform != 'darwin' or platform_machine != 'x86_64'",
+    "fastapi>=0.115.0",
+    "uvicorn>=0.34.0",
+    "feetech-servo-sdk>=1.0.0",
+    "lerobot>=0.3.3; sys_platform != 'darwin' or platform_machine != 'x86_64'",
+    "livekit-agents[openai]~=1.2",
+    "livekit-plugins-noise-cancellation~=0.2",
+    "numpy>=2.2.6",
+    "pvporcupine>=3.0.5",
+    "pvrecorder>=1.2.7",
+    "pyarrow==20.0.0",
+    "pyaudio>=0.2.14",
+    "python-dotenv",
+    "python-multipart>=0.0.9",
+    "requests>=2.31.0",
+    "sounddevice>=0.5.2",
+    "webrtcvad>=2.0.10",
+    # Nightly, deliberately. YouTube breaks extraction every few weeks and the
+    # yt-dlp maintainers ship the fix within days — but only to the nightly
+    # channel, so a stable release goes stale while music is dead on every
+    # device. 2026.7.4 (the newest stable as of this pin) 403s on all protected
+    # content: metadata resolves, every format URL is refused. The 2026.8.17
+    # nightly restores it via the visionos client + HLS path. Requires
+    # prerelease = "if-necessary-or-explicit" below to resolve at all.
+    # Expect to bump this again — treat it as routine upkeep, not an incident.
+    "yt-dlp>=2026.8.17.73947.dev0",
+    "Pillow>=10.0.0",
+    "opencv-python>=4.8.0",
+    "ultralytics>=8.4,<9",
+    "soundfile>=0.12",
+    "scipy>=1.8",
+    "noisereduce",
+    # NOTE: `silero-vad` and its `torchaudio` pins used to sit here. The
+    # speaker-recognition VAD now runs TEN-VAD from the vendored
+    # `hal/drivers/voice/ten_vad_lite` (numpy + onnxruntime, both already listed
+    # above), and nothing in `hal/` imports torch or torchaudio any more — so
+    # both are gone rather than pinned. Don't re-add the pins to "be safe": a
+    # direct entry FORCES the install, which is what we are removing. They only
+    # ever existed because silero-vad pulled torchaudio in and the latest aarch64
+    # wheel is CUDA-linked (needs libcudart.so.13), so it failed to import on the
+    # GPU-less device Pi and took the on-device VAD down with it.
+    "onnxruntime>=1.23.2",
+    "anthropic>=0.40.0",
+    "cryptography>=44.0.0",
+    "google-genai>=0.7.0",
+    "openai>=3.14.1",
+    "pydantic>=2.0.0",
+    "websockets>=12.0",
+]
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = [".."]
+include = ["hal"]
+
+[tool.uv]
+# Needed for the yt-dlp nightly pin above (see the comment there). Scoped
+# deliberately: "explicit" only honours a prerelease a requirement names
+# outright, "if-necessary" only when no stable satisfies it — so every other
+# dependency keeps resolving to stable as before.
+prerelease = "if-necessary-or-explicit"
+required-environments = [
+    "sys_platform == 'linux' and platform_machine == 'aarch64'",
+    "sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
+# `reachy` (Pollen's SDK) pins onnxruntime==1.27.0; `pipecat` (pipecat-ai)
+# pins ~=1.24. They never share a body — reachy is the Reachy Mini Pi, pipecat
+# the lamp — so tell the resolver they are mutually exclusive instead of
+# letting the lock fail outright.
+conflicts = [
+    [{ extra = "reachy" }, { extra = "pipecat" }],
+]
+
+[tool.uv.sources]
+lerobot = { git = "https://github.com/huggingface/lerobot", rev = "55198de096f46a8e0447a8795129dd9ee84c088c" }
+# Prebuilt aarch64 wheel for the `aec` extra — see docs/realtime-voice.md.
+# PyPI has Windows wheels only, so without this every install compiles the
+# vendored webrtc + abseil: 5m35s of device CPU, and build tools the image does
+# not ship. Rebuild with scripts/release/build-aec-wheel.sh and republish with
+# `make upload-aec-wheel`, then re-pin the URL here. It is a GitHub release
+# asset on a per-wheel tag (`wheels/aec-<version>`), not the OTA bucket: this
+# repo is public and a fork can host its own, while gs:// is org-only.
+# The marker is narrow on purpose. linux/aarch64 because the wheel is tagged
+# linux_aarch64 and a dev Mac must not try to install it; python < 3.13 because
+# the wheel is cp312. Keep this explicit even though the project currently
+# targets only CPython 3.12, so a future Python-range expansion cannot select
+# an incompatible wheel. Other platforms compile the PyPI sdist.
+aec-audio-processing = { url = "https://github.com/autonomous-ai/autonomous-os/releases/download/wheels/aec-1.0.1/aec_audio_processing-1.0.1-cp312-cp312-linux_aarch64.whl", marker = "sys_platform == 'linux' and platform_machine == 'aarch64' and python_full_version < '3.13'" }
+# webrtcvad: PyPI ships only an sdist, so without this every HAL install
+# compiled the C extension on the device, and a device whose compiler could not
+# build it could not install HAL. Rebuild with
+# scripts/release/build-webrtcvad-wheel.sh and `make upload-webrtcvad-wheel`
+# (tag `wheels/webrtcvad-<version>`); same marker rules as above.
+webrtcvad = { url = "https://github.com/autonomous-ai/autonomous-os/releases/download/wheels/webrtcvad-2.0.10/webrtcvad-2.0.10-cp312-cp312-linux_aarch64.whl", marker = "sys_platform == 'linux' and platform_machine == 'aarch64' and python_full_version < '3.13'" }
+
+# Static metadata for sdist-only deps of the `reachy` extra. Without this,
+# resolving the lock (on ANY machine, even when the extra is not installed)
+# builds pygobject/pycairo from source just to read their metadata — which
+# fails wherever cairo/gobject dev libs are absent (lamp images, dev Macs).
+# With static metadata uv skips the build at resolve time; the real build
+# only happens at install time on a device that selects --extra reachy.
+[[tool.uv.dependency-metadata]]
+name = "pygobject"
+version = "3.46.0"
+requires-dist = ["pycairo>=1.16.0"]
+requires-python = ">=3.8"
+
+[[tool.uv.dependency-metadata]]
+name = "pycairo"
+requires-python = ">=3.9"
+
+[project.optional-dependencies]
+dev = [
+    "pyflakes>=3.0",
+    # `make hal-test` runs `.venv/bin/python -m pytest test/`. Declared here so
+    # a plain `uv sync --extra dev` is enough to run the suite: while it was
+    # only ever installed by hand, every re-sync of the venv silently took the
+    # test runner with it.
+    "pytest>=8.0",
+]
+hardware = [
+    "adafruit-circuitpython-neopixel",
+    "adafruit-circuitpython-neopixel-spi",
+    "gpiozero",
+    "lgpio",
+    "rpi-ws281x",
+    "spidev",
+]
+# Reachy Mini body only (robots/reachy-mini) — Pollen's SDK client.
+# NOT merged into `hardware`: reachy-mini pulls pygobject/pycairo which build
+# from source and need cairo/gobject system libs (present on Pollen's OS,
+# absent on lamp images — merging would break lamp OTA).
+# Install on-device with: uv sync --extra reachy
+reachy = [
+    # linux-only marker: the SDK pins onnxruntime==1.27.0 which has no
+    # darwin-x86_64 wheels; the extra only ever installs on the robot's Pi.
+    "reachy-mini>=1.9; sys_platform == 'linux'",
+]
+# Acoustic echo cancellation on the mic path (docs/realtime-voice.md).
+# NOT in `dependencies` and NOT merged into `hardware`: PyPI ships no Linux
+# wheel, so it builds the vendored webrtc-audio-processing + abseil from source
+# and needs meson/ninja, which the lamp image does not install. As a hard dep it
+# fails `uv sync` — that is BOTH the image build (scripts/imager, which stops
+# shipping devices) and `software-update hal` on every device in the field — for
+# a feature that degrades to a no-op without it (HAL_AEC_ENABLED). The import in
+# drivers/voice/aec.py is already optional: without it the mic runs uncancelled.
+# Install on-device with: uv sync --extra aec
+aec = [
+    "aec-audio-processing>=1.0.1",
+]
+# On-device Pipecat pipeline — the `pipecat_v1` realtime provider
+# (hal/realtime/voice_agent/pipecat_v1.py, docs/realtime-voice.md). NOT in
+# `dependencies`: pipecat-ai drags numba, resampy, nltk and a pinned
+# onnxruntime (~1.24) that nothing else here needs, and the provider degrades
+# to "unavailable" without it (the orchestrator falls back to the main agent).
+# Silero VAD, Smart Turn v3 and the OpenAI-compatible LLM service ship in the
+# core package; STT is HAL's own provider, so no vendor extra is required.
+# Lamp setup, image builds and non-Reachy OTA select this extra automatically:
+# Smart Turn is shared by all non-Live voice backends, not only pipecat_v1.
+# Kept as an extra because Reachy's SDK has an incompatible ONNX pin.
+# Development hosts can opt in with: uv sync --extra pipecat
+pipecat = [
+    "pipecat-ai>=1.11.0,<2",
+]
