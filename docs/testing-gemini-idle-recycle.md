@@ -125,4 +125,4 @@ directory created at deploy time, then `sudo systemctl restart hal`.
 
 Proxy-side analysis, including why this is not a `campaign-api` ceiling:
 `bff-campaign-service/docs/gemini-1008-idle-session-close.md`. Original report:
-[autonomous-os#238](https://github.com/autonomous-ai/autonomous-os/issues/238).
+[autonomous-os#238](https://github.com/autonomous-ai/lampOS/issues/238).

@@ -11,7 +11,7 @@
       "description": "Show Claude Code activity (task-done, usage, approvals) on your device.",
       "source": {
         "source": "git-subdir",
-        "url": "https://github.com/autonomous-ai/autonomous-os",
+        "url": "https://github.com/autonomous-ai/aos",
         "path": "integrations/companions/claude-desktop-buddy/claude-code-buddy"
       }
     }

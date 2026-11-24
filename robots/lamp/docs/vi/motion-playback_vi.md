@@ -93,7 +93,7 @@ visual và collision đã được bỏ. Nó theo gói device profile lên máy 
 đặt ngay tại gốc của nó: con số milimét tuyệt đối là xấp xỉ, còn thứ hạng giữa các
 clip thì không. Phải tính lại hằng số này nếu phân bố khối lượng của thân máy thay đổi.
 
-[#271]: https://github.com/autonomous-ai/autonomous-os/issues/271
+[#271]: https://github.com/autonomous-ai/lampOS/issues/271
 
 ## Dừng khi chạm và cắt torque khi quá tải
 

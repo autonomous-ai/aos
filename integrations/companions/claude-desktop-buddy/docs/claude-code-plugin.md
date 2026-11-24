@@ -229,7 +229,7 @@ unreachable, timeout, or any other error — the hook prints **nothing** and exi
 From Claude Code on the Mac:
 
 ```bash
-claude plugins marketplace add https://raw.githubusercontent.com/autonomous-ai/autonomous-os/main/integrations/companions/claude-desktop-buddy/claude-code-buddy/.claude-plugin/marketplace.json
+claude plugins marketplace add https://raw.githubusercontent.com/autonomous-ai/aos/main/integrations/companions/claude-desktop-buddy/claude-code-buddy/.claude-plugin/marketplace.json
 claude plugins install claude-code-buddy
 ```
 

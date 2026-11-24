@@ -94,7 +94,7 @@ estimates and the URDF's inertial origins are all zero, so each link's mass sits
 at its own origin: the absolute millimetres are approximate, the ranking between
 clips is not. Re-derive the constant if the body's mass distribution changes.
 
-[#271]: https://github.com/autonomous-ai/autonomous-os/issues/271
+[#271]: https://github.com/autonomous-ai/lampOS/issues/271
 
 ## Overload cut-off
 

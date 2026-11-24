@@ -6,7 +6,7 @@ Skills, brains and the app are shared, so a new robot brings only three markdown
 
 **First check the compute.** 64-bit arm64 Linux with systemd, ~4 GB free (the installer brings its own Python 3.12 via uv), and a `/proc/device-tree/model` string that matches an entry in [`boards.json`](../hal/board/boards.json) — a new board is one JSON entry, not a code change.
 
-**And check the shape.** Today's motion contract is joint-space, proven on a 5–6 DOF articulated head — joints, aim, nudge, recordings — which is Lamp and Reachy Mini. An arm is the same `MotionService` with more joints, untested in-tree. Wheels and legs need a second service beside it, `LocomotionService`; the [Go2-W port](https://github.com/autonomous-ai/autonomous-os/issues/205) is where that gets designed.
+**And check the shape.** Today's motion contract is joint-space, proven on a 5–6 DOF articulated head — joints, aim, nudge, recordings — which is Lamp and Reachy Mini. An arm is the same `MotionService` with more joints, untested in-tree. Wheels and legs need a second service beside it, `LocomotionService`; the [Go2-W port](https://github.com/autonomous-ai/lampOS/issues/205) is where that gets designed.
 
 ## 1. Scaffold the folder
 
@@ -77,7 +77,7 @@ python3 -c "from hal.safety.policy import parse_safety, clamp_brightness; p = pa
 go test ./system/server/agent/delivery/http/ -run ExtractHWCalls -v   # needs Go 1.24
 ```
 
-[`skill-creator`](../skills/skill-creator/) grades whether a skill *triggers* for the right requests, also on your laptop. What the marker *does* still needs a body — or the [mock body](https://github.com/autonomous-ai/autonomous-os/issues/200).
+[`skill-creator`](../skills/skill-creator/) grades whether a skill *triggers* for the right requests, also on your laptop. What the marker *does* still needs a body — or the [mock body](https://github.com/autonomous-ai/lampOS/issues/200).
 
 ## 6. Teach it a skill
 
@@ -111,8 +111,8 @@ The day it merges your robot is a product: a one-line installer for your custome
 
 **Frozen:** the `autonomous.device.v1` schema (fields are only added) and the capability names in [`capabilities.md`](../robots/contract/capabilities.md) (never removed). A v1 `ROBOT.md` boots on every later v1 runtime. **Not frozen yet:** the driver protocols (`MotionService`, `MediaOwner`) and the HAL route paths skills call (`/servo/aim`, `/emotion`) — both can move between releases, which is why ports live in-tree, where a protocol change carries every driver with it; port against a tag (`v0.1.4`, 2026-08-12).
 
-`hal/` is GPL-3.0 — wrapping a permissive vendor SDK is fine (`reachy_service.py` imports Pollen's Apache-2.0 `reachy_mini`, and that is the whole driver); a closed SDK goes out of process ([#204](https://github.com/autonomous-ai/autonomous-os/issues/204)).
+`hal/` is GPL-3.0 — wrapping a permissive vendor SDK is fine (`reachy_service.py` imports Pollen's Apache-2.0 `reachy_mini`, and that is the whole driver); a closed SDK goes out of process ([#204](https://github.com/autonomous-ai/lampOS/issues/204)).
 
-What CTS still can't check is listed by name in [`cts/README.md`](../robots/contract/cts/README.md#not-covered-yet) — including rule 6, the immediate deterministic stop: no body in this repo has one yet (`/servo/release` travels to idle before cutting torque), so read that rule as where the contract is going, not as something we pass today. Fixing it is [#201](https://github.com/autonomous-ai/autonomous-os/issues/201).
+What CTS still can't check is listed by name in [`cts/README.md`](../robots/contract/cts/README.md#not-covered-yet) — including rule 6, the immediate deterministic stop: no body in this repo has one yet (`/servo/release` travels to idle before cutting torque), so read that rule as where the contract is going, not as something we pass today. Fixing it is [#201](https://github.com/autonomous-ai/lampOS/issues/201).
 
 Copy from a finished one: [Lamp](../robots/lamp/), [Intern](../robots/intern-v2/), [Reachy Mini](../robots/reachy-mini/), [Go2-W](../robots/unitree-go2w/).
