@@ -15,7 +15,7 @@ through Pollen's own SDK.
 SSH into your robot and run:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/autonomous-ai/autonomous-os/main/robots/reachy-mini/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/autonomous-ai/aos/main/robots/reachy-mini/install.sh | sudo bash
 ```
 
 That is the whole thing. No repo to clone, no Go or Node toolchain, no build
@@ -94,7 +94,7 @@ daemon `reachy_mini` 1.9.0 (2026-07-29); the driver pins `reachy-mini>=1.9`.
    `sudo bash /opt/devices/reachy-mini/spike.sh --stop` / `--uninstall`.
 
 Reachy Mini Lite (the daemon runs on your laptop) is not supported yet — it needs the
-[mock body](https://github.com/autonomous-ai/autonomous-os/issues/200).
+[mock body](https://github.com/autonomous-ai/lampOS/issues/200).
 
 ## What changes on your Reachy while it runs
 

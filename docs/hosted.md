@@ -10,13 +10,13 @@ Autonomous OS phones home to three things and nothing else.
   been installed 14 times. Nothing in the store is paid — every entry is free. Plugins are not on this
   list: plugins install from the same store. (The plugin browser still queries
   Hugging Face Spaces — that was a prototype, and removing it is
-  [#213](https://github.com/autonomous-ai/autonomous-os/issues/213).)
+  [#213](https://github.com/autonomous-ai/lampOS/issues/213).)
 - **AI gateway** — the default OpenClaw brain and the voice, face and mood
   models call it. The key comes with the app account, self-built bodies
   included. No account? Swap the brain to Claude Code or Codex with your own key:
   you get chat and every skill; voice, face and mood still need the gateway.
   Pointing OpenClaw at your own endpoint (Ollama, any OpenAI-compatible server on
-  your LAN) is not built yet — it is [#198](https://github.com/autonomous-ai/autonomous-os/issues/198).
+  your LAN) is not built yet — it is [#198](https://github.com/autonomous-ai/lampOS/issues/198).
 - **Release feed** — the robot auto-updates from our CDN every 5 min
   (`bootstrap/`, staged by `min_version`, so we can hold a floor). Metadata is
   Ed25519-signed and ZIPs are SHA-256 checked before extraction. Running a
@@ -55,7 +55,7 @@ on the Autonomous backend while the brain runs locally, set `backend_base_url`
 
 **Verified in unit tests, not yet on a robot against a local Ollama.** If you
 run one, say what happened in
-[Discussions](https://github.com/autonomous-ai/autonomous-os/discussions).
+[Discussions](https://github.com/autonomous-ai/lampOS/discussions).
 
 ## Offline
 

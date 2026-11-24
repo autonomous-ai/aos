@@ -431,7 +431,7 @@ lint:
 #   make deploy-slave  DEPLOY_HOST=root@<ip>
 
 DEPLOY_HOST ?=
-DEPLOY_REPO ?= https://github.com/autonomous-ai/autonomous-os.git
+DEPLOY_REPO ?= https://github.com/autonomous-ai/aos.git
 DEPLOY_BRANCH ?= main
 DEPLOY_ROOT ?= /workspace/autonomous-os
 DEPLOY_DL ?= $(DEPLOY_ROOT)/integrations/perception-service

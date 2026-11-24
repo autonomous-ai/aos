@@ -22,7 +22,7 @@ Which Pi OS: the SD-card imager targets Trixie on Pi 5 and Bookworm on Pi 4 and 
 Needs internet and ~4 GB free; budget 15 min, most of it HAL's Python environment. `install.sh` fetches [`scripts/provision/setup.sh`](../../scripts/provision/setup.sh) from our CDN — a published snapshot of the file in this tree — and runs it as root; it pulls every component from the release feed and puts each behind a systemd unit. Over Wi-Fi run it under `nohup` so the session drop doesn't kill it:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/autonomous-ai/autonomous-os/main/scripts/provision/install.sh -o install.sh
+curl -fsSL https://raw.githubusercontent.com/autonomous-ai/aos/main/scripts/provision/install.sh -o install.sh
 sudo -v   # cache the password first (OrangePi asks, Pi OS doesn't)
 sudo DEVICE_TYPE=lamp nohup bash install.sh > install.log 2>&1 &
 tail -f install.log
@@ -30,7 +30,7 @@ tail -f install.log
 
 Over Wi-Fi your session drops in the last stage — that is the sign it is nearly done. When `lamp-xxxx` shows up in your Wi-Fi list (xxxx = last 4 characters of the board serial, lowercase) it has rebooted into setup mode; `install.log` stays on the board and ends with `AP SSID: lamp-xxxx` and any stage that failed — re-run the same command to retry. No Ethernet and no `lamp-xxxx` after 5 min? The board's old Wi-Fi is masked too, so SSH is gone: pull the SD card, read `install.log` from your home directory on it, reflash, and start again over a cable.
 
-Prefer to run the file you can read? `git clone https://github.com/autonomous-ai/autonomous-os && cd autonomous-os && sudo DEVICE_TYPE=lamp OTA_METADATA_URL=https://cdn.autonomous.ai/os/ota/metadata.json bash scripts/provision/setup.sh` — `install.sh` does nothing but fetch that file and run it. The feed is our CDN — prebuilt `os-server`, HAL, web UI and OpenClaw, built from this tree by `scripts/release/`; to run your own build, publish your own feed and pass `OTA_METADATA_URL=https://…/metadata.json`. Prefer an SD-card image? [`scripts/imager/`](../../scripts/imager/) builds one in 25–40 min (Docker on Linux; no prebuilt image yet).
+Prefer to run the file you can read? `git clone https://github.com/autonomous-ai/aos && cd autonomous-os && sudo DEVICE_TYPE=lamp OTA_METADATA_URL=https://cdn.autonomous.ai/os/ota/metadata.json bash scripts/provision/setup.sh` — `install.sh` does nothing but fetch that file and run it. The feed is our CDN — prebuilt `os-server`, HAL, web UI and OpenClaw, built from this tree by `scripts/release/`; to run your own build, publish your own feed and pass `OTA_METADATA_URL=https://…/metadata.json`. Prefer an SD-card image? [`scripts/imager/`](../../scripts/imager/) builds one in 25–40 min (Docker on Linux; no prebuilt image yet).
 
 ## 3. Give the servos IDs, then calibrate
 

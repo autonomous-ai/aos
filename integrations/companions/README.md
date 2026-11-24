@@ -72,7 +72,7 @@ daemon's `:5002` API:
 Install from the marketplace:
 
 ```bash
-claude plugins marketplace add https://raw.githubusercontent.com/autonomous-ai/autonomous-os/main/integrations/companions/claude-desktop-buddy/claude-code-buddy/.claude-plugin/marketplace.json
+claude plugins marketplace add https://raw.githubusercontent.com/autonomous-ai/aos/main/integrations/companions/claude-desktop-buddy/claude-code-buddy/.claude-plugin/marketplace.json
 claude plugins install claude-code-buddy
 ```
 

@@ -21,7 +21,7 @@ pre-installed.
 > you'll need a Developer Edition (black) unit — the consumer images cannot
 > be unlocked in the field.
 
-The source of truth is the [`autonomous-os` repo](https://github.com/autonomous-ai/autonomous-os).
+The source of truth is the [`aos` repo](https://github.com/autonomous-ai/aos).
 Every file path in this guide is relative to that repo unless noted otherwise.
 
 ---
@@ -669,4 +669,4 @@ closed and cannot be turned into a developer unit later.
 
 **Support:**
 
-- **GitHub**: [`autonomous-ai/autonomous-os`](https://github.com/autonomous-ai/autonomous-os) — issues + discussions
+- **GitHub**: [`autonomous-ai/aos`](https://github.com/autonomous-ai/aos) — issues + discussions

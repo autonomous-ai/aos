@@ -7,7 +7,7 @@ export function SourceFooter({ inline = false }: { inline?: boolean }) {
   if (!inline && ["/monitor", "/setting"].includes(pathname)) return null;
   return (
     <a
-      href="https://github.com/autonomous-ai/autonomous-os"
+      href="https://github.com/autonomous-ai/aos"
       target="_blank"
       rel="noopener noreferrer"
       style={{
@@ -23,7 +23,7 @@ export function SourceFooter({ inline = false }: { inline?: boolean }) {
       }}
       title="Source code (GPL v3)"
     >
-      {inline ? "Source code · GPL v3 ↗" : "⌥ github.com/autonomous-ai/autonomous-os"}
+      {inline ? "Source code · GPL v3 ↗" : "⌥ github.com/autonomous-ai/aos"}
     </a>
   );
 }

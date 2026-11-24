@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # install.sh — one-command Autonomous OS bring-up on a Reachy Mini (run on the robot).
-# Usage: curl -fsSL https://raw.githubusercontent.com/autonomous-ai/autonomous-os/main/robots/reachy-mini/install.sh | sudo bash [-s -- SPIKE_ARGS|--force]
+# Usage: curl -fsSL https://raw.githubusercontent.com/autonomous-ai/aos/main/robots/reachy-mini/install.sh | sudo bash [-s -- SPIKE_ARGS|--force]
 # Env: OTA_METADATA_URL, OTA_SIGNING_PUBLIC_KEY, DEVICE_TYPE.
 set -euo pipefail
 
