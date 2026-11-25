@@ -26,15 +26,25 @@ else
   ota_metadata_unpack "$METADATA_TMP" "$PAYLOAD_TMP"
 fi
 
-python3 - "$PAYLOAD_TMP" "$VERSION" "$(date '+%Y-%m-%d %H:%M:%S %z')" <<'PY'
+# Tarball integrity from the default npm registry. Devices that install from
+# another registry install only packages that match these values.
+OC_INTEGRITY=$(npm view "openclaw@${VERSION}" dist.integrity --registry https://registry.npmjs.org/)
+OC_DISCORD_INTEGRITY=$(npm view "@openclaw/discord@${VERSION}" dist.integrity --registry https://registry.npmjs.org/ 2>/dev/null || true)
+OC_SLACK_INTEGRITY=$(npm view "@openclaw/slack@${VERSION}" dist.integrity --registry https://registry.npmjs.org/ 2>/dev/null || true)
+[[ "$OC_INTEGRITY" == sha512-* ]] || { echo "ERROR: no sha512 integrity for openclaw@${VERSION}" >&2; exit 1; }
+
+python3 - "$PAYLOAD_TMP" "$VERSION" "$(date '+%Y-%m-%d %H:%M:%S %z')" "$OC_INTEGRITY" "$OC_DISCORD_INTEGRITY" "$OC_SLACK_INTEGRITY" <<'PY'
 import json
 import sys
 
-path, version, updated_at = sys.argv[1], sys.argv[2], sys.argv[3]
+path, version, updated_at, integrity, discord, slack = sys.argv[1:7]
 d = json.load(open(path))
 oc = d.get("openclaw") if isinstance(d.get("openclaw"), dict) else {}
 oc["version"] = version
 oc["updated_at"] = updated_at
+oc["integrity"] = integrity
+oc["plugins"] = {name: value for name, value in (("@openclaw/discord", discord), ("@openclaw/slack", slack))
+                 if value.startswith("sha512-")}
 d["openclaw"] = oc
 json.dump(d, open(path, "w"), indent=4)
 PY

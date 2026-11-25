@@ -176,36 +176,70 @@ class MirrorTests(unittest.TestCase):
         self.assertEqual(self.bash(code)[0].stdout, "cn\n")
         self.assertEqual(self.bash(code, OTA_REGION="US")[0].stdout, "other\n")
 
-    def npm_run(self, region=None, default_fails=False):
+    def npm_run(self, region=None, default_fails=False, pinned=True, override="", pack_bytes=b"tarball"):
         if region:
             (self.root / "config.json").write_text(json.dumps({"region": region}))
-        code = functions("device_region", "region_is_cn", "openclaw_npm_registry", "ensure_openclaw_node")
-        code += ('OTA_NPM_MIRROR=https://npm-mirror.example\n'
-                 'npm() { event "npm registry=${NPM_CONFIG_REGISTRY:-default} $*";'
-                 ' if [ "$DEFAULT_FAILS" = 1 ] && [ -z "${NPM_CONFIG_REGISTRY:-}" ]; then return 1; fi;'
-                 ' printf "%s\\n" \'">=22"\'; }\n'
+        integrity = "sha512-" + __import__("base64").b64encode(hashlib.sha512(b"tarball").digest()).decode()
+        meta = {"openclaw": {"version": "2026.9.3"}}
+        if pinned:
+            meta["openclaw"]["integrity"] = integrity
+            meta["openclaw"]["plugins"] = {"@openclaw/discord": "sha512-discord"}
+        (self.root / "meta.json").write_text(json.dumps(meta))
+        (self.root / "pack").write_bytes(pack_bytes)
+        code = functions("device_region", "region_is_cn", "openclaw_pinned", "openclaw_npm_registry",
+                         "openclaw_npm", "sri_sha512", "install_openclaw_package", "install_openclaw_plugin",
+                         "ensure_openclaw_node")
+        code += (f'METADATA_PAYLOAD="{self.root}/meta.json"\nOTA_NPM_MIRROR=https://npm-mirror.example\n'
+                 'npm() { event "npm env=${NPM_CONFIG_REGISTRY:-unset} $*";'
+                 ' case " $* " in *" --registry "*) ;; *) [ "$DEFAULT_FAILS" = 1 ] && return 1 ;; esac;'
+                 ' case "$*" in *dist.integrity*) printf "%s\\n" sha512-discord ;;'
+                 ' *" pack "*) cp "$PACK" openclaw-2026.9.3.tgz; echo openclaw-2026.9.3.tgz ;;'
+                 ' *engines.node*) printf "%s\\n" \'">=22"\' ;; esac; }\n'
+                 'openclaw() { event "openclaw env=${NPM_CONFIG_REGISTRY:-unset} $*"; }\n'
                  'ensure_node_engine() { event "engine $*"; }\n'
-                 'ensure_openclaw_node 2026.9.3 && npm install -g openclaw@2026.9.3\n')
-        return self.bash(code, DEFAULT_FAILS="1" if default_fails else "0")
+                 'ensure_openclaw_node 2026.9.3 && install_openclaw_package 2026.9.3'
+                 ' && install_openclaw_plugin @openclaw/discord 2026.9.3 || exit 1\n'
+                 'event "after env=${NPM_CONFIG_REGISTRY:-unset}"\n')
+        return self.bash(code, DEFAULT_FAILS="1" if default_fails else "0", PACK=str(self.root / "pack"),
+                         OTA_NPM_REGISTRY=override)
 
     def test_npm_default_registry_outside_cn(self):
         result, events = self.npm_run()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue(all("registry=default" in e for e in events if e.startswith("npm")), events)
+        self.assertFalse(any("--registry" in e for e in events), events)
+        self.assertIn("npm env=unset install -g openclaw@2026.9.3", events)
 
-    def test_npm_mirror_in_cn(self):
+    def test_npm_no_cn_registry_after_default_fails_outside_cn(self):
+        result, events = self.npm_run(default_fails=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(any("npm-mirror" in e for e in events), events)
+
+    def test_npm_cn_registry_scoped_to_each_command(self):
         result, events = self.npm_run(region="CN")
         self.assertEqual(result.returncode, 0, result.stderr)
         npm = [e for e in events if e.startswith("npm")]
-        self.assertEqual(len(npm), 2, events)
-        self.assertTrue(all("registry=https://npm-mirror.example" in e for e in npm), events)
+        self.assertTrue(npm and all("--registry https://npm-mirror.example" in e for e in npm), events)
+        self.assertTrue(all("env=unset" in e for e in npm), events)
+        self.assertTrue(any(" pack openclaw@2026.9.3" in e for e in npm), events)
+        self.assertTrue(any("install -g " in e and e.endswith("openclaw-2026.9.3.tgz") for e in npm), events)
+        self.assertIn("openclaw env=https://npm-mirror.example plugins install @openclaw/discord@2026.9.3 --force",
+                      events)
+        self.assertEqual(events[-1], "after env=unset")
 
-    def test_npm_mirror_after_default_registry_fails(self):
-        result, events = self.npm_run(default_fails=True)
+    def test_npm_cn_without_pinned_integrity_uses_default(self):
+        result, events = self.npm_run(region="CN", pinned=False)
         self.assertEqual(result.returncode, 0, result.stderr)
-        npm = [e for e in events if e.startswith("npm")]
-        self.assertIn("registry=default", npm[0])
-        self.assertTrue(all("registry=https://npm-mirror.example" in e for e in npm[1:]), events)
+        self.assertFalse(any("--registry" in e for e in events), events)
+
+    def test_npm_cn_tarball_mismatch_is_refused(self):
+        result, events = self.npm_run(region="CN", pack_bytes=b"other bytes")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(any("install -g" in e for e in events), events)
+
+    def test_npm_explicit_registry_override(self):
+        result, events = self.npm_run(override="https://other.example")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(any("--registry https://other.example" in e for e in events), events)
 
     def node_order(self, region=None):
         if region:

@@ -1522,10 +1522,17 @@ fails when a pinned version has no digest.
 | Hermes pinned installer | `hermes/<commit>/install.sh` | mirror, then GitHub |
 
 Versions come from the metadata and from the pins in `runtimes/*/install.sh`.
-openclaw comes from npm: in region CN, or after the default registry fails,
-`software-update` sets `NPM_CONFIG_REGISTRY` to `OTA_NPM_MIRROR`
-(`https://registry.npmmirror.com`) for that run; an explicit
-`NPM_CONFIG_REGISTRY` wins.
+
+openclaw comes from the default npm registry. In region CN `software-update`
+uses `OTA_NPM_MIRROR` (`https://registry.npmmirror.com`) instead, and
+`OTA_NPM_REGISTRY` selects a registry on any device. That registry is passed to
+the openclaw npm commands only (`npm --registry`), and only for a version whose
+metadata carries `openclaw.integrity`, the default registry's `dist.integrity`
+written by `make upload-openclaw`. The package tarball is fetched with
+`npm pack`, compared with that value, and installed from the file; the discord
+and slack plugins install from that registry only when it reports the integrity
+in `openclaw.plugins`. Without these values, or outside CN with no override, the
+default registry is used as before.
 
 Still needing the vendor: the Hermes checkout and its Python packages, the
 Claude Code installer, a first-time uv-managed Python download, and apt

@@ -1478,10 +1478,17 @@ thay đổi; `scripts/release/tests/test_mirror_pins.py` lỗi khi một phiên 
 | yq | `yq/v4.46.1/yq_linux_<arch>` | mirror, rồi GitHub releases |
 | Bộ cài Hermes ghim commit | `hermes/<commit>/install.sh` | mirror, rồi GitHub |
 
-Phiên bản lấy từ metadata và từ các pin trong `runtimes/*/install.sh`. openclaw
-lấy từ npm: ở vùng CN, hoặc sau khi registry mặc định lỗi, `software-update` đặt
-`NPM_CONFIG_REGISTRY` thành `OTA_NPM_MIRROR` (`https://registry.npmmirror.com`)
-cho lượt chạy đó; `NPM_CONFIG_REGISTRY` đặt sẵn thì được ưu tiên.
+Phiên bản lấy từ metadata và từ các pin trong `runtimes/*/install.sh`.
+
+openclaw lấy từ registry npm mặc định. Ở vùng CN `software-update` dùng
+`OTA_NPM_MIRROR` (`https://registry.npmmirror.com`) thay thế, và
+`OTA_NPM_REGISTRY` chọn registry trên mọi thiết bị. Registry đó chỉ được truyền
+cho các lệnh npm của openclaw (`npm --registry`), và chỉ cho phiên bản có
+`openclaw.integrity` trong metadata, tức `dist.integrity` của registry mặc định
+do `make upload-openclaw` ghi vào. Tarball được tải bằng `npm pack`, so với giá
+trị đó, rồi cài từ file; plugin discord và slack chỉ cài từ registry đó khi nó
+báo đúng integrity trong `openclaw.plugins`. Không có các giá trị này, hoặc ngoài
+CN và không override, thì dùng registry mặc định như trước.
 
 Vẫn cần vendor: checkout Hermes và các gói Python của nó, bộ cài Claude Code,
 lần đầu tải Python do uv quản lý, và các gói apt.

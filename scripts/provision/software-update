@@ -25,7 +25,7 @@ DEVICE_HAL_MIN="${DEVICE_HAL_MIN:-0.1.2}"
 OTA_STORAGE_PREFIX="${OTA_STORAGE_PREFIX:-https://storage.googleapis.com/s3-autonomous-upgrade-3}"
 OTA_CDN_BASE="${OTA_CDN_BASE:-https://cdn.autonomous.ai}"
 OS_MIRROR_BASE="${OS_MIRROR_BASE:-$OTA_CDN_BASE/os/mirror}"
-# npm registry used for openclaw in region CN, or after the default registry fails.
+# npm registry for openclaw in region CN. OTA_NPM_REGISTRY, when set, is used on any device.
 OTA_NPM_MIRROR="${OTA_NPM_MIRROR:-https://registry.npmmirror.com}"
 # Node package mirrored from the vendor's apt repository (same .deb, same layout).
 NODE_MIRROR_DEB="${NODE_MIRROR_DEB:-nodejs_24.22.3-1nodesource1_arm64.deb}"
@@ -1189,24 +1189,94 @@ ensure_node_engine() {
   }
 }
 
-# openclaw_npm_registry: in region CN use the npm mirror for this run (an explicit
-# NPM_CONFIG_REGISTRY wins). Exported, so npm install and plugin installs follow.
+# openclaw comes from the default npm registry. In region CN (OTA_NPM_MIRROR), or
+# when OTA_NPM_REGISTRY is set, another registry is used, but only for a version
+# whose tarball integrity the metadata pins (openclaw.integrity, the default
+# registry's dist.integrity); the registry is passed to each npm command, never
+# exported. Without a pin the default registry is used as before.
+OPENCLAW_NPM_REGISTRY=""
+OPENCLAW_INTEGRITY=""
+
+openclaw_pinned() {
+  [ -n "${METADATA_PAYLOAD:-}" ] || return 0
+  jq -r --arg v "$1" --arg path "$2" \
+    'select(.openclaw.version == $v) | .openclaw | getpath($path | split(".")) // empty' \
+    "$METADATA_PAYLOAD" 2>/dev/null || true
+}
+
 openclaw_npm_registry() {
-  if [ -z "${NPM_CONFIG_REGISTRY:-}" ] && [ -n "${OTA_NPM_MIRROR:-}" ] && region_is_cn; then
-    echo "[software-update] region CN: using npm registry $OTA_NPM_MIRROR"
-    export NPM_CONFIG_REGISTRY="$OTA_NPM_MIRROR"
+  local version="$1" candidate=""
+  OPENCLAW_NPM_REGISTRY=""
+  OPENCLAW_INTEGRITY=""
+  if [ -n "${OTA_NPM_REGISTRY:-}" ]; then
+    candidate="$OTA_NPM_REGISTRY"
+  elif [ -n "${OTA_NPM_MIRROR:-}" ] && region_is_cn; then
+    candidate="$OTA_NPM_MIRROR"
   fi
+  [ -n "$candidate" ] || return 0
+  OPENCLAW_INTEGRITY=$(openclaw_pinned "$version" integrity)
+  if [[ ! "$OPENCLAW_INTEGRITY" =~ ^sha512- ]]; then
+    echo "[software-update] no pinned integrity for openclaw@$version; using the default npm registry"
+    OPENCLAW_INTEGRITY=""
+    return 0
+  fi
+  echo "[software-update] using npm registry $candidate for openclaw@$version"
+  OPENCLAW_NPM_REGISTRY="$candidate"
+}
+
+openclaw_npm() {
+  if [ -n "${OPENCLAW_NPM_REGISTRY:-}" ]; then
+    npm --registry "$OPENCLAW_NPM_REGISTRY" "$@"
+  else
+    npm "$@"
+  fi
+}
+
+# sri_sha512 <file>: the file's npm-style integrity string.
+sri_sha512() {
+  printf 'sha512-%s' "$(openssl dgst -sha512 -binary "$1" | base64 | tr -d '\n')"
+}
+
+# install_openclaw_package <version>: npm install -g, from a tarball that matched
+# the pinned integrity when another registry is in use.
+install_openclaw_package() {
+  local version="$1" dir tarball
+  if [ -z "${OPENCLAW_NPM_REGISTRY:-}" ]; then
+    npm install -g "openclaw@$version"
+    return
+  fi
+  dir=$(mktemp -d) || return 1
+  tarball=$(cd "$dir" && openclaw_npm pack "openclaw@$version" --silent | tail -n 1) || { rm -rf "$dir"; return 1; }
+  if [ ! -f "$dir/$tarball" ] || [ "$(sri_sha512 "$dir/$tarball")" != "$OPENCLAW_INTEGRITY" ]; then
+    echo "[software-update] openclaw@$version from $OPENCLAW_NPM_REGISTRY does not match the pinned integrity" >&2
+    rm -rf "$dir"
+    return 1
+  fi
+  openclaw_npm install -g "$dir/$tarball" || { rm -rf "$dir"; return 1; }
+  rm -rf "$dir"
+}
+
+# install_openclaw_plugin <name> <version>: from another registry only when the
+# registry reports the integrity the metadata pins (openclaw.plugins.<name>).
+install_openclaw_plugin() {
+  local name="$1" version="$2" pinned served
+  if [ -z "${OPENCLAW_NPM_REGISTRY:-}" ]; then
+    openclaw plugins install "$name@$version" --force 2>&1
+    return
+  fi
+  pinned=$(openclaw_pinned "$version" "plugins.$name")
+  served=$(openclaw_npm view "$name@$version" dist.integrity 2>/dev/null || true)
+  if [[ ! "$pinned" =~ ^sha512- ]] || [ "$served" != "$pinned" ]; then
+    echo "[software-update] $name@$version has no matching pinned integrity; keeping the installed plugin" >&2
+    return 1
+  fi
+  NPM_CONFIG_REGISTRY="$OPENCLAW_NPM_REGISTRY" openclaw plugins install "$name@$version" --force 2>&1
 }
 
 ensure_openclaw_node() {
   local version="$1" engine_json engine
-  openclaw_npm_registry
-  if ! engine_json=$(npm view "openclaw@$version" engines.node --json); then
-    [ -z "${NPM_CONFIG_REGISTRY:-}" ] && [ -n "${OTA_NPM_MIRROR:-}" ] || return 1
-    echo "[software-update] default npm registry failed; retrying with $OTA_NPM_MIRROR"
-    export NPM_CONFIG_REGISTRY="$OTA_NPM_MIRROR"
-    engine_json=$(npm view "openclaw@$version" engines.node --json) || return 1
-  fi
+  openclaw_npm_registry "$version"
+  engine_json=$(openclaw_npm view "openclaw@$version" engines.node --json) || return 1
   engine=$(printf '%s' "$engine_json" | jq -er 'select(type == "string" and length > 0)') || {
     echo "[software-update] Missing Node requirement for openclaw@$version" >&2
     return 1
@@ -1252,9 +1322,9 @@ update_hermes_pinned() {
 update_openclaw() {
   local version="$1" attempt
   ensure_openclaw_node "$version" || return 1
-  npm install -g "openclaw@$version" || { echo "npm install openclaw failed"; return 1; }
-  openclaw plugins install "@openclaw/discord@$version" --force 2>&1 || echo "[software-update] WARN: discord plugin install failed (non-fatal)"
-  openclaw plugins install "@openclaw/slack@$version" --force 2>&1 || echo "[software-update] WARN: slack plugin install failed (non-fatal)"
+  install_openclaw_package "$version" || { echo "npm install openclaw failed"; return 1; }
+  install_openclaw_plugin @openclaw/discord "$version" || echo "[software-update] WARN: discord plugin install failed (non-fatal)"
+  install_openclaw_plugin @openclaw/slack "$version" || echo "[software-update] WARN: slack plugin install failed (non-fatal)"
   # Use the system gateway's state paths, not the SSH user's.
   systemctl stop openclaw || return 1
   if ! HOME=/root OPENCLAW_HOME=/root/.openclaw OPENCLAW_STATE_DIR=/root/.openclaw \
@@ -1871,7 +1941,7 @@ if [ -z "${SOFTWARE_UPDATE_DETACHED:-}" ] && command -v systemd-run >/dev/null 2
     SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
     # Transient units start with a clean env; forward every ${VAR:-} this script reads.
     SU_ENV=()
-    for v in OTA_METADATA_URL HAL_UV_CACHE OTA_REGION OS_MIRROR_BASE OTA_NPM_MIRROR HAL_WHEELHOUSE; do
+    for v in OTA_METADATA_URL HAL_UV_CACHE OTA_REGION OS_MIRROR_BASE OTA_NPM_MIRROR OTA_NPM_REGISTRY HAL_WHEELHOUSE; do
       [ -z "${!v:-}" ] || SU_ENV+=("--setenv=$v=${!v}")
     done
     echo "[software-update] running as $SU_UNIT.service — follow with: journalctl -fu $SU_UNIT"
