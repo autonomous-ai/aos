@@ -5,6 +5,7 @@ import logging
 import math
 import os
 import threading
+import time
 from typing import Any, Dict, List, Optional, Set
 
 import numpy as np
@@ -94,6 +95,12 @@ _MOVE_MAP: Dict[str, str] = {
 }
 
 _MIN_MOVE_DURATION_S = 0.1
+
+# release(): wait for a cancelled move, then retry goto_sleep while the daemon
+# still reports a running move. Torque goes off only once the sleep pose is in.
+_RELEASE_JOIN_S = 2.0
+_SLEEP_ATTEMPTS = 5
+_SLEEP_RETRY_S = 0.3
 
 # Seconds the daemon takes to interpolate into a move's first pose
 # (play_move(initial_goto_duration=...)).
@@ -194,6 +201,9 @@ class ReachyMotionService:
         self._music_recording: Optional[str] = None
         # Read by GET /servo alongside get_available_recordings().
         self._current_recording: Optional[str] = None
+        # Tracking hands the body back by playing this (drivers/tracking/body.py,
+        # tracker_service.py), the same contract as the feetech AnimationService.
+        self.idle_recording: str = P.SERVO_IDLE
 
     def start(self, skip_wake: bool = False) -> None:
         with self._lock:
@@ -437,12 +447,32 @@ class ReachyMotionService:
         errors: Dict[str, str] = {}
         self._released = True
         self._take_servo()
+        # The daemon refuses goto_sleep while the cancelled move is still
+        # winding down ("a move is already running"). Let it finish first.
+        thread = self._play_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=_RELEASE_JOIN_S)
         with self._lock:
             mini = self._require_mini()
-            try:
-                mini.goto_sleep()
-            except Exception as e:
-                errors["sleep"] = str(e)
+            sleep_err: Optional[Exception] = None
+            for attempt in range(_SLEEP_ATTEMPTS):
+                try:
+                    mini.goto_sleep()
+                    sleep_err = None
+                    break
+                except Exception as e:
+                    sleep_err = e
+                    if attempt + 1 < _SLEEP_ATTEMPTS:
+                        time.sleep(_SLEEP_RETRY_S)
+            if sleep_err is not None:
+                # Cutting torque away from the sleep pose drops the head.
+                # Keep holding and report instead.
+                errors["sleep"] = str(sleep_err)
+                logger.warning(
+                    "[reachy] goto_sleep failed %d times, torque left on: %s",
+                    _SLEEP_ATTEMPTS, sleep_err,
+                )
+                return errors
             try:
                 mini.disable_motors()
             except Exception as e:

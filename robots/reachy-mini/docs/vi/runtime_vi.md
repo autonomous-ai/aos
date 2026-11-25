@@ -134,9 +134,9 @@ trong khi mọi service vẫn báo healthy.
 | Bước | Script | Làm gì |
 |------|--------|--------|
 | 1 | `spike-device.sh` | Tải `devices.reachy-mini` từ OTA về `/opt/devices/reachy-mini` **và** đắp `rootfs/` của gói đó lên `/` — đây là nguồn của `/etc/asound.conf` và `/opt/hal/.env`. Thiếu `ROBOT.md` thì HAL không boot |
-| 2 | `spike-hal.sh` | Tải component `hal` về `/opt/hal`, `uv sync --python 3.12 --extra hardware --extra reachy`, chạy uvicorn ở `127.0.0.1:5001` |
+| 2 | `spike-hal.sh` | Tải component `hal` về `/opt/hal`, cài `ffmpeg` (TTS giải mã audio qua nó; thiếu thì robot không nói), `uv sync --python 3.12 --extra hardware --extra reachy`, chạy uvicorn ở `127.0.0.1:5001` kèm đường dẫn libcamera của Pollen khi có `/usr/local/lib/aarch64-linux-gnu/libcamera/ipa` |
 | 3 | `spike-os.sh` | Tải binary `os-server` về `/usr/local/bin`, seed `/root/config/config.json` tối thiểu, chạy **dưới root với `WorkingDirectory=/root`** |
-| 4 | `spike-web.sh` | Cài nginx, tải bundle `web` về `/usr/share/nginx/html/setup`, viết vhost `reachy-spike` |
+| 4 | `spike-web.sh` | Cài nginx, tải bundle `web` về `/usr/share/nginx/html/setup`, viết vhost `reachy-spike` (có location WebSocket `/api/harness/ws` mà Harness cần để pair), quảng bá `_autonomous._tcp` qua `/etc/avahi/services/autonomous.service` để Harness/Buddy tìm thấy robot |
 | 5 | `spike-agent.sh` | Node.js tương thích (cài từ NodeSource 24.x khi cần) + `openclaw` đúng version OTA pin, seed `/root/.openclaw`, chạy gateway ở loopback `18789` |
 | 6 | `spike-bootstrap.sh` | Worker OTA: seed `/root/config/bootstrap.json`, cài `software-update` được `upload-device.sh` stage sẵn ở gốc device package (bản canonical `scripts/provision/software-update`) → `/usr/local/bin/software-update` (worker exec script này để áp update; thiếu nó thì mọi lần apply đều fail `executable file not found in $PATH` trong khi mọi unit vẫn báo healthy), poll feed mỗi `5m` |
 
@@ -358,6 +358,14 @@ frame rate là tham số dòng lệnh. `HAL_CAMERA_INDEX` vô tác dụng với 
 (libcamera chọn sensor theo pipeline), và `requires_v4l2_index = False` giúp boot
 không đi dò `/dev/video*` cho node sẽ không bao giờ mở.
 
+Pollen OS có bản libcamera riêng dưới `/usr/local`. `launcher.sh` của daemon
+export `LD_LIBRARY_PATH=/usr/local/lib/aarch64-linux-gnu/`,
+`LIBCAMERA_IPA_MODULE_PATH=/usr/local/lib/aarch64-linux-gnu/libcamera/ipa` và
+`LIBCAMERA_IPA_CONFIG_PATH=/usr/local/share/libcamera/ipa`; thiếu chúng thì
+`rpicam-vid` không bao giờ ra frame ("no frame since HAL start").
+`spike-hal.sh` ghi đúng ba biến đó thành dòng `Environment=` trong `hal.service`
+khi thư mục IPA đó tồn tại.
+
 Điểm còn phải tune: ở mức idle 5 fps, libcamera có thể chọn thời gian phơi sáng
 đủ dài để làm nhoè vật thể chuyển động. Nâng idle rate hoặc chặn trần
 `--shutter` khi cần ảnh tĩnh nét hơn là cần tiết kiệm CPU.
@@ -520,6 +528,18 @@ Suppression được tách đúng theo cách các route đọc, không gộp th�
 những gì route cho qua. Trước đây Reachy thiếu cả hai cờ nên route tưởng không
 hold, vẫn dispatch, còn driver thì drop kèm mỗi dòng log `debug` — robot im lặng
 sau khi hold mà không rõ lý do.
+
+`release()` (`/servo/release`, đi ngủ) trước tiên chờ tối đa 2 s cho play thread
+của move vừa bị huỷ, rồi gọi `goto_sleep()` tối đa 5 lần cách nhau 0.3 s, vì
+daemon từ chối với "a move is already running" khi move bị huỷ chưa dừng hẳn.
+Chỉ tắt torque sau khi `goto_sleep()` thành công; nếu mọi lần đều lỗi, motor vẫn
+bật để giữ tư thế hiện tại và lỗi trả về dạng `{"sleep": ...}`. Trước đây tắt
+torque khi chưa về tư thế ngủ làm đầu rớt xuống.
+
+`idle_recording` là `P.SERVO_IDLE`, đúng thuộc tính mà `AnimationService` của
+Feetech có: tracking trả body về bằng cách play nó (`drivers/tracking/body.py`,
+`tracker_service.py`). Thiếu nó thì mỗi lần trả body đều ném `AttributeError`
+và đầu đứng yên ở vị trí tracking để lại.
 
 `freeze()` không bao giờ huỷ move đang chạy: snapshot vision diễn ra thường
 xuyên, chặt move cho từng lần vừa phá animation đang xem vừa làm groove khởi động
