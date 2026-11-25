@@ -43,3 +43,22 @@ func TestSkillDownloadsFallBackFromCDNToStorage(t *testing.T) {
 		t.Fatalf("data %q", data)
 	}
 }
+
+func TestSkillVersionsSkipHTMLFromCDN(t *testing.T) {
+	cdn := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("<html><body>Sign in to the network</body></html>"))
+	}))
+	defer cdn.Close()
+	storage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"skills":{"voice":{"version":"abc"}}}`))
+	}))
+	defer storage.Close()
+	old := otamirror.Default
+	otamirror.Default = otamirror.Mapping{CDN: cdn.URL, Storage: storage.URL + "/bucket"}
+	defer func() { otamirror.Default = old }()
+
+	versions, err := FetchSkillVersions(cdn.URL + "/os/ota/metadata.json")
+	if err != nil || versions["voice"] != "abc" {
+		t.Fatalf("versions %v err %v", versions, err)
+	}
+}

@@ -2,6 +2,10 @@ package bootstrap
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -90,6 +94,65 @@ func TestUpdaterFetchFallsBackOnEmptyCDNBody(t *testing.T) {
 	b := &Bootstrap{cfg: &config.Config{}, client: http.DefaultClient}
 	data, err := b.fetchUpdater(context.Background(), storage+"/os/software-update")
 	if err != nil || string(data) != "#!/bin/bash\n" {
+		t.Fatalf("data %q err %v", data, err)
+	}
+}
+
+const portalPage = "<html><body>Sign in to the network</body></html>"
+
+func TestMetadataFetchSkipsHTMLFromCDN(t *testing.T) {
+	_, storage := mirrorServers(t,
+		func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(portalPage)) },
+		func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{"from":"storage"}`)) })
+	b := &Bootstrap{cfg: &config.Config{MetadataURL: storage + "/os/ota/metadata.json"}, client: http.DefaultClient}
+	payload, _, err := b.fetchMetadataPayload(context.Background())
+	if err != nil || string(payload) != `{"from":"storage"}` {
+		t.Fatalf("payload %s err %v", payload, err)
+	}
+}
+
+func TestSignedMetadataFetchSkipsUnverifiedCDNReply(t *testing.T) {
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte(`{"from":"storage"}`)
+	envelope, _ := json.Marshal(map[string]any{
+		"format":  otaMetadataFormat,
+		"payload": base64.StdEncoding.EncodeToString(payload),
+		"signature": map[string]string{"algorithm": "ed25519",
+			"value": base64.StdEncoding.EncodeToString(ed25519.Sign(privateKey, payload))},
+	})
+	_, storage := mirrorServers(t,
+		// Valid JSON, but not signed metadata.
+		func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{"from":"cdn"}`)) },
+		func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write(envelope) })
+	b := &Bootstrap{serviceStateDir: t.TempDir(), client: http.DefaultClient, cfg: &config.Config{
+		MetadataURL: storage + "/os/ota/metadata.json", SigningPublicKey: base64.StdEncoding.EncodeToString(publicKey)}}
+	got, verified, err := b.fetchMetadataPayload(context.Background())
+	if err != nil || !verified || string(got) != string(payload) {
+		t.Fatalf("payload %s verified %v err %v", got, verified, err)
+	}
+}
+
+func TestUpdaterFetchSkipsHTMLFromCDN(t *testing.T) {
+	_, storage := mirrorServers(t,
+		func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(portalPage)) },
+		func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("#!/bin/bash\necho ok\n")) })
+	b := &Bootstrap{cfg: &config.Config{}, client: http.DefaultClient}
+	data, err := b.fetchUpdater(context.Background(), storage+"/os/software-update")
+	if err != nil || string(data) != "#!/bin/bash\necho ok\n" {
+		t.Fatalf("data %q err %v", data, err)
+	}
+}
+
+func TestUpdaterFetchSkipsBrokenScript(t *testing.T) {
+	_, storage := mirrorServers(t,
+		func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("#!/bin/bash\nif then\n")) },
+		func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("#!/bin/bash\necho ok\n")) })
+	b := &Bootstrap{cfg: &config.Config{}, client: http.DefaultClient}
+	data, err := b.fetchUpdater(context.Background(), storage+"/os/software-update")
+	if err != nil || string(data) != "#!/bin/bash\necho ok\n" {
 		t.Fatalf("data %q err %v", data, err)
 	}
 }

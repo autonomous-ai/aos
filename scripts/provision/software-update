@@ -2139,31 +2139,50 @@ trap on_exit EXIT
 # INT/TERM/HUP run the same restore; HUP is what an interrupted SSH sends.
 trap 'exit 130' INT
 trap 'exit 143' TERM HUP
+OTA_SIGNING_PUBLIC_KEY="$(jq -r '.signing_public_key // empty' "$BOOTSTRAP_JSON" 2>/dev/null || true)"
+
+# metadata_accept <reply> <payload-out>: the reply is the OTA metadata: a JSON
+# object, and signed with the provisioned key when one is set. Writes the payload.
+metadata_accept() {
+  local reply="$1" out="$2" der sig status=1
+  if ! jq -e 'type == "object"' "$reply" >/dev/null 2>&1; then
+    echo "[software-update] metadata reply is not JSON" >&2
+    return 1
+  fi
+  if [ -z "${OTA_SIGNING_PUBLIC_KEY:-}" ]; then
+    cp "$reply" "$out"
+    return
+  fi
+  der=$(mktemp); sig=$(mktemp)
+  if jq -er '(.signed // .) | .format == "autonomous-ota/v1" and .signature.algorithm == "ed25519"' "$reply" >/dev/null \
+      && printf '\060\052\060\005\006\003\053\145\160\003\041\000' > "$der" \
+      && printf '%s' "$OTA_SIGNING_PUBLIC_KEY" | base64 -d >> "$der" \
+      && jq -r '(.signed // .).payload' "$reply" | base64 -d > "$out" \
+      && jq -r '(.signed // .).signature.value' "$reply" | base64 -d > "$sig" \
+      && openssl pkeyutl -verify -pubin -keyform DER -inkey "$der" -rawin -in "$out" -sigfile "$sig" >/dev/null 2>&1; then
+    status=0
+  else
+    echo "[software-update] metadata reply is not signed OTA metadata" >&2
+  fi
+  rm -f "$der" "$sig"
+  return "$status"
+}
+
+# Each host's reply is checked before it is used, so a reply that is not the
+# metadata (an HTML page, a cut body) moves on to the next host.
 METADATA_FETCHED=0
 while IFS= read -r METADATA_SOURCE; do
   [ -n "$METADATA_SOURCE" ] || continue
   if curl -fsSL --connect-timeout 30 --max-time 120 -H "Cache-Control: no-cache" -H "Pragma: no-cache" \
-      -o "$METADATA_TMP" "$METADATA_SOURCE"; then
+      -o "$METADATA_TMP" "$METADATA_SOURCE" && metadata_accept "$METADATA_TMP" "$METADATA_PAYLOAD"; then
     METADATA_FETCHED=1
     [ "$METADATA_SOURCE" = "$OTA_METADATA_URL" ] || echo "[software-update] OTA metadata fetched from $METADATA_SOURCE"
     break
   fi
   echo "[software-update] metadata fetch failed from $METADATA_SOURCE" >&2
 done <<< "$OTA_METADATA_CANDIDATES"
-[ "$METADATA_FETCHED" = 1 ] || { echo "Failed to fetch metadata from $OTA_METADATA_URL"; exit 1; }
-OTA_SIGNING_PUBLIC_KEY="$(jq -r '.signing_public_key // empty' "$BOOTSTRAP_JSON" 2>/dev/null || true)"
-if [ -n "$OTA_SIGNING_PUBLIC_KEY" ]; then
-  PUBLIC_DER=$(mktemp); SIGNATURE_TMP=$(mktemp)
-  jq -er '(.signed // .) | .format == "autonomous-ota/v1" and .signature.algorithm == "ed25519"' "$METADATA_TMP" >/dev/null || { echo "Unsigned or unsupported OTA metadata"; exit 1; }
-  printf '\060\052\060\005\006\003\053\145\160\003\041\000' > "$PUBLIC_DER"
-  printf '%s' "$OTA_SIGNING_PUBLIC_KEY" | base64 -d >> "$PUBLIC_DER" || { echo "Invalid OTA signing public key"; exit 1; }
-  jq -r '(.signed // .).payload' "$METADATA_TMP" | base64 -d > "$METADATA_PAYLOAD" || { echo "Invalid OTA metadata payload"; exit 1; }
-  jq -r '(.signed // .).signature.value' "$METADATA_TMP" | base64 -d > "$SIGNATURE_TMP" || { echo "Invalid OTA metadata signature"; exit 1; }
-  openssl pkeyutl -verify -pubin -keyform DER -inkey "$PUBLIC_DER" -rawin -in "$METADATA_PAYLOAD" -sigfile "$SIGNATURE_TMP" >/dev/null || { echo "OTA metadata signature verification failed"; exit 1; }
-else
-  echo "[software-update] WARN: OTA signing is not configured; using legacy unsigned metadata"
-  cp "$METADATA_TMP" "$METADATA_PAYLOAD"
-fi
+[ "$METADATA_FETCHED" = 1 ] || { echo "Failed to fetch valid metadata from $OTA_METADATA_URL"; exit 1; }
+[ -n "$OTA_SIGNING_PUBLIC_KEY" ] || echo "[software-update] WARN: OTA signing is not configured; using legacy unsigned metadata"
 if [ "$APP" = "device" ]; then
   DEVICE_TYPE="$(grep -E '^DEVICE_TYPE=' /opt/hal/.env 2>/dev/null | cut -d= -f2)"
   [ -z "$DEVICE_TYPE" ] && DEVICE_TYPE="$(jq -r '.device_type // empty' /root/config/config.json 2>/dev/null)"

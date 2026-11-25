@@ -23,22 +23,23 @@ func FetchSkillVersions(otaMetadataURL string) (map[string]string, error) {
 	if strings.TrimSpace(otaMetadataURL) == "" {
 		return nil, nil
 	}
-	var body []byte
+	// A reply that is not JSON (an HTML page, a cut body) moves on to the next host.
+	var meta map[string]json.RawMessage
 	var errs []error
 	for _, u := range otamirror.Candidates(otaMetadataURL) {
 		b, err := fetchMetadataBody(u)
 		if err == nil {
-			body = b
-			break
+			meta = nil
+			if err = json.Unmarshal(b, &meta); err == nil {
+				break
+			}
+			err = fmt.Errorf("%s: metadata is not JSON: %w", u, err)
 		}
+		meta = nil
 		errs = append(errs, err)
 	}
-	if body == nil {
+	if meta == nil {
 		return nil, errors.Join(errs...)
-	}
-	var meta map[string]json.RawMessage
-	if err := json.Unmarshal(body, &meta); err != nil {
-		return nil, err
 	}
 	raw, ok := meta["skills"]
 	if !ok {

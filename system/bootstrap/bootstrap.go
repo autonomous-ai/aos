@@ -574,19 +574,30 @@ func (b *Bootstrap) fetchMetadataPayload(ctx context.Context) (payload []byte, v
 	// Record every outcome, including transport failures, in the security status.
 	defer func() { b.security.record(verified, err) }()
 
-	data, err := b.fetchFirst(ctx, b.metadataCandidates(), 2<<20, false)
+	// Each host's reply is checked before it is accepted, so a reply that is not
+	// the metadata (an HTML page, a cut body) moves on to the next host.
+	signed := strings.TrimSpace(b.cfg.SigningPublicKey) != ""
+	accept := func(data []byte) ([]byte, error) {
+		if signed {
+			return verifyOTAMetadata(data, b.cfg.SigningPublicKey)
+		}
+		var object map[string]json.RawMessage
+		if err := json.Unmarshal(data, &object); err != nil {
+			return nil, fmt.Errorf("metadata is not a JSON object: %w", err)
+		}
+		return data, nil
+	}
+	payload, err = b.fetchFirst(ctx, b.metadataCandidates(), 2<<20, false, accept)
 	if err != nil {
+		if signed {
+			return nil, false, fmt.Errorf("verify metadata %s: %w", b.cfg.MetadataURL, err)
+		}
 		return nil, false, fmt.Errorf("fetch metadata: %w", err)
 	}
-	if strings.TrimSpace(b.cfg.SigningPublicKey) == "" {
+	if !signed {
 		slog.Warn("OTA signature verification disabled: signing_public_key is not provisioned", "component", "bootstrap")
-		return data, false, nil
 	}
-	payload, err = verifyOTAMetadata(data, b.cfg.SigningPublicKey)
-	if err != nil {
-		return nil, false, fmt.Errorf("verify metadata %s: %w", b.cfg.MetadataURL, err)
-	}
-	return payload, true, nil
+	return payload, signed, nil
 }
 
 // metadataCandidates lists the metadata URLs to try: an explicit OTA_METADATA_URL
@@ -601,13 +612,20 @@ func (b *Bootstrap) metadataCandidates() []string {
 // fetchFirst GETs each URL in order and returns the first 200 body (at most
 // limit bytes; empty or larger bodies fail that candidate). Errors from every candidate
 // are joined so the log shows why each host failed.
-func (b *Bootstrap) fetchFirst(ctx context.Context, urls []string, limit int64, noCache bool) ([]byte, error) {
+func (b *Bootstrap) fetchFirst(ctx context.Context, urls []string, limit int64, noCache bool,
+	accept func([]byte) ([]byte, error)) ([]byte, error) {
 	if len(urls) == 0 {
 		return nil, errors.New("no url configured")
 	}
 	var errs []error
 	for i, u := range urls {
 		data, err := b.fetchOne(ctx, u, limit, noCache)
+		if err == nil && accept != nil {
+			if data, err = accept(data); err != nil {
+				err = fmt.Errorf("%s: %w", u, err)
+				slog.Info("OTA download rejected; trying the next host", "component", "bootstrap", "url", u, "error", err)
+			}
+		}
 		if err == nil {
 			if i > 0 {
 				slog.Info("OTA download used the fallback host", "component", "bootstrap", "url", u)

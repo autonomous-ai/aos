@@ -1,6 +1,7 @@
 package bootstrap
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
@@ -147,7 +148,23 @@ func (b *Bootstrap) fetchUpdater(ctx context.Context, src string) ([]byte, error
 	const maxUpdaterBytes = 1 << 20 // 1 MiB; the real script is ~100 KB
 
 	// The updater is republished in place; a cached copy would hide the fix.
-	return b.fetchFirst(ctx, otaMirror.Candidates(src), maxUpdaterBytes, true)
+	return b.fetchFirst(ctx, otaMirror.Candidates(src), maxUpdaterBytes, true, func(data []byte) ([]byte, error) {
+		return data, checkUpdaterScript(ctx, data)
+	})
+}
+
+// checkUpdaterScript rejects a reply that is not a bash script: it must start
+// with a shebang and pass bash -n.
+func checkUpdaterScript(ctx context.Context, data []byte) error {
+	if !bytes.HasPrefix(data, []byte("#!")) {
+		return errors.New("updater does not start with #!")
+	}
+	cmd := exec.CommandContext(ctx, "bash", "-n", "/dev/stdin")
+	cmd.Stdin = bytes.NewReader(data)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("updater failed bash -n: %w: %s", err, out)
+	}
+	return nil
 }
 
 // installUpdater validates the script and installs it atomically.

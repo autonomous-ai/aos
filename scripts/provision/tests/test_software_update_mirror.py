@@ -94,6 +94,50 @@ class MirrorTests(unittest.TestCase):
     def curled(self, events):
         return [line.split()[-1] for line in events if line.startswith("curl ")]
 
+    def metadata_loop(self, cdn_body, storage_body, key=""):
+        text = SCRIPT.read_text()
+        loop = text[text.index("METADATA_FETCHED=0\n"):text.index('[ "$METADATA_FETCHED" = 1 ]')]
+        self.publish(f"{CDN}/os/ota/metadata.json", cdn_body)
+        self.publish(f"{STORAGE}/os/ota/metadata.json", storage_body)
+        code = functions("ota_url_candidates", "metadata_accept") + (
+            f'OTA_SIGNING_PUBLIC_KEY="{key}"\nOTA_METADATA_URL="{STORAGE}/os/ota/metadata.json"\n'
+            'OTA_METADATA_CANDIDATES="$(ota_url_candidates "$OTA_METADATA_URL")"\n'
+            'METADATA_TMP=$(mktemp); METADATA_PAYLOAD=$(mktemp)\n' + loop +
+            '[ "$METADATA_FETCHED" = 1 ] || exit 1\ncat "$METADATA_PAYLOAD"\n')
+        return self.bash(code)
+
+    def test_metadata_html_from_cdn_uses_storage(self):
+        result, events = self.metadata_loop(b"<html>Sign in to the network</html>", b'{"from":"storage"}')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {"from": "storage"})
+        self.assertEqual(self.curled(events), [f"{CDN}/os/ota/metadata.json", f"{STORAGE}/os/ota/metadata.json"])
+
+    def test_metadata_cut_json_from_cdn_uses_storage(self):
+        result, _ = self.metadata_loop(b'{"from":"cd', b'{"from":"storage"}')
+        self.assertEqual(json.loads(result.stdout), {"from": "storage"})
+
+    def test_metadata_all_hosts_invalid_fails(self):
+        result, _ = self.metadata_loop(b"<html></html>", b"<html></html>")
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_signed_metadata_unsigned_cdn_reply_uses_storage(self):
+        key_file = self.root / "key.pem"
+        if subprocess.run(["openssl", "genpkey", "-algorithm", "ed25519", "-out", str(key_file)],
+                          capture_output=True).returncode != 0:
+            self.skipTest("openssl without ed25519")
+        payload = b'{"from":"storage"}'
+        (self.root / "payload").write_bytes(payload)
+        sig = subprocess.run(["openssl", "pkeyutl", "-sign", "-inkey", str(key_file), "-rawin",
+                              "-in", str(self.root / "payload")], capture_output=True, check=True).stdout
+        der = subprocess.run(["openssl", "pkey", "-in", str(key_file), "-pubout", "-outform", "DER"],
+                             capture_output=True, check=True).stdout
+        import base64
+        envelope = json.dumps({"format": "autonomous-ota/v1", "payload": base64.b64encode(payload).decode(),
+                               "signature": {"algorithm": "ed25519", "value": base64.b64encode(sig).decode()}})
+        result, _ = self.metadata_loop(b'{"from":"cdn"}', envelope.encode(), base64.b64encode(der[-32:]).decode())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {"from": "storage"})
+
     def test_candidates_map_storage_and_cdn_both_ways(self):
         code = functions("ota_url_candidates") + (
             f'ota_url_candidates "{STORAGE}/os/ota/hal/1.zip"; echo --\n'
