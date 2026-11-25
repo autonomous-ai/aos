@@ -261,9 +261,10 @@ one clears it. A check is a ping to `8.8.8.8` (and to `223.5.5.5` only when
 falling back to a TLS handshake with the device's cloud API host when ICMP
 fails, so networks that drop ICMP are not reported offline. The monitor's ping
 and TLS check each wait up to 4s; setup's TLS check waits up to 5s. HAL's own
-internet check (it decides whether a backend error flashes amber) runs the
-same probe set over TCP/53 and a TLS handshake with the cloud API host from
-`config.json` at once, within 4s. The monitor page's Overview uses the same fallback
+internet check (it decides whether a backend error flashes amber) asks
+`8.8.8.8` over TCP/53 first; only when that fails or has not answered within
+1s does it also try `223.5.5.5` over TCP/53 and a TLS handshake with the cloud
+API host from `config.json`. The first answer wins, within 4s. The monitor page's Overview uses the same fallback
 (`CheckInternetRTT`), showing no ping time when only TLS got through. Internet status is separate from WiFi recovery:
 association and a usable station IPv4 address keep WiFi active even without
 Internet. The monitor no longer reboots the device.
@@ -298,7 +299,8 @@ any other region, or with no region, the drop-in and the sources file are
 removed and the image's `name_servers="1.1.1.1 8.8.8.8"` line and
 `device-sta-mode` lines are put back, but only where ours are in place.
 timesyncd is restarted (if running), chrony reloaded and `resolv.conf`
-regenerated only after a change; the `device-sta-mode` change applies from the
+regenerated only after a change, or again on the next check when a step
+failed (a failed step is retried every 5 minutes until all succeed); the `device-sta-mode` change applies from the
 next WiFi join. Before setup nothing changes, so an image built with
 `IMAGE_REGION=CN` (`scripts/imager`) keeps these settings until the cloud has
 answered.

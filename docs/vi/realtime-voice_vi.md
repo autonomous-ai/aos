@@ -3643,12 +3643,15 @@ chỉ chứa model đã được xác minh; một lần tải lỗi bị xóa v�
 đôi dần tới 600 s. Cả HAL khi khởi động lẫn voice loop đều không chờ việc tải này.
 Mỗi lần thử tải trước từ bản trên CDN (`HAL_LANG_ID_MODEL_MIRROR_URL`, mặc định
 `https://cdn.autonomous.ai/models/ambernet/ambernet.onnx`, để rỗng là tắt) với
-timeout kết nối và đọc 5s, nên bản bị thiếu hoặc chậm chỉ tốn vài giây, rồi tới
+yêu cầu kết nối và bắt đầu phản hồi trong 5s, nên bản bị thiếu hoặc không tới
+được chỉ tốn vài giây (khi phản hồi đã bắt đầu, việc đọc dùng timeout bình thường,
+nên một lúc khựng giữa chừng không làm hỏng lần tải), rồi tới
 `url` đã pin, rồi tới các `mirrors` https trong file pin. Mọi nguồn đều được kiểm
 tra cùng SHA-256. Model chất lượng giọng (`HAL_SPEAKER_MODEL_MIRROR_BASE`, kiểm
 tra với SHA-256 đã pin) và các file Piper (`HAL_PIPER_MIRROR_BASE`) cũng thử bản
 trên CDN trước theo cách này. File nén engine Piper và từng file giọng trong
-catalogue được kiểm tra với SHA-256 đã pin trong `tts/piper_catalog.py` trước khi
+catalogue được kiểm tra với SHA-256 đã pin trong `tts/piper_catalog.py` (giọng
+được tải từ một revision cố định của repo giọng, `VOICES_REVISION`) trước khi
 giữ lại hay giải nén; file không khớp bị xóa và nguồn kế tiếp được thử.
 
 Cổng chỉ **active** khi model đã load xong (`Language gate active`). Trước đó (đang

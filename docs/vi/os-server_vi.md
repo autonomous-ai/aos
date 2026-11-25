@@ -253,8 +253,9 @@ state này. Mỗi lần kiểm tra là ping `8.8.8.8` (và ping `223.5.5.5` ch�
 thì bắt tay TLS với host cloud API của thiết bị, nên mạng chặn ICMP không bị báo
 là offline. Ping và kiểm tra TLS của monitor mỗi cái chờ tối đa 4s; kiểm tra TLS
 lúc setup chờ tối đa 5s. Kiểm tra internet riêng của HAL (quyết định có nháy cam
-khi backend lỗi hay không) chạy cùng lúc bộ probe qua TCP/53 và bắt tay TLS với
-host cloud API lấy từ `config.json`, trong vòng 4s. Overview của trang monitor dùng cùng
+khi backend lỗi hay không) hỏi `8.8.8.8` qua TCP/53 trước; chỉ khi lỗi hoặc chưa
+trả lời sau 1s mới thử thêm `223.5.5.5` qua TCP/53 và bắt tay TLS với host cloud
+API lấy từ `config.json`. Câu trả lời đầu tiên được dùng, trong vòng 4s. Overview của trang monitor dùng cùng
 fallback này (`CheckInternetRTT`), không hiện thời gian ping khi chỉ TLS đi qua. Trạng thái Internet độc lập với phục hồi WiFi: nếu còn association
 và IPv4 dùng được ở chế độ STA, thiết bị giữ WiFi ngay cả khi mất Internet.
 Monitor không còn reboot thiết bị.
@@ -288,7 +289,8 @@ server này sau DNS của DHCP lease. Với region khác, hoặc chưa có regio
 và file source bị xóa, dòng `name_servers="1.1.1.1 8.8.8.8"` của image và các
 dòng của `device-sta-mode` được đặt lại, nhưng chỉ khi dòng của chúng ta đang ở
 đó. timesyncd chỉ được restart (nếu đang chạy), chrony reload và `resolv.conf`
-tạo lại sau khi có thay đổi; thay đổi trong `device-sta-mode` có hiệu lực từ lần
+tạo lại sau khi có thay đổi, hoặc lại ở lần kiểm tra kế tiếp khi một bước lỗi (bước
+lỗi được thử lại mỗi 5 phút tới khi tất cả thành công); thay đổi trong `device-sta-mode` có hiệu lực từ lần
 join WiFi kế tiếp. Trước khi setup không có gì thay đổi, nên image build với
 `IMAGE_REGION=CN` (`scripts/imager`) giữ các thiết lập này cho tới khi cloud trả
 lời.
