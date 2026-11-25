@@ -17,8 +17,9 @@ Khi OS server chưa được cấu hình (`SetUpCompleted = false`), thiết b�
       early-capture publish IP LAN (STA) vào setup state ngay khi wlan0 có
       IP (trước cả khi có internet), để Web UI đọc được lúc AP còn sống
       trong giây lát (xem "Tự Động Chuyển Hướng AP→STA")
-   b. Chờ internet (tối đa 60s tính theo đồng hồ; ICMP tới 8.8.8.8, nếu không
-      được thì bắt tay TLS với host cloud API — cho mạng chặn ICMP)
+   b. Chờ internet (tối đa 60s tính theo đồng hồ; ICMP tới 8.8.8.8, rồi tới
+      223.5.5.5 khi 8.8.8.8 lỗi hoặc chưa trả lời sau 1s, nếu không được thì bắt
+      tay TLS với host cloud API — cho mạng chặn ICMP)
    c. Lưu config, rồi đồng bộ lại đồng hồ (không có RTC: thiết bị khởi động
       với giờ cũ và mọi lệnh TLS lỗi "certificate is not yet valid"): chrony
       `online` + `refresh` (resolve lại tên NTP pool bị lỗi lúc ở AP mode) +
@@ -104,8 +105,9 @@ Toàn bộ phần sau đó (LLM config, channel, agent setup, `SetUpCompleted`) 
 1. Gọi `connect-wifi` CLI tool với SSID + password
 2. Poll kiểm tra:
    - SSID match? (`iwgetid`)
-   - Internet OK? (`ping 8.8.8.8`, nếu không được thì bắt tay TLS với host cloud
-     API của thiết bị — `system/network/reachability.go`)
+   - Internet OK? (`ping 8.8.8.8`, hoặc `223.5.5.5` khi 8.8.8.8 lỗi hay chậm,
+     nếu không được thì bắt tay TLS với host cloud API của thiết bị —
+     `system/network/reachability.go`)
 3. Timeout 60s tính theo đồng hồ → fail. (Trước đây đếm 60 lần thử, mà mỗi lần
    ping thất bại chờ 5s, nên mạng chặn ICMP khiến thiết bị thử tới ~6 phút trong
    khi web client đã bỏ cuộc sau 80s.)

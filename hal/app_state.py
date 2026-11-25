@@ -943,15 +943,68 @@ def _dismiss_mic_muted_led(source: str):
     logger.info("Mic-muted LED indicator dismissed by %s (mic stays muted)", source)
 
 
-def _has_internet() -> bool:
-    """True if a 1s TCP connect to a public DNS IP succeeds."""
+# Public resolvers probed over TCP/53, in order; any answer counts. The first is
+# the probe every device has always used; the second answers on networks where
+# the first is blocked and is only tried after the first fails. Same probe set
+# as os-server's internet check.
+_INTERNET_PROBE_IPS = ("8.8.8.8", "223.5.5.5")
+_INTERNET_PROBE_TIMEOUT_S = 1.0
+
+
+def _tcp_probe(host: str, port: int) -> bool:
     import socket
 
     try:
-        with socket.create_connection(("8.8.8.8", 53), timeout=1.0):
+        with socket.create_connection((host, port), timeout=_INTERNET_PROBE_TIMEOUT_S):
             return True
     except OSError:
         return False
+
+
+def _tls_probe(host: str, port: int) -> bool:
+    """TLS handshake with host, nothing sent. The certificate is not checked on
+    purpose: this only proves reachability and must work before NTP fixes the clock."""
+    import socket
+    import ssl
+
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        with socket.create_connection((host, port), timeout=_INTERNET_PROBE_TIMEOUT_S) as sock:
+            sock.settimeout(_INTERNET_PROBE_TIMEOUT_S)
+            with ctx.wrap_socket(sock, server_hostname=host):
+                return True
+    except (OSError, ValueError):
+        return False
+
+
+def _cloud_probe_target():
+    """(host, port) of the device's Autonomous cloud API from config.json, or None.
+    An owner's own LLM provider is never probed."""
+    try:
+        from urllib.parse import urlparse
+
+        from hal.config import _os_cfg_get
+        from hal.drivers.gelf_handler import _is_autonomous_host
+
+        base = (_os_cfg_get("llm_base_url", "") or "").strip()
+        u = urlparse(base)
+        if u.scheme != "https" or not u.hostname or not _is_autonomous_host(base):
+            return None
+        return u.hostname, u.port or 443
+    except Exception:
+        return None
+
+
+def _has_internet() -> bool:
+    """True if a probe answers, tried in order: TCP/53 to each public resolver,
+    then a TLS handshake with the cloud API host. Stops at the first answer, so
+    a network where the first resolver answers costs one probe, as before."""
+    if any(_tcp_probe(ip, 53) for ip in _INTERNET_PROBE_IPS):
+        return True
+    cloud = _cloud_probe_target()
+    return bool(cloud) and _tls_probe(*cloud)
 
 
 def _flash_backend_error():
