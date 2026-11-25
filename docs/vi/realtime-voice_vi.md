@@ -3647,7 +3647,9 @@ timeout kết nối và đọc 5s, nên bản bị thiếu hoặc chậm chỉ t
 `url` đã pin, rồi tới các `mirrors` https trong file pin. Mọi nguồn đều được kiểm
 tra cùng SHA-256. Model chất lượng giọng (`HAL_SPEAKER_MODEL_MIRROR_BASE`, kiểm
 tra với SHA-256 đã pin) và các file Piper (`HAL_PIPER_MIRROR_BASE`) cũng thử bản
-trên CDN trước theo cách này.
+trên CDN trước theo cách này. File nén engine Piper và từng file giọng trong
+catalogue được kiểm tra với SHA-256 đã pin trong `tts/piper_catalog.py` trước khi
+giữ lại hay giải nén; file không khớp bị xóa và nguồn kế tiếp được thử.
 
 Cổng chỉ **active** khi model đã load xong (`Language gate active`). Trước đó (đang
 tải, đang load lúc boot), hoặc khi model load lỗi, mọi capture ghi log

@@ -16,7 +16,8 @@ from fastapi import APIRouter
 from pydantic import BaseModel
 
 from hal.drivers.voice.tts.piper_catalog import (
-    BINARY_URL, CATALOG, DEFAULT_VOICE, binary_mirror_url, voice_mirror_urls, voice_urls,
+    BINARY_SHA256, BINARY_URL, CATALOG, DEFAULT_VOICE, binary_mirror_url, voice_mirror_urls,
+    voice_sha256, voice_urls,
 )
 
 router = APIRouter()
@@ -210,7 +211,7 @@ def piper_install():
         return {"status": "ok", "already": True}
     if not _claim("engine", "piper"):
         return {"status": "busy", "job": _read_job()}
-    _spawn({"kind": "engine", "target": "piper", "url": BINARY_URL,
+    _spawn({"kind": "engine", "target": "piper", "url": BINARY_URL, "sha256": BINARY_SHA256,
             "quick": [u for u in (binary_mirror_url(),) if u],
             "dir": PIPER_DIR, "voices_dir": VOICES_DIR})
     return {"status": "started", "job": _read_job()}
@@ -228,14 +229,15 @@ def piper_voice(req: VoiceRequest):
         return {"status": "busy", "job": _read_job()}
     onnx_url, json_url = voice_urls(name)
     mirror_onnx, mirror_json = voice_mirror_urls(name) or (None, None)
+    onnx_sha, json_sha = voice_sha256(name)
     _spawn({
         "kind": "voice", "target": name,
         "steps": [
             # Sidecar first: it carries the sample rate; a model without it plays pitched.
-            {"url": json_url, "quick": [mirror_json] if mirror_json else [],
+            {"url": json_url, "sha256": json_sha, "quick": [mirror_json] if mirror_json else [],
              "dest": os.path.join(VOICES_DIR, f"{name}.onnx.json"),
              "from": 0, "to": 3, "track": False},
-            {"url": onnx_url, "quick": [mirror_onnx] if mirror_onnx else [],
+            {"url": onnx_url, "sha256": onnx_sha, "quick": [mirror_onnx] if mirror_onnx else [],
              "dest": os.path.join(VOICES_DIR, f"{name}.onnx"),
              "from": 3, "to": 100, "track": True},
         ],

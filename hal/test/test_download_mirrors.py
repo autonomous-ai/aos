@@ -1,7 +1,9 @@
 """Model, voice and engine downloads try a CDN copy first, quickly, then
 upstream; the internet check accepts any of its probes."""
 
+import hashlib
 import importlib.util
+import io
 from pathlib import Path
 
 from hal.drivers.voice.speaker_recognizer.audio_processors import model_store as stoi_store
@@ -86,7 +88,7 @@ def test_piper_mirror_paths(monkeypatch):
 def test_piper_worker_tries_cdn_copy_quickly_then_upstream(tmp_path, monkeypatch):
     tried = []
 
-    def fake(url, dest, w_from, w_to, track, timeout):
+    def fake(url, dest, w_from, w_to, track, timeout, sha256):
         tried.append((url, timeout))
         if url == "https://m/x":
             Path(dest + ".part").write_bytes(b"half")
@@ -96,11 +98,83 @@ def test_piper_worker_tries_cdn_copy_quickly_then_upstream(tmp_path, monkeypatch
     monkeypatch.setattr(piper_dl, "_download", fake)
     dest = str(tmp_path / "v.onnx")
     piper_dl._download_any(piper_dl._urls({"url": "https://up/x", "quick": ["https://m/x"]}),
-                           dest, 0, 100, False)
+                           dest, 0, 100, False, "0" * 64)
     assert tried == [("https://m/x", piper_dl.QUICK_TIMEOUT_S), ("https://up/x", piper_dl.DOWNLOAD_TIMEOUT_S)]
     assert Path(dest).read_bytes() == b"ok"
     assert not Path(dest + ".part").exists()
     assert piper_dl._urls({"url": "https://up/x"}) == [("https://up/x", piper_dl.DOWNLOAD_TIMEOUT_S)]
+
+
+class _Resp:
+    def __init__(self, body):
+        self._body = io.BytesIO(body)
+        self.headers = {"Content-Length": str(len(body))}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def read(self, n):
+        return self._body.read(n)
+
+
+def _serve(monkeypatch, bodies):
+    tried = []
+
+    def urlopen(url, timeout):
+        tried.append(url)
+        return _Resp(bodies[url])
+
+    monkeypatch.setattr(piper_dl.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(piper_dl, "_flush", lambda *a, **k: None)
+    return tried
+
+
+def test_piper_download_rejects_mismatch_and_tries_next_url(tmp_path, monkeypatch):
+    good = b"the real voice"
+    pin = hashlib.sha256(good).hexdigest()
+    tried = _serve(monkeypatch, {"https://m/v.onnx": b"something else", "https://up/v.onnx": good})
+    dest = str(tmp_path / "v.onnx")
+    piper_dl._download_any(piper_dl._urls({"url": "https://up/v.onnx", "quick": ["https://m/v.onnx"]}),
+                           dest, 0, 100, True, pin)
+    assert tried == ["https://m/v.onnx", "https://up/v.onnx"]
+    assert Path(dest).read_bytes() == good
+    assert not Path(dest + ".part").exists()
+
+
+def test_piper_download_fails_cleanly_when_no_url_matches(tmp_path, monkeypatch):
+    _serve(monkeypatch, {"https://m/v.onnx": b"x", "https://up/v.onnx": b"y"})
+    dest = str(tmp_path / "v.onnx")
+    try:
+        piper_dl._download_any(piper_dl._urls({"url": "https://up/v.onnx", "quick": ["https://m/v.onnx"]}),
+                               dest, 0, 100, False, "0" * 64)
+    except ValueError as exc:
+        assert "sha256 mismatch" in str(exc)
+    else:
+        raise AssertionError("a file matching no pin must not install")
+    assert not Path(dest).exists() and not Path(dest + ".part").exists()
+
+
+def test_piper_download_needs_a_pin(tmp_path, monkeypatch):
+    tried = _serve(monkeypatch, {"https://up/v.onnx": b"y"})
+    dest = str(tmp_path / "v.onnx")
+    try:
+        piper_dl._download_any([("https://up/v.onnx", 60)], dest, 0, 100, False, "")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a download without a pin must not install")
+    assert tried == [] and not Path(dest).exists()
+
+
+def test_piper_catalog_pins_every_file():
+    assert len(piper_catalog.BINARY_SHA256) == 64
+    for name in piper_catalog.CATALOG:
+        onnx, sidecar = piper_catalog.voice_sha256(name)
+        assert len(onnx) == 64 and len(sidecar) == 64, name
+    assert piper_catalog.voice_sha256("not-a-voice") is None
 
 
 def test_has_internet_accepts_any_probe(monkeypatch):

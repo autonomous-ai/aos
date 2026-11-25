@@ -3728,7 +3728,10 @@ with a 5s connect and read timeout, so a copy that is missing or slow costs
 seconds, then the pinned `url`, then any https `mirrors` in the pin file. Every
 source is checked against the same SHA-256. The speech-quality model
 (`HAL_SPEAKER_MODEL_MIRROR_BASE`, checked against its pinned SHA-256) and Piper
-downloads (`HAL_PIPER_MIRROR_BASE`) try their CDN copy first the same way.
+downloads (`HAL_PIPER_MIRROR_BASE`) try their CDN copy first the same way. The
+Piper engine archive and each catalogue voice file are checked against SHA-256
+hashes pinned in `tts/piper_catalog.py` before they are kept or extracted; a
+file that does not match is deleted and the next source is tried.
 
 The gate is **active** only once the model is loaded (`Language gate active`).
 Until then (download in flight, loading at boot), or when the model fails to load,
