@@ -24,6 +24,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -84,11 +85,15 @@ var (
 type State func() (region string, setUp bool)
 
 // Applier applies the settings for the current state, doing work only when
-// the China/not-China decision changed since the last call.
+// the China/not-China decision changed since the last successful call. A call
+// with a failed step is retried in full on the next one.
 type Applier struct {
 	state   State
 	applied *bool
 	mu      sync.Mutex
+	// retry is set after a failed apply: the next one also reruns the
+	// refresh commands, since files written last time no longer "change".
+	retry bool
 }
 
 // NewApplier returns an Applier reading state.
@@ -110,8 +115,12 @@ func (a *Applier) Apply(ctx context.Context) {
 	if a.applied != nil && *a.applied == china {
 		return
 	}
-	apply(ctx, china)
-	a.applied = &china
+	if err := apply(ctx, china, a.retry); err != nil {
+		slog.Warn("network fallback incomplete; retrying on the next check", "component", "netfallback", "china", china, "error", err)
+		a.applied, a.retry = nil, true
+		return
+	}
+	a.applied, a.retry = &china, false
 }
 
 // Run applies the state now and every regionCheckInterval until ctx ends.
@@ -128,15 +137,37 @@ func (a *Applier) Run(ctx context.Context) {
 	}
 }
 
-func apply(ctx context.Context, china bool) {
-	changed, err := ensureTimesyncd(ctx, china)
-	logStep("timesyncd", changed, err)
-	changed, err = ensureChrony(ctx, china)
-	logStep("chrony", changed, err)
-	changed, err = ensureResolvconf(ctx, china)
-	logStep("resolvconf", changed, err)
+// apply runs every step and returns the failures joined (nil when all
+// succeeded). refresh reruns each step's refresh command even when its file
+// did not change.
+func apply(ctx context.Context, china, refresh bool) error {
+	var errs []error
+	step := func(name string, changed bool, err error) {
+		logStep(name, changed, err)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", name, err))
+		}
+	}
+	changed, err := ensureTimesyncd(ctx, china, refresh)
+	step("timesyncd", changed, err)
+	changed, err = ensureChrony(ctx, china, refresh)
+	step("chrony", changed, err)
+	changed, err = ensureResolvconf(ctx, china, refresh)
+	step("resolvconf", changed, err)
 	changed, err = ensureStaModeScript(china)
-	logStep("device-sta-mode", changed, err)
+	step("device-sta-mode", changed, err)
+	return errors.Join(errs...)
+}
+
+// refreshCmd runs a refresh command; a missing command is not an error.
+func refreshCmd(ctx context.Context, name string, args ...string) error {
+	cctx, cancel := context.WithTimeout(ctx, commandTimeout)
+	defer cancel()
+	out, err := runCmd(cctx, name, args...)
+	if err == nil || errors.Is(err, exec.ErrNotFound) {
+		return nil
+	}
+	return fmt.Errorf("%s %s: %w (%s)", name, strings.Join(args, " "), err, strings.TrimSpace(string(out)))
 }
 
 func logStep(name string, changed bool, err error) {
@@ -151,23 +182,18 @@ func logStep(name string, changed bool, err error) {
 
 // ensureTimesyncd writes the drop-in in China and removes it elsewhere, then
 // restarts a running timesyncd after a change.
-func ensureTimesyncd(ctx context.Context, china bool) (bool, error) {
+func ensureTimesyncd(ctx context.Context, china, refresh bool) (bool, error) {
 	changed, err := putOrRemove(timesyncdDropInPath, timesyncdDropIn, china)
-	if err != nil || !changed {
+	if err != nil || !(changed || refresh) {
 		return changed, err
 	}
-	cctx, cancel := context.WithTimeout(ctx, commandTimeout)
-	defer cancel()
 	// try-restart leaves a stopped timesyncd (e.g. on chrony images) stopped.
-	if out, err := runCmd(cctx, "systemctl", "try-restart", "systemd-timesyncd"); err != nil {
-		slog.Warn("systemd-timesyncd restart failed", "component", "netfallback", "error", err, "output", strings.TrimSpace(string(out)))
-	}
-	return true, nil
+	return changed, refreshCmd(ctx, "systemctl", "try-restart", "systemd-timesyncd")
 }
 
 // ensureChrony writes the extra sources in China when chrony reads a sources
 // directory, and removes them elsewhere, then reloads chrony's sources.
-func ensureChrony(ctx context.Context, china bool) (bool, error) {
+func ensureChrony(ctx context.Context, china, refresh bool) (bool, error) {
 	if china {
 		conf, err := os.ReadFile(chronyConf)
 		if err != nil {
@@ -181,15 +207,10 @@ func ensureChrony(ctx context.Context, china bool) (bool, error) {
 		}
 	}
 	changed, err := putOrRemove(filepath.Join(chronySourcesDir, chronySourcesName), chronySources, china)
-	if err != nil || !changed {
+	if err != nil || !(changed || refresh) {
 		return changed, err
 	}
-	cctx, cancel := context.WithTimeout(ctx, commandTimeout)
-	defer cancel()
-	if out, err := runCmd(cctx, "chronyc", "reload", "sources"); err != nil && !errors.Is(err, exec.ErrNotFound) {
-		slog.Warn("chronyc reload sources failed", "component", "netfallback", "error", err, "output", strings.TrimSpace(string(out)))
-	}
-	return true, nil
+	return changed, refreshCmd(ctx, "chronyc", "reload", "sources")
 }
 
 // putOrRemove writes content to path when want is true (unless it already
@@ -212,7 +233,7 @@ func putOrRemove(path, content string, want bool) (bool, error) {
 // name_servers lines in China. Elsewhere it puts the image's line back, but
 // only where chinaResolvconfLine is the one in place. resolv.conf is
 // regenerated after a change.
-func ensureResolvconf(ctx context.Context, china bool) (bool, error) {
+func ensureResolvconf(ctx context.Context, china, refresh bool) (bool, error) {
 	data, err := os.ReadFile(resolvconfConf)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return false, err
@@ -221,23 +242,24 @@ func ensureResolvconf(ctx context.Context, china bool) (bool, error) {
 	line := chinaResolvconfLine
 	if !china {
 		if !hasLine(now, chinaResolvconfLine) {
+			if refresh && hasLine(now, defaultResolvconfLine) {
+				return false, refreshCmd(ctx, "resolvconf", "-u")
+			}
 			return false, nil
 		}
 		line = defaultResolvconfLine
 	}
 	fixed := resolvconfFixed(now, line)
 	if fixed == now {
+		if refresh {
+			return false, refreshCmd(ctx, "resolvconf", "-u")
+		}
 		return false, nil
 	}
 	if err := writeFileAtomic(resolvconfConf, []byte(fixed), 0o644); err != nil {
 		return false, err
 	}
-	cctx, cancel := context.WithTimeout(ctx, commandTimeout)
-	defer cancel()
-	if out, err := runCmd(cctx, "resolvconf", "-u"); err != nil && !errors.Is(err, exec.ErrNotFound) {
-		slog.Warn("resolvconf -u failed", "component", "netfallback", "error", err, "output", strings.TrimSpace(string(out)))
-	}
-	return true, nil
+	return true, refreshCmd(ctx, "resolvconf", "-u")
 }
 
 // resolvconfFixed returns now with line in place of the first name_servers*

@@ -2,6 +2,7 @@ package netfallback
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,12 +10,14 @@ import (
 )
 
 type fakeCmds struct {
+	fail  map[string]error
 	calls []string
 }
 
 func (f *fakeCmds) run(_ context.Context, name string, args ...string) ([]byte, error) {
-	f.calls = append(f.calls, strings.Join(append([]string{name}, args...), " "))
-	return nil, nil
+	key := strings.Join(append([]string{name}, args...), " ")
+	f.calls = append(f.calls, key)
+	return nil, f.fail[key]
 }
 
 func setup(t *testing.T) (string, *fakeCmds) {
@@ -48,10 +51,10 @@ func read(t *testing.T, path string) string {
 
 func TestTimesyncdDropInOnlyInChina(t *testing.T) {
 	_, f := setup(t)
-	if changed, err := ensureTimesyncd(context.Background(), false); changed || err != nil || len(f.calls) != 0 {
+	if changed, err := ensureTimesyncd(context.Background(), false, false); changed || err != nil || len(f.calls) != 0 {
 		t.Fatalf("non-CN, nothing there: changed=%v err=%v calls=%v", changed, err, f.calls)
 	}
-	if changed, err := ensureTimesyncd(context.Background(), true); !changed || err != nil {
+	if changed, err := ensureTimesyncd(context.Background(), true, false); !changed || err != nil {
 		t.Fatalf("CN: changed=%v err=%v", changed, err)
 	}
 	if got := read(t, timesyncdDropInPath); !strings.HasSuffix(got,
@@ -61,10 +64,10 @@ func TestTimesyncdDropInOnlyInChina(t *testing.T) {
 	if len(f.calls) != 1 || f.calls[0] != "systemctl try-restart systemd-timesyncd" {
 		t.Fatalf("calls = %v", f.calls)
 	}
-	if changed, _ := ensureTimesyncd(context.Background(), true); changed || len(f.calls) != 1 {
+	if changed, _ := ensureTimesyncd(context.Background(), true, false); changed || len(f.calls) != 1 {
 		t.Fatalf("CN again must not rewrite or restart: calls=%v", f.calls)
 	}
-	if changed, err := ensureTimesyncd(context.Background(), false); !changed || err != nil {
+	if changed, err := ensureTimesyncd(context.Background(), false, false); !changed || err != nil {
 		t.Fatalf("leaving CN: changed=%v err=%v", changed, err)
 	}
 	if _, err := os.Stat(timesyncdDropInPath); !os.IsNotExist(err) {
@@ -77,13 +80,13 @@ func TestTimesyncdDropInOnlyInChina(t *testing.T) {
 
 func TestChronySourcesOnlyInChina(t *testing.T) {
 	_, f := setup(t)
-	if changed, err := ensureChrony(context.Background(), true); changed || err != nil {
+	if changed, err := ensureChrony(context.Background(), true, false); changed || err != nil {
 		t.Fatalf("no chrony: changed=%v err=%v", changed, err)
 	}
 	if err := os.WriteFile(chronyConf, []byte("pool 2.debian.pool.ntp.org iburst\nsourcedir "+chronySourcesDir+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if changed, err := ensureChrony(context.Background(), true); !changed || err != nil {
+	if changed, err := ensureChrony(context.Background(), true, false); !changed || err != nil {
 		t.Fatalf("CN: changed=%v err=%v", changed, err)
 	}
 	got := read(t, filepath.Join(chronySourcesDir, chronySourcesName))
@@ -92,10 +95,10 @@ func TestChronySourcesOnlyInChina(t *testing.T) {
 			t.Fatalf("sources missing %q:\n%s", want, got)
 		}
 	}
-	if changed, _ := ensureChrony(context.Background(), true); changed {
+	if changed, _ := ensureChrony(context.Background(), true, false); changed {
 		t.Fatal("CN again must be a no-op")
 	}
-	if changed, err := ensureChrony(context.Background(), false); !changed || err != nil {
+	if changed, err := ensureChrony(context.Background(), false, false); !changed || err != nil {
 		t.Fatalf("leaving CN: changed=%v err=%v", changed, err)
 	}
 	if _, err := os.Stat(filepath.Join(chronySourcesDir, chronySourcesName)); !os.IsNotExist(err) {
@@ -112,19 +115,19 @@ func TestResolvconfAppendsInChinaAndRestoresImageLine(t *testing.T) {
 	if err := os.WriteFile(resolvconfConf, []byte(image), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if changed, err := ensureResolvconf(context.Background(), false); changed || err != nil || len(f.calls) != 0 {
+	if changed, err := ensureResolvconf(context.Background(), false, false); changed || err != nil || len(f.calls) != 0 {
 		t.Fatalf("non-CN on the image's line: changed=%v err=%v calls=%v", changed, err, f.calls)
 	}
-	if changed, err := ensureResolvconf(context.Background(), true); !changed || err != nil {
+	if changed, err := ensureResolvconf(context.Background(), true, false); !changed || err != nil {
 		t.Fatalf("CN: changed=%v err=%v", changed, err)
 	}
 	if got := read(t, resolvconfConf); got != "# comment\n"+chinaResolvconfLine+"\n" {
 		t.Fatalf("resolvconf.conf = %q", got)
 	}
-	if changed, _ := ensureResolvconf(context.Background(), true); changed {
+	if changed, _ := ensureResolvconf(context.Background(), true, false); changed {
 		t.Fatal("CN again must be a no-op")
 	}
-	if changed, err := ensureResolvconf(context.Background(), false); !changed || err != nil {
+	if changed, err := ensureResolvconf(context.Background(), false, false); !changed || err != nil {
 		t.Fatalf("leaving CN: changed=%v err=%v", changed, err)
 	}
 	if got := read(t, resolvconfConf); got != image {
@@ -141,7 +144,7 @@ func TestResolvconfOutsideChinaLeavesOtherLinesAlone(t *testing.T) {
 	if err := os.WriteFile(resolvconfConf, []byte(custom), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if changed, err := ensureResolvconf(context.Background(), false); changed || err != nil {
+	if changed, err := ensureResolvconf(context.Background(), false, false); changed || err != nil {
 		t.Fatalf("changed=%v err=%v", changed, err)
 	}
 	if got := read(t, resolvconfConf); got != custom {
@@ -236,5 +239,37 @@ func TestApplierFollowsRegionAfterSetup(t *testing.T) {
 	a.Apply(context.Background())
 	if got := read(t, resolvconfConf); got != chinaResolvconfLine+"\n" {
 		t.Fatalf("cn: resolvconf.conf = %q", got)
+	}
+}
+
+func TestApplierRetriesAfterAFailedStep(t *testing.T) {
+	_, f := setup(t)
+	if err := os.WriteFile(resolvconfConf, []byte(defaultResolvconfLine+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.fail = map[string]error{"resolvconf -u": errors.New("busy")}
+	a := NewApplier(func() (string, bool) { return "CN", true })
+
+	a.Apply(context.Background())
+	if a.applied != nil || !a.retry {
+		t.Fatalf("a failed step must not mark the state applied: applied=%v retry=%v", a.applied, a.retry)
+	}
+
+	// The file was already written; the retry still reruns every refresh.
+	f.fail, f.calls = nil, nil
+	a.Apply(context.Background())
+	if a.applied == nil || !*a.applied || a.retry {
+		t.Fatalf("retry did not complete: applied=%v retry=%v", a.applied, a.retry)
+	}
+	want := "systemctl try-restart systemd-timesyncd;resolvconf -u"
+	if got := strings.Join(f.calls, ";"); got != want {
+		t.Fatalf("retry calls = %q, want %q", got, want)
+	}
+
+	// Once applied, nothing runs again.
+	f.calls = nil
+	a.Apply(context.Background())
+	if len(f.calls) != 0 {
+		t.Fatalf("applied state reran commands: %v", f.calls)
 	}
 }
