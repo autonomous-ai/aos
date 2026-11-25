@@ -5,9 +5,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
-	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
@@ -143,38 +141,13 @@ func (b *Bootstrap) refreshUpdater(ctx context.Context) bool {
 	return true
 }
 
-// fetchUpdater downloads the published script, size-capped against captive portals.
+// fetchUpdater downloads the published script (CDN copy first, then the bucket),
+// size-capped against captive portals.
 func (b *Bootstrap) fetchUpdater(ctx context.Context, src string) ([]byte, error) {
-	const maxUpdaterBytes = 1 << 20 // 1 MiB; the real script is ~40 KB
+	const maxUpdaterBytes = 1 << 20 // 1 MiB; the real script is ~100 KB
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, src, nil)
-	if err != nil {
-		return nil, fmt.Errorf("build request: %w", err)
-	}
 	// The updater is republished in place; a cached copy would hide the fix.
-	req.Header.Set("Cache-Control", "no-cache")
-
-	resp, err := b.client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("fetch %s: %w", src, err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("fetch %s: status %s", src, resp.Status)
-	}
-
-	data, err := io.ReadAll(io.LimitReader(resp.Body, maxUpdaterBytes+1))
-	if err != nil {
-		return nil, fmt.Errorf("read %s: %w", src, err)
-	}
-	if len(data) > maxUpdaterBytes {
-		return nil, fmt.Errorf("fetch %s: larger than %d bytes", src, maxUpdaterBytes)
-	}
-	if len(data) == 0 {
-		return nil, fmt.Errorf("fetch %s: empty body", src)
-	}
-	return data, nil
+	return b.fetchFirst(ctx, otaMirror.Candidates(src), maxUpdaterBytes, true)
 }
 
 // installUpdater validates the script and installs it atomically.

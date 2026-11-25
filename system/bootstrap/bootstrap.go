@@ -26,6 +26,7 @@ import (
 	"go.autonomous.ai/os/system/domain"
 	"go.autonomous.ai/os/system/lib/core/system"
 	"go.autonomous.ai/os/system/lib/hal"
+	"go.autonomous.ai/os/system/lib/otamirror"
 )
 
 // semverRe captures the first semver-like token (e.g. 2026.3.8 or v1.2.3-beta).
@@ -103,6 +104,13 @@ type Bootstrap struct {
 	serviceStateDir    string
 }
 
+// otaHTTPTimeout bounds one metadata or updater fetch; slow links need more
+// than a fast one, and a failed host still leaves time for the fallback.
+const otaHTTPTimeout = 60 * time.Second
+
+// otaMirror maps bucket URLs to the CDN; a var so tests can point it at local servers.
+var otaMirror = otamirror.Default
+
 // configRetryInterval is how often Serve reloads bootstrap.json while unprovisioned.
 const configRetryInterval = 30 * time.Second
 
@@ -123,7 +131,7 @@ func ProvideServer() (*Bootstrap, error) {
 	}
 	return &Bootstrap{
 		cfg:    cfg,
-		client: &http.Client{Timeout: 20 * time.Second},
+		client: &http.Client{Timeout: otaHTTPTimeout},
 		state:  st,
 	}, nil
 }
@@ -566,21 +574,9 @@ func (b *Bootstrap) fetchMetadataPayload(ctx context.Context) (payload []byte, v
 	// Record every outcome, including transport failures, in the security status.
 	defer func() { b.security.record(verified, err) }()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, b.cfg.MetadataURL, nil)
+	data, err := b.fetchFirst(ctx, b.metadataCandidates(), 2<<20, false)
 	if err != nil {
-		return nil, false, fmt.Errorf("build metadata request: %w", err)
-	}
-	resp, err := b.client.Do(req)
-	if err != nil {
-		return nil, false, fmt.Errorf("fetch metadata %s: %w", b.cfg.MetadataURL, err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, false, fmt.Errorf("fetch metadata %s: status %s", b.cfg.MetadataURL, resp.Status)
-	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
-	if err != nil {
-		return nil, false, fmt.Errorf("read metadata: %w", err)
+		return nil, false, fmt.Errorf("fetch metadata: %w", err)
 	}
 	if strings.TrimSpace(b.cfg.SigningPublicKey) == "" {
 		slog.Warn("OTA signature verification disabled: signing_public_key is not provisioned", "component", "bootstrap")
@@ -591,6 +587,68 @@ func (b *Bootstrap) fetchMetadataPayload(ctx context.Context) (payload []byte, v
 		return nil, false, fmt.Errorf("verify metadata %s: %w", b.cfg.MetadataURL, err)
 	}
 	return payload, true, nil
+}
+
+// metadataCandidates lists the metadata URLs to try: an explicit OTA_METADATA_URL
+// is used as given; otherwise the CDN copy first, then the bucket URL.
+func (b *Bootstrap) metadataCandidates() []string {
+	if b.cfg.MetadataFromEnv() {
+		return []string{strings.TrimSpace(b.cfg.MetadataURL)}
+	}
+	return otaMirror.Candidates(b.cfg.MetadataURL)
+}
+
+// fetchFirst GETs each URL in order and returns the first 200 body (at most
+// limit bytes; empty or larger bodies fail that candidate). Errors from every candidate
+// are joined so the log shows why each host failed.
+func (b *Bootstrap) fetchFirst(ctx context.Context, urls []string, limit int64, noCache bool) ([]byte, error) {
+	if len(urls) == 0 {
+		return nil, errors.New("no url configured")
+	}
+	var errs []error
+	for i, u := range urls {
+		data, err := b.fetchOne(ctx, u, limit, noCache)
+		if err == nil {
+			if i > 0 {
+				slog.Info("OTA download used the fallback host", "component", "bootstrap", "url", u)
+			}
+			return data, nil
+		}
+		errs = append(errs, err)
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	return nil, errors.Join(errs...)
+}
+
+func (b *Bootstrap) fetchOne(ctx context.Context, src string, limit int64, noCache bool) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, src, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build request %s: %w", src, err)
+	}
+	if noCache {
+		req.Header.Set("Cache-Control", "no-cache")
+	}
+	resp, err := b.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fetch %s: %w", src, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("fetch %s: status %s", src, resp.Status)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", src, err)
+	}
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("fetch %s: larger than %d bytes", src, limit)
+	}
+	if len(data) == 0 {
+		return nil, fmt.Errorf("fetch %s: empty body", src)
+	}
+	return data, nil
 }
 
 func decodeOTAMetadataPayload(payload []byte, requireChecksums bool) (domain.OTAMetadata, error) {

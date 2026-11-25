@@ -16,13 +16,15 @@ import (
 	"sync"
 
 	"go.autonomous.ai/os/system/lib/mqtt"
+	"go.autonomous.ai/os/system/lib/otamirror"
 	"go.autonomous.ai/os/system/lib/syspath"
 	"go.autonomous.ai/os/system/lib/urlnorm"
 )
 
 // otaMetadataURLFromBootstrap returns metadata_url from the OTA worker's
 // config file, or "" when it is missing or invalid (e.g. device not yet
-// provisioned).
+// provisioned). A URL in the OTA storage is mapped to the CDN that serves the
+// same files, so skill and hook bases follow the CDN as bootstrap does.
 func otaMetadataURLFromBootstrap() string {
 	data, err := os.ReadFile(syspath.BootstrapConfig())
 	if err != nil {
@@ -34,7 +36,7 @@ func otaMetadataURLFromBootstrap() string {
 	if err := json.Unmarshal(data, &bc); err != nil {
 		return ""
 	}
-	return strings.TrimSpace(bc.MetadataURL)
+	return otamirror.ToCDN(strings.TrimSpace(bc.MetadataURL))
 }
 
 var configPath = "config/config.json"
