@@ -15,6 +15,8 @@ CODEX_BIN="/usr/local/bin/codex"
 # Pinned release; bump here and re-OTA os-server to upgrade.
 CODEX_VERSION="${CODEX_VERSION:-rust-v0.142.5}"
 CODEX_REPO="${CODEX_REPO:-openai/codex}"
+# Third-party downloads try the CDN mirror first, then the vendor.
+OS_MIRROR_BASE="${OS_MIRROR_BASE:-https://cdn.autonomous.ai/os/mirror}"
 
 echo "[install-codex] prerequisites (jq, curl)"
 apt-get update || true
@@ -34,7 +36,8 @@ else
   CODEX_URL="https://github.com/${CODEX_REPO}/releases/download/${CODEX_VERSION}/${CODEX_ASSET}"
   CODEX_TMP="$(mktemp -d)"
   echo "[install-codex] downloading ${CODEX_URL}"
-  curl -fsSL "$CODEX_URL" -o "$CODEX_TMP/$CODEX_ASSET"
+  curl -fsSL "${OS_MIRROR_BASE}/codex/${WANT_VERSION}/${CODEX_ASSET}" -o "$CODEX_TMP/$CODEX_ASSET" \
+    || curl -fsSL "$CODEX_URL" -o "$CODEX_TMP/$CODEX_ASSET"
   tar -xzf "$CODEX_TMP/$CODEX_ASSET" -C "$CODEX_TMP"
   install -m 0755 "$CODEX_TMP/${CODEX_ASSET%.tar.gz}" "$CODEX_BIN"
   rm -rf "$CODEX_TMP"

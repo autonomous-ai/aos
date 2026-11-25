@@ -86,7 +86,9 @@ class OpenClawUpdateTests(unittest.TestCase):
                    component="openclaw"):
         functions = "\n".join(
             shell_function(name)
-            for name in ("progress_report", "ensure_node_engine", "ensure_openclaw_node",
+            for name in ("progress_report", "device_region", "region_is_cn", "fetch_first",
+                         "install_node_from_vendor", "install_node_from_mirror",
+                         "ensure_node_engine", "openclaw_npm_registry", "ensure_openclaw_node",
                          "update_openclaw", "update_hermes_package")
         )
         command = ('update_openclaw "2026.9.3"' if component == "openclaw"
@@ -100,6 +102,7 @@ class OpenClawUpdateTests(unittest.TestCase):
                 env={
                     **os.environ,
                     "EVENTS": str(events),
+                    "OS_CONFIG_JSON": str(directory / "no-config.json"),
                     "UPGRADED": str(directory / "upgraded"),
                     "TMPDIR": temporary,
                     "SCENARIO": scenario,

@@ -17,6 +17,9 @@ PICO_CONFIG="$PICO_DIR/config.json"
 PICO_VERSION="${PICO_VERSION:-v0.3.1-fixvision}"
 PICO_REPO="${PICO_REPO:-autonomous-ai/picoclaw}"
 
+# Third-party downloads try the CDN mirror first, then the vendor.
+OS_MIRROR_BASE="${OS_MIRROR_BASE:-https://cdn.autonomous.ai/os/mirror}"
+
 echo "[install-picoclaw] prerequisites (jq, yq, curl)"
 apt-get update || true
 apt-get install -y jq curl || true
@@ -28,7 +31,9 @@ if ! command -v yq >/dev/null 2>&1; then
     armv7l|armv6l) YQ_BIN="yq_linux_arm" ;;
     *) echo "[install-picoclaw] ERROR: unsupported arch $(uname -m) for yq"; exit 1 ;;
   esac
-  curl -fsSL "https://github.com/mikefarah/yq/releases/download/v4.46.1/${YQ_BIN}" -o /usr/local/bin/yq
+  # CDN mirror first (same release file), then the vendor.
+  curl -fsSL "${OS_MIRROR_BASE}/yq/v4.46.1/${YQ_BIN}" -o /usr/local/bin/yq \
+    || curl -fsSL "https://github.com/mikefarah/yq/releases/download/v4.46.1/${YQ_BIN}" -o /usr/local/bin/yq
   chmod +x /usr/local/bin/yq
 fi
 
@@ -41,7 +46,8 @@ esac
 PICO_URL="https://github.com/${PICO_REPO}/releases/download/${PICO_VERSION}/${PICO_ASSET}"
 PICO_TMP="$(mktemp)"
 echo "[install-picoclaw] downloading ${PICO_URL}"
-curl -fsSL "$PICO_URL" -o "$PICO_TMP"
+curl -fsSL "${OS_MIRROR_BASE}/picoclaw/${PICO_VERSION}/${PICO_ASSET}" -o "$PICO_TMP" \
+  || curl -fsSL "$PICO_URL" -o "$PICO_TMP"
 install -m 0755 "$PICO_TMP" "$PICO_BIN"
 rm -f "$PICO_TMP"
 if [ ! -x "$PICO_BIN" ]; then

@@ -15,6 +15,8 @@ OPENCODE_BIN="/usr/local/bin/opencode"
 # Latest published tag as of this build; see https://github.com/anomalyco/opencode/releases for
 # newer.
 OPENCODE_VERSION="${OPENCODE_VERSION:-1.18.4}"
+# The CDN mirror holds the vendor's release archive; the official installer is the fallback.
+OS_MIRROR_BASE="${OS_MIRROR_BASE:-https://cdn.autonomous.ai/os/mirror}"
 
 echo "[install-opencode] prerequisites (jq, curl, tar)"
 apt-get update || true
@@ -27,8 +29,23 @@ if [ -x "$OPENCODE_BIN" ] && "$OPENCODE_BIN" --version 2>/dev/null | grep -qw "$
   echo "[install-opencode] opencode ${WANT_VERSION} already installed at $OPENCODE_BIN — skipping download"
 else
   echo "[install-opencode] install opencode CLI ${WANT_VERSION} → /usr/local/bin"
-  curl -fsSL https://opencode.ai/install \
-    | OPENCODE_INSTALL_DIR=/usr/local/bin bash -s -- --version "$WANT_VERSION"
+  case "$(uname -m)" in
+    aarch64|arm64) OC_ASSET="opencode-linux-arm64.tar.gz" ;;
+    x86_64)        OC_ASSET="opencode-linux-x64.tar.gz" ;;
+    *)             OC_ASSET="" ;;
+  esac
+  OC_TMP="$(mktemp -d)"
+  if [ -n "$OC_ASSET" ] \
+      && curl -fsSL "${OS_MIRROR_BASE}/opencode/${WANT_VERSION}/${OC_ASSET}" -o "$OC_TMP/$OC_ASSET" \
+      && tar -xzf "$OC_TMP/$OC_ASSET" -C "$OC_TMP" && [ -f "$OC_TMP/opencode" ] \
+      && chmod 0755 "$OC_TMP/opencode" && "$OC_TMP/opencode" --version 2>/dev/null | grep -qw "$WANT_VERSION"; then
+    install -m 0755 "$OC_TMP/opencode" "$OPENCODE_BIN"
+    echo "[install-opencode] installed opencode ${WANT_VERSION} from the CDN mirror"
+  else
+    curl -fsSL https://opencode.ai/install \
+      | OPENCODE_INSTALL_DIR=/usr/local/bin bash -s -- --version "$WANT_VERSION"
+  fi
+  rm -rf "$OC_TMP"
 fi
 # Belt-and-suspenders: if the installer ignored OPENCODE_INSTALL_DIR (its behavior has drifted
 # before), locate the binary it produced and copy it into /usr/local/bin so the systemd unit +

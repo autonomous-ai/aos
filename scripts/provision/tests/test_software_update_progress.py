@@ -23,7 +23,8 @@ class ProgressTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.snapshot = self.root / "progress" / "hal.json"
         self.source = "\n".join(function(n) for n in (
-            "progress_report", "progress_download_sample", "download_verified", "on_exit"))
+            "progress_report", "progress_download_sample", "ota_url_candidates", "download_from",
+            "download_verified", "on_exit"))
         self.env = {**os.environ, "PROGRESS_DIR": str(self.root / "progress"),
                     "PROGRESS_RUN_ID": "test-run", "APP": "hal", "PROGRESS_BOOT_ID": "test-boot",
                     "ROLLBACK_DIR": str(self.root / "rollback"), "DEST": str(self.root / "artifact")}

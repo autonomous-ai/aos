@@ -16,6 +16,9 @@ ENV_FILE="$HERMES_DIR/.env"
 # Must equal runtimes/hermes/constants.go APIKey (401 on every turn otherwise).
 HERMES_API_SERVER_KEY="hermes-local-api-key"
 
+# Third-party downloads try the CDN mirror first, then the vendor.
+OS_MIRROR_BASE="${OS_MIRROR_BASE:-https://cdn.autonomous.ai/os/mirror}"
+
 echo "[install-hermes] prerequisites (jq, yq, curl)"
 apt-get update || true
 apt-get install -y jq curl || true
@@ -26,7 +29,9 @@ if ! command -v yq >/dev/null 2>&1; then
     armv7l|armv6l) YQ_BIN="yq_linux_arm" ;;
     *) echo "[install-hermes] ERROR: unsupported arch $(uname -m) for yq"; exit 1 ;;
   esac
-  curl -fsSL "https://github.com/mikefarah/yq/releases/download/v4.46.1/${YQ_BIN}" -o /usr/local/bin/yq
+  # CDN mirror first (same release file), then the vendor.
+  curl -fsSL "${OS_MIRROR_BASE}/yq/v4.46.1/${YQ_BIN}" -o /usr/local/bin/yq \
+    || curl -fsSL "https://github.com/mikefarah/yq/releases/download/v4.46.1/${YQ_BIN}" -o /usr/local/bin/yq
   chmod +x /usr/local/bin/yq
 fi
 

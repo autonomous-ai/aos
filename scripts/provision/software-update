@@ -16,6 +16,70 @@ HAL_UV_HOME="${HAL_UV_HOME:-/usr/local/lib/autonomous/uv}"
 # HAL reads ROBOT.md from 0.1.2; older HAL only opens DEVICE.md and will not start without it.
 DEVICE_HAL_MIN="${DEVICE_HAL_MIN:-0.1.2}"
 
+# Download sources. The CDN serves the OTA storage byte for byte and is reachable
+# where the storage host is not, so OTA files are fetched from the CDN first and
+# from the storage URL if that fails. Third-party tools (uv, Node, agent CLIs)
+# are tried from the CDN mirror first, then from their vendor.
+OTA_STORAGE_PREFIX="${OTA_STORAGE_PREFIX:-https://storage.googleapis.com/s3-autonomous-upgrade-3}"
+OTA_CDN_BASE="${OTA_CDN_BASE:-https://cdn.autonomous.ai}"
+OS_MIRROR_BASE="${OS_MIRROR_BASE:-$OTA_CDN_BASE/os/mirror}"
+# npm registry used for openclaw in region CN, or after the default registry fails.
+OTA_NPM_MIRROR="${OTA_NPM_MIRROR:-https://registry.npmmirror.com}"
+# Node package mirrored from the vendor's apt repository (same .deb, same layout).
+NODE_MIRROR_DEB="${NODE_MIRROR_DEB:-nodejs_24.22.3-1nodesource1_arm64.deb}"
+# Each download attempt is bounded; an interrupted transfer resumes while it makes progress.
+OTA_DOWNLOAD_MAX_TIME="${OTA_DOWNLOAD_MAX_TIME:-600}"
+OTA_DOWNLOAD_ATTEMPTS="${OTA_DOWNLOAD_ATTEMPTS:-30}"
+
+# ota_url_candidates <url>: print the URLs to try, one per line: the CDN copy
+# first, then the storage URL. Other URLs print unchanged.
+ota_url_candidates() {
+  local url="$1" rest storage="${OTA_STORAGE_PREFIX:-}" cdn="${OTA_CDN_BASE:-}"
+  case "$url" in
+    "") return 0 ;;
+  esac
+  if [ -n "$storage" ] && [ -n "$cdn" ]; then
+    case "$url" in
+      "$storage"/*)
+        rest="${url#"$storage"}"
+        printf '%s\n%s\n' "$cdn$rest" "$url"
+        return 0 ;;
+      "$cdn"/*)
+        rest="${url#"$cdn"}"
+        printf '%s\n%s\n' "$url" "$storage$rest"
+        return 0 ;;
+    esac
+  fi
+  printf '%s\n' "$url"
+}
+
+# device_region: OTA_REGION, else the region os-server stored from the cloud.
+device_region() {
+  if [ -n "${OTA_REGION:-}" ]; then
+    printf '%s\n' "$OTA_REGION"
+    return 0
+  fi
+  jq -r '.region // empty' "${OS_CONFIG_JSON:-/root/config/config.json}" 2>/dev/null || true
+}
+
+region_is_cn() {
+  [ "$(device_region | tr '[:lower:]' '[:upper:]' | tr -d '[:space:]')" = CN ]
+}
+
+# fetch_first <dest> <url>...: download the first URL that answers, no progress.
+fetch_first() {
+  local destination="$1" url
+  shift
+  for url in "$@"; do
+    [ -n "$url" ] || continue
+    if curl -fsSL --connect-timeout 30 --max-time "${OTA_DOWNLOAD_MAX_TIME:-600}" -o "$destination" "$url"; then
+      return 0
+    fi
+    echo "[software-update] download failed: $url" >&2
+  done
+  return 1
+}
+
 # The helper stays embedded so updater refresh remains a single-file operation.
 service_transaction() {
   python3 - "$@" <<'SERVICE_OTA_PY'
@@ -787,16 +851,18 @@ progress_report() {
   return 0
 }
 
-# Use only the final successful response, never a redirect's Content-Length.
+# Use only the final successful response, never a redirect's Content-Length;
+# a resumed (206) response reports the full size from Content-Range.
 # Chunked responses have no reliable denominator, even with a Content-Length header.
 progress_download_sample() {
   local destination="$1" headers="$2" downloaded total
   downloaded=$(wc -c < "$destination" 2>/dev/null | tr -d '[:space:]')
   total=$(awk '
-    /^HTTP\// { length_value=0; chunked=0; status=$2 }
+    /^HTTP\// { length_value=0; range_total=0; chunked=0; status=$2 }
     tolower($1)=="content-length:" { gsub("\r", "", $2); if ($2 ~ /^[0-9]+$/) length_value=$2 }
+    tolower($1)=="content-range:" { value=$0; gsub("\r", "", value); sub(/.*\//, "", value); if (value ~ /^[0-9]+$/) range_total=value }
     tolower($1)=="transfer-encoding:" { if (tolower($0) ~ /chunked/) chunked=1 }
-    END { if (status==200 && !chunked) print length_value+0; else print 0 }
+    END { if (status==200 && !chunked) print length_value+0; else if (status==206 && !chunked) print range_total+0; else print 0 }
   ' "$headers" 2>/dev/null)
   downloaded=${downloaded:-0}; total=${total:-0}
   # Never display a misleading percentage for inconsistent server headers.
@@ -847,6 +913,81 @@ run_uv_with_activity() {
   return "$result"
 }
 
+# hal_wheelhouse_mode: first (region CN), fallback (elsewhere) or off; HAL_WHEELHOUSE overrides.
+hal_wheelhouse_mode() {
+  case "${HAL_WHEELHOUSE:-}" in
+    first|fallback|off) printf '%s\n' "$HAL_WHEELHOUSE"; return 0 ;;
+  esac
+  if region_is_cn; then printf '%s\n' first; else printf '%s\n' fallback; fi
+}
+
+# hal_wheelhouse_install: install HAL's locked dependencies without PyPI or
+# GitHub, from the prebuilt wheelhouse the metadata lists for this platform
+# (hal.wheelhouse["linux-<arch>-<extra>"] = {url, sha256, lock_sha256}). Runs in
+# the staged HAL directory. The wheelhouse is used only when it was built from
+# this HAL's uv.lock; a downloaded copy is kept per digest so a later HAL release
+# with the same lock does not download it again, and a partial download resumes.
+hal_wheelhouse_install() {
+  local key url digest lock_sha cache dir archive
+  key="linux-$(uname -m)-$HAL_EXTRA"
+  url=$(jq -r --arg k "$key" '.hal.wheelhouse[$k].url // empty' "$METADATA_PAYLOAD" 2>/dev/null || true)
+  digest=$(jq -r --arg k "$key" '.hal.wheelhouse[$k].sha256 // empty' "$METADATA_PAYLOAD" 2>/dev/null || true)
+  lock_sha=$(jq -r --arg k "$key" '.hal.wheelhouse[$k].lock_sha256 // empty' "$METADATA_PAYLOAD" 2>/dev/null || true)
+  if [ -z "$url" ] || ! [[ "$digest" =~ ^[a-f0-9]{64}$ ]]; then
+    echo "[software-update] no HAL wheelhouse for $key in the metadata" >&2
+    return 1
+  fi
+  if [ ! -f uv.lock ] || [ "$(sha256sum uv.lock | cut -d' ' -f1)" != "$lock_sha" ]; then
+    echo "[software-update] HAL wheelhouse $key was built for another uv.lock; skipping it" >&2
+    return 1
+  fi
+  cache="${HAL_WHEELHOUSE_DIR:-$(dirname "$HAL_DIR")/.hal-wheelhouse}"
+  dir="$cache/$digest"
+  mkdir -p "$cache" || return 1
+  if [ ! -f "$dir/.complete" ]; then
+    archive="$cache/$digest.tar.gz"
+    progress_report installing 0 0 "Downloading HAL dependencies"
+    DOWNLOAD_KEEP_PARTIAL=keep download_verified "$url" "$archive" "$digest" || return 1
+    rm -rf "$dir" "$dir.new"
+    mkdir -p "$dir.new" || return 1
+    if ! tar -xzf "$archive" -C "$dir.new"; then
+      rm -rf "$dir.new"
+      return 1
+    fi
+    touch "$dir.new/.complete" && mv "$dir.new" "$dir" || return 1
+    # Keep only the current wheelhouse.
+    find "$cache" -mindepth 1 -maxdepth 1 ! -name "$digest" -exec rm -rf {} + 2>/dev/null || true
+  fi
+  [ -f "$dir/requirements.txt" ] && [ -d "$dir/wheels" ] || { echo "[software-update] HAL wheelhouse $key is incomplete" >&2; return 1; }
+  echo "[software-update] installing HAL dependencies from the wheelhouse ($key)"
+  rm -rf .venv
+  UV_PYTHON_DOWNLOADS=never run_uv_with_activity "$UV_BIN" venv --python 3.12 .venv || return 1
+  run_uv_with_activity "$UV_BIN" pip install --python .venv/bin/python --offline --no-index \
+    --find-links "$dir/wheels" -r "$dir/requirements.txt" || return 1
+  # The project itself, editable, as `uv sync` installs it.
+  run_uv_with_activity "$UV_BIN" pip install --python .venv/bin/python --offline --no-index \
+    --find-links "$dir/wheels" --no-deps -e . || return 1
+}
+
+# hal_install_dependencies: today's online `uv sync`, with the wheelhouse tried
+# first in region CN and as a fallback elsewhere. Runs in the staged HAL dir.
+hal_install_dependencies() {
+  local mode rc
+  mode=$(hal_wheelhouse_mode)
+  if [ "$mode" = first ]; then
+    hal_wheelhouse_install && return 0
+    echo "[software-update] HAL wheelhouse install failed; trying the package index" >&2
+    rm -rf .venv
+  fi
+  hal_uv_sync && return 0
+  rc=$?
+  if [ "$mode" = fallback ]; then
+    echo "[software-update] uv sync failed (exit $rc); trying the HAL wheelhouse" >&2
+    hal_wheelhouse_install && return 0
+  fi
+  return "$rc"
+}
+
 find_hal_uv() {
   local candidate
   candidate="$(command -v uv || true)"
@@ -872,6 +1013,34 @@ uv_at_least_min() {
   [ "$(printf '%s\n%s\n' "$HAL_UV_MIN" "$version" | sort -V | head -n 1)" = "$HAL_UV_MIN" ]
 }
 
+# install_uv_from_mirror: the pinned uv release archive from the CDN mirror,
+# checked against the vendor's published .sha256, unpacked into HAL_UV_HOME.
+install_uv_from_mirror() {
+  local triple asset dir status=1
+  case "$(uname -m)" in
+    aarch64|arm64) triple=aarch64-unknown-linux-gnu ;;
+    x86_64) triple=x86_64-unknown-linux-gnu ;;
+    *) return 1 ;;
+  esac
+  asset="uv-$triple.tar.gz"
+  dir=$(mktemp -d) || return 1
+  if fetch_first "$dir/$asset" "$OS_MIRROR_BASE/uv/$HAL_UV_PIN/$asset" \
+      && fetch_first "$dir/$asset.sha256" "$OS_MIRROR_BASE/uv/$HAL_UV_PIN/$asset.sha256" \
+      && (cd "$dir" && sha256sum -c "$asset.sha256" >/dev/null) \
+      && tar -xzf "$dir/$asset" -C "$dir" \
+      && [ -f "$dir/uv-$triple/uv" ] \
+      && mkdir -p "$HAL_UV_HOME" \
+      && install -m 0755 "$dir/uv-$triple/uv" "$HAL_UV_HOME/uv"; then
+    [ ! -f "$dir/uv-$triple/uvx" ] || install -m 0755 "$dir/uv-$triple/uvx" "$HAL_UV_HOME/uvx" || true
+    echo "[software-update] installed uv $HAL_UV_PIN from the CDN mirror" >&2
+    status=0
+  else
+    echo "[software-update] uv $HAL_UV_PIN not available from the CDN mirror; using the vendor installer" >&2
+  fi
+  rm -rf "$dir"
+  return "$status"
+}
+
 # Print a uv new enough for HAL. When the device's own uv is missing or too old,
 # install the pinned uv into HAL_UV_HOME without touching the device's own uv.
 ensure_hal_uv() {
@@ -887,14 +1056,16 @@ ensure_hal_uv() {
     echo "[software-update] uv ${version:-unknown} at $candidate is older than $HAL_UV_MIN" >&2
   done
   echo "[software-update] uv is missing or older than $HAL_UV_MIN; installing uv $HAL_UV_PIN into $HAL_UV_HOME" >&2
-  installer=$(mktemp) || return 1
-  if ! curl -fsSL "https://astral.sh/uv/$HAL_UV_PIN/install.sh" -o "$installer" \
-      || ! UV_UNMANAGED_INSTALL="$HAL_UV_HOME" sh "$installer" >&2; then
+  if ! install_uv_from_mirror; then
+    installer=$(mktemp) || return 1
+    if ! curl -fsSL "https://astral.sh/uv/$HAL_UV_PIN/install.sh" -o "$installer" \
+        || ! UV_UNMANAGED_INSTALL="$HAL_UV_HOME" sh "$installer" >&2; then
+      rm -f "$installer"
+      echo "uv $HAL_UV_PIN install failed" >&2
+      return 1
+    fi
     rm -f "$installer"
-    echo "uv $HAL_UV_PIN install failed" >&2
-    return 1
   fi
-  rm -f "$installer"
   if [ -x "$HAL_UV_HOME/uv" ] && uv_at_least_min "$HAL_UV_HOME/uv"; then
     printf '%s\n' "$HAL_UV_HOME/uv"
     return 0
@@ -933,16 +1104,8 @@ try {
 NODE
 }
 
-ensure_node_engine() {
-  local engine="$1" component="$2" status setup_script
-  if node_satisfies_engine "$engine"; then
-    return 0
-  else
-    status=$?
-    # A broken checker must not trigger a system package upgrade.
-    [ "$status" -eq 1 ] || return "$status"
-  fi
-  echo "[software-update] $component requires Node $engine; upgrading system Node to 24.x"
+install_node_from_vendor() {
+  local setup_script
   setup_script=$(mktemp) || return 1
   if ! curl -fsSL https://deb.nodesource.com/setup_24.x -o "$setup_script"; then
     rm -f "$setup_script"
@@ -954,6 +1117,39 @@ ensure_node_engine() {
   fi
   rm -f "$setup_script"
   apt-get install -y nodejs || return 1
+}
+
+# install_node_from_mirror: the vendor's nodejs .deb, mirrored on the CDN with a .sha256.
+install_node_from_mirror() {
+  local dir status=1
+  [ "$(dpkg --print-architecture 2>/dev/null)" = arm64 ] || return 1
+  dir=$(mktemp -d) || return 1
+  if fetch_first "$dir/$NODE_MIRROR_DEB" "$OS_MIRROR_BASE/node/$NODE_MIRROR_DEB" \
+      && fetch_first "$dir/$NODE_MIRROR_DEB.sha256" "$OS_MIRROR_BASE/node/$NODE_MIRROR_DEB.sha256" \
+      && (cd "$dir" && sha256sum -c "$NODE_MIRROR_DEB.sha256" >/dev/null) \
+      && apt-get install -y "$dir/$NODE_MIRROR_DEB"; then
+    status=0
+  fi
+  rm -rf "$dir"
+  return "$status"
+}
+
+ensure_node_engine() {
+  local engine="$1" component="$2" status
+  if node_satisfies_engine "$engine"; then
+    return 0
+  else
+    status=$?
+    # A broken checker must not trigger a system package upgrade.
+    [ "$status" -eq 1 ] || return "$status"
+  fi
+  echo "[software-update] $component requires Node $engine; upgrading system Node to 24.x"
+  # Region CN tries the CDN copy of the Node package first; elsewhere it is the fallback.
+  if region_is_cn; then
+    install_node_from_mirror || install_node_from_vendor || return 1
+  else
+    install_node_from_vendor || install_node_from_mirror || return 1
+  fi
   hash -r
   node_satisfies_engine "$engine" || {
     echo "[software-update] Node still does not satisfy $engine; refusing $component update (check Node version and PATH)" >&2
@@ -961,9 +1157,24 @@ ensure_node_engine() {
   }
 }
 
+# openclaw_npm_registry: in region CN use the npm mirror for this run (an explicit
+# NPM_CONFIG_REGISTRY wins). Exported, so npm install and plugin installs follow.
+openclaw_npm_registry() {
+  if [ -z "${NPM_CONFIG_REGISTRY:-}" ] && [ -n "${OTA_NPM_MIRROR:-}" ] && region_is_cn; then
+    echo "[software-update] region CN: using npm registry $OTA_NPM_MIRROR"
+    export NPM_CONFIG_REGISTRY="$OTA_NPM_MIRROR"
+  fi
+}
+
 ensure_openclaw_node() {
   local version="$1" engine_json engine
-  engine_json=$(npm view "openclaw@$version" engines.node --json) || return 1
+  openclaw_npm_registry
+  if ! engine_json=$(npm view "openclaw@$version" engines.node --json); then
+    [ -z "${NPM_CONFIG_REGISTRY:-}" ] && [ -n "${OTA_NPM_MIRROR:-}" ] || return 1
+    echo "[software-update] default npm registry failed; retrying with $OTA_NPM_MIRROR"
+    export NPM_CONFIG_REGISTRY="$OTA_NPM_MIRROR"
+    engine_json=$(npm view "openclaw@$version" engines.node --json) || return 1
+  fi
   engine=$(printf '%s' "$engine_json" | jq -er 'select(type == "string" and length > 0)') || {
     echo "[software-update] Missing Node requirement for openclaw@$version" >&2
     return 1
@@ -987,7 +1198,9 @@ update_hermes_pinned() {
   local commit="$1" installer stage
   ensure_node_engine '>=22.22.0 <23 || >=24.11.0 <25 || >=26.0.0' hermes || return 1
   installer=$(mktemp)
-  curl -fsSL "https://raw.githubusercontent.com/NousResearch/hermes-agent/${commit}/scripts/install.sh" -o "$installer" || { echo "[software-update] failed to fetch hermes installer @ $commit"; rm -f "$installer"; return 1; }
+  fetch_first "$installer" "$OS_MIRROR_BASE/hermes/${commit}/install.sh" \
+    "https://raw.githubusercontent.com/NousResearch/hermes-agent/${commit}/scripts/install.sh" \
+    || { echo "[software-update] failed to fetch hermes installer @ $commit"; rm -f "$installer"; return 1; }
   for stage in repository venv python-deps path; do
     echo "[software-update] hermes installer stage: $stage (commit $commit)"
     bash "$installer" --stage "$stage" --non-interactive --commit "$commit" --force-commit || { echo "[software-update] hermes installer stage $stage failed"; rm -f "$installer"; return 1; }
@@ -1621,7 +1834,7 @@ if [ -z "${SOFTWARE_UPDATE_DETACHED:-}" ] && command -v systemd-run >/dev/null 2
     SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
     # Transient units start with a clean env; forward every ${VAR:-} this script reads.
     SU_ENV=()
-    for v in OTA_METADATA_URL HAL_UV_CACHE; do
+    for v in OTA_METADATA_URL HAL_UV_CACHE OTA_REGION OS_MIRROR_BASE OTA_NPM_MIRROR HAL_WHEELHOUSE; do
       [ -z "${!v:-}" ] || SU_ENV+=("--setenv=$v=${!v}")
     done
     echo "[software-update] running as $SU_UNIT.service — follow with: journalctl -fu $SU_UNIT"
@@ -1790,8 +2003,13 @@ trap 'exit 130' INT
 trap 'exit 143' TERM HUP
 progress_report preparing
 
+# An explicit OTA_METADATA_URL is used as given; the stored URL also tries its CDN/storage twin.
+OTA_METADATA_CANDIDATES=""
 if [ -z "${OTA_METADATA_URL:-}" ]; then
   OTA_METADATA_URL="$(jq -r '.metadata_url // empty' "$BOOTSTRAP_JSON" 2>/dev/null || true)"
+  OTA_METADATA_CANDIDATES="$(ota_url_candidates "$OTA_METADATA_URL")"
+else
+  OTA_METADATA_CANDIDATES="$OTA_METADATA_URL"
 fi
 if [ -z "$OTA_METADATA_URL" ]; then
   echo "[software-update] ERROR: no metadata_url in $BOOTSTRAP_JSON and OTA_METADATA_URL unset"
@@ -1814,7 +2032,18 @@ trap on_exit EXIT
 # INT/TERM/HUP run the same restore; HUP is what an interrupted SSH sends.
 trap 'exit 130' INT
 trap 'exit 143' TERM HUP
-curl -fsSL -H "Cache-Control: no-cache" -H "Pragma: no-cache" -o "$METADATA_TMP" "$OTA_METADATA_URL" || { echo "Failed to fetch metadata from $OTA_METADATA_URL"; exit 1; }
+METADATA_FETCHED=0
+while IFS= read -r METADATA_SOURCE; do
+  [ -n "$METADATA_SOURCE" ] || continue
+  if curl -fsSL --connect-timeout 30 --max-time 120 -H "Cache-Control: no-cache" -H "Pragma: no-cache" \
+      -o "$METADATA_TMP" "$METADATA_SOURCE"; then
+    METADATA_FETCHED=1
+    [ "$METADATA_SOURCE" = "$OTA_METADATA_URL" ] || echo "[software-update] OTA metadata fetched from $METADATA_SOURCE"
+    break
+  fi
+  echo "[software-update] metadata fetch failed from $METADATA_SOURCE" >&2
+done <<< "$OTA_METADATA_CANDIDATES"
+[ "$METADATA_FETCHED" = 1 ] || { echo "Failed to fetch metadata from $OTA_METADATA_URL"; exit 1; }
 OTA_SIGNING_PUBLIC_KEY="$(jq -r '.signing_public_key // empty' "$BOOTSTRAP_JSON" 2>/dev/null || true)"
 if [ -n "$OTA_SIGNING_PUBLIC_KEY" ]; then
   PUBLIC_DER=$(mktemp); SIGNATURE_TMP=$(mktemp)
@@ -1845,29 +2074,78 @@ fi
 [ -z "$VERSION" ] && { echo "Metadata has no version for $APP"; exit 1; }
 [ -z "$URL" ] || [ -z "$OTA_SIGNING_PUBLIC_KEY" ] || [[ "$SHA256" =~ ^[a-fA-F0-9]{64}$ ]] || { echo "Metadata has no valid SHA-256 for $APP"; exit 1; }
 
-download_verified() {
-  local url="$1" destination="$2" digest="$3"
-  local result=0
-  DOWNLOAD_HEADERS=$(mktemp) || return 1
-  : > "$destination" || return 1
-  progress_report downloading
-  curl -fsSL --connect-timeout 30 --max-time 600 -D "$DOWNLOAD_HEADERS" -H "Cache-Control: no-cache" -o "$destination" "$url" &
-  DOWNLOAD_PID=$!
-  while kill -0 "$DOWNLOAD_PID" 2>/dev/null; do
+# download_from <url> <dest> [keep]: download with resume. An interrupted
+# transfer continues from the bytes already on disk while each attempt adds
+# bytes; "keep" also resumes a partial file left by an earlier run.
+download_from() {
+  local url="$1" destination="$2" keep="${3:-}" attempt=0 before after result restarted=0
+  if [ "$keep" != keep ] || [ ! -f "$destination" ]; then
+    : > "$destination" || return 1
+  fi
+  while :; do
+    attempt=$((attempt + 1))
+    before=$(wc -c < "$destination" 2>/dev/null | tr -d '[:space:]')
+    before=${before:-0}
+    result=0
+    curl -fsSL --connect-timeout 30 --speed-limit 1024 --speed-time 60 --max-time "${OTA_DOWNLOAD_MAX_TIME:-600}" \
+      -C - -D "$DOWNLOAD_HEADERS" -H "Cache-Control: no-cache" -o "$destination" "$url" &
+    DOWNLOAD_PID=$!
+    while kill -0 "$DOWNLOAD_PID" 2>/dev/null; do
+      progress_download_sample "$destination" "$DOWNLOAD_HEADERS"
+      sleep 1
+    done
+    wait "$DOWNLOAD_PID" || result=$?
+    DOWNLOAD_PID=""
     progress_download_sample "$destination" "$DOWNLOAD_HEADERS"
-    sleep 1
+    [ "$result" -ne 0 ] || return 0
+    after=$(wc -c < "$destination" 2>/dev/null | tr -d '[:space:]')
+    after=${after:-0}
+    # A refused range (or a range past a replaced file) restarts from zero, once.
+    if { [ "$result" -eq 33 ] || { [ "$result" -eq 22 ] && [ "$before" -gt 0 ]; }; } && [ "$restarted" -eq 0 ]; then
+      restarted=1
+      : > "$destination" || return 1
+      echo "[software-update] resume refused by $url (curl $result); restarting the download" >&2
+      continue
+    fi
+    [ "$result" -ne 22 ] || return "$result"
+    [ "$attempt" -lt "${OTA_DOWNLOAD_ATTEMPTS:-30}" ] || return "$result"
+    [ "$after" -gt "$before" ] || return "$result"
+    echo "[software-update] download interrupted (curl $result) at $after bytes; resuming" >&2
   done
-  wait "$DOWNLOAD_PID" || result=$?
-  DOWNLOAD_PID=""
-  progress_download_sample "$destination" "$DOWNLOAD_HEADERS"
+}
+
+# download_verified <url> <dest> <sha256|""> [fallback-url...]: try the URL's
+# CDN copy, the URL itself, then each fallback, until one downloads and matches
+# the digest.
+download_verified() {
+  local url="$1" destination="$2" digest="$3" candidates candidate extra result=1
+  shift 3
+  candidates=$(ota_url_candidates "$url"; for extra in "$@"; do ota_url_candidates "$extra"; done)
+  DOWNLOAD_HEADERS=$(mktemp) || return 1
+  progress_report downloading
+  while IFS= read -r candidate; do
+    [ -n "$candidate" ] || continue
+    result=0
+    download_from "$candidate" "$destination" "${DOWNLOAD_KEEP_PARTIAL:-}" || result=$?
+    if [ "$result" -ne 0 ]; then
+      echo "[software-update] download failed (curl $result): $candidate" >&2
+      continue
+    fi
+    progress_report verifying
+    if [ -n "$digest" ] && ! echo "$digest  $destination" | sha256sum -c - >/dev/null 2>&1; then
+      echo "[software-update] checksum mismatch: $candidate" >&2
+      : > "$destination" || true
+      result=1
+      continue
+    fi
+    rm -f "$DOWNLOAD_HEADERS"
+    DOWNLOAD_HEADERS=""
+    progress_report installing
+    return 0
+  done <<< "$candidates"
   rm -f "$DOWNLOAD_HEADERS"
   DOWNLOAD_HEADERS=""
-  [ "$result" -eq 0 ] || return "$result"
-  progress_report verifying
-  if [ -n "$digest" ]; then
-    echo "$digest  $destination" | sha256sum -c - >/dev/null || return 1
-  fi
-  progress_report installing
+  return 1
 }
 
 if [ "${2:-}" = --activate-promoted ] && [ "$LEGACY_TARGET" != 0 ]; then
@@ -1928,9 +2206,10 @@ elif [ "$APP" = "codex" ]; then
   esac
   CODEX_URL="https://github.com/openai/codex/releases/download/rust-v${VERSION}/${CODEX_ASSET}"
   DIR_TMP=$(mktemp -d)
-  echo "[software-update] downloading $CODEX_URL"
+  echo "[software-update] downloading codex $VERSION (CDN mirror first, then $CODEX_URL)"
   # No sha256 (upstream artifact); tar extraction is the integrity check.
-  download_verified "$CODEX_URL" "$DIR_TMP/$CODEX_ASSET" "" || { echo "Failed to download codex $VERSION"; exit 1; }
+  download_verified "$OS_MIRROR_BASE/codex/${VERSION}/${CODEX_ASSET}" "$DIR_TMP/$CODEX_ASSET" "" "$CODEX_URL" \
+    || { echo "Failed to download codex $VERSION"; exit 1; }
   tar -xzf "$DIR_TMP/$CODEX_ASSET" -C "$DIR_TMP" || { echo "Corrupt codex tarball for $VERSION"; exit 1; }
   CODEX_SRC="$DIR_TMP/${CODEX_ASSET%.tar.gz}"
   [ -f "$CODEX_SRC" ] || { echo "No codex binary in tarball"; exit 1; }
@@ -1965,8 +2244,25 @@ elif [ "$APP" = "opencode" ]; then
   [ -x /usr/local/bin/opencode ] || { echo "opencode is not installed on this device — switch the runtime to opencode first"; exit 1; }
   export HOME=/root
   install -D -m 0755 /usr/local/bin/opencode /root/bootstrap/rollback/opencode.previous
-  curl -fsSL https://opencode.ai/install | OPENCODE_INSTALL_DIR=/usr/local/bin bash -s -- --version "$VERSION" \
-    || { echo "opencode installer failed for $VERSION"; exit 1; }
+  # The CDN mirror holds the vendor's release archive; the vendor installer stays the fallback.
+  case "$(uname -m)" in
+    aarch64|arm64) OC_ASSET="opencode-linux-arm64.tar.gz" ;;
+    x86_64)        OC_ASSET="opencode-linux-x64.tar.gz" ;;
+    *)             OC_ASSET="" ;;
+  esac
+  DIR_TMP=$(mktemp -d)
+  OC_FROM_MIRROR=0
+  if [ -n "$OC_ASSET" ] && fetch_first "$DIR_TMP/$OC_ASSET" "$OS_MIRROR_BASE/opencode/${VERSION}/${OC_ASSET}" \
+      && tar -xzf "$DIR_TMP/$OC_ASSET" -C "$DIR_TMP"; then
+    OC_NEW=$(find "$DIR_TMP" -type f -name opencode 2>/dev/null | head -1)
+    if [ -n "$OC_NEW" ] && chmod 0755 "$OC_NEW" && "$OC_NEW" --version 2>/dev/null | grep -qw "$VERSION"; then
+      install -m 0755 "$OC_NEW" /usr/local/bin/opencode && OC_FROM_MIRROR=1
+    fi
+  fi
+  if [ "$OC_FROM_MIRROR" != 1 ]; then
+    curl -fsSL https://opencode.ai/install | OPENCODE_INSTALL_DIR=/usr/local/bin bash -s -- --version "$VERSION" \
+      || { echo "opencode installer failed for $VERSION"; exit 1; }
+  fi
   # The installer has ignored OPENCODE_INSTALL_DIR before.
   if [ ! -x /usr/local/bin/opencode ]; then
     OC_SRC="$(command -v opencode 2>/dev/null || true)"
@@ -2027,8 +2323,9 @@ elif [ "$APP" = "picoclaw" ]; then
   esac
   PICO_URL="https://github.com/autonomous-ai/picoclaw/releases/download/${VERSION}/${PICO_ASSET}"
   DIR_TMP=$(mktemp -d)
-  echo "[software-update] downloading $PICO_URL"
-  download_verified "$PICO_URL" "$DIR_TMP/$PICO_ASSET" "" || { echo "Failed to download picoclaw $VERSION"; exit 1; }
+  echo "[software-update] downloading picoclaw $VERSION (CDN mirror first, then $PICO_URL)"
+  download_verified "$OS_MIRROR_BASE/picoclaw/${VERSION}/${PICO_ASSET}" "$DIR_TMP/$PICO_ASSET" "" "$PICO_URL" \
+    || { echo "Failed to download picoclaw $VERSION"; exit 1; }
   # No sha256: run the new binary from the temp dir before replacing the installed one.
   chmod 0755 "$DIR_TMP/$PICO_ASSET"
   "$DIR_TMP/$PICO_ASSET" --no-color version >/dev/null 2>&1 || { echo "Downloaded picoclaw $VERSION is not runnable — keeping the current binary"; exit 1; }
@@ -2129,7 +2426,7 @@ elif [ "$APP" = "hal" ]; then
       rm -f "$log"
       return "$rc"
     }
-    hal_uv_sync || {
+    hal_install_dependencies || {
       status=$?
       echo "HAL staging failed: uv sync exited $status (uv $("$UV_BIN" --version 2>/dev/null | cli_semver || true) at $UV_BIN, ${HAL_LOCK_ARGS[*]:-no lock}, $(df -Pk "$DIR_TMP" 2>/dev/null | awk 'NR == 2 { print int($4 / 1024) " MiB free" }'))" >&2
       exit 1
