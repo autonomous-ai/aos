@@ -328,3 +328,11 @@ def test_has_internet_gives_up_at_the_overall_bound(monkeypatch):
     started = time.monotonic()
     assert app_state._has_internet() is False
     assert time.monotonic() - started < 1.3
+
+
+def test_piper_voices_come_from_a_fixed_revision():
+    rev = piper_catalog.VOICES_REVISION
+    assert len(rev) == 40 and all(c in "0123456789abcdef" for c in rev)
+    for name in piper_catalog.CATALOG:
+        for url in piper_catalog.voice_urls(name):
+            assert f"/resolve/{rev}/" in url, url

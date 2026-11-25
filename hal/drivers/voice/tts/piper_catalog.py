@@ -2,7 +2,11 @@
 
 import os
 
-VOICES_BASE = "https://huggingface.co/rhasspy/piper-voices/resolve/main"
+# Voices come from a fixed revision of the voices repo, so the files never
+# change under their pinned digests. Moving to a newer revision means
+# rechecking every sha256/json_sha256 below at that revision.
+VOICES_REVISION = "5ec43b186ef915a195d3ddbcfd9916e76c503c3f"
+VOICES_BASE = f"https://huggingface.co/rhasspy/piper-voices/resolve/{VOICES_REVISION}"
 
 BINARY_URL = (
     "https://github.com/rhasspy/piper/releases/download/2023.11.14-2/"
