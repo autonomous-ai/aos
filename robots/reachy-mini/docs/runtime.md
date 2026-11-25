@@ -129,9 +129,9 @@ component scripts in order. Each of those also runs standalone:
 | Step | Script | What it installs |
 |------|--------|------------------|
 | 1 | `spike-device.sh` | `devices.reachy-mini` from OTA → `/opt/devices/reachy-mini`, then applies the package's `rootfs/` overlay onto `/` (that is where `/etc/asound.conf` and `/opt/hal/.env` come from) |
-| 2 | `spike-hal.sh` | `hal` → `/opt/hal`, builds the venv (`uv sync --python 3.12 --extra hardware --extra reachy`), runs uvicorn on `127.0.0.1:5001` |
+| 2 | `spike-hal.sh` | `hal` → `/opt/hal`, installs `ffmpeg` (TTS decodes provider audio through it; without it the robot is silent), builds the venv (`uv sync --python 3.12 --extra hardware --extra reachy`), runs uvicorn on `127.0.0.1:5001` with Pollen's libcamera paths when `/usr/local/lib/aarch64-linux-gnu/libcamera/ipa` exists |
 | 3 | `spike-os.sh` | `os-server` → `/usr/local/bin/os-server`, seeds `/root/config/config.json`, runs it **as root with `WorkingDirectory=/root`** |
-| 4 | `spike-web.sh` | `web` → `/usr/share/nginx/html/setup`, installs nginx, writes the spike vhost |
+| 4 | `spike-web.sh` | `web` → `/usr/share/nginx/html/setup`, installs nginx, writes the spike vhost (including the `/api/harness/ws` WebSocket location Harness pairing needs), advertises `_autonomous._tcp` via `/etc/avahi/services/autonomous.service` for Harness/Buddy discovery |
 | 5 | `spike-agent.sh` | Compatible Node.js (NodeSource 24.x when needed) + `openclaw` at the OTA-pinned version, seeds `/root/.openclaw`, runs `openclaw gateway run` on loopback `18789` |
 | 6 | `spike-bootstrap.sh` | `bootstrap` → `/usr/local/bin/bootstrap-server`, seeds `/root/config/bootstrap.json`, installs the `software-update` staged at the device-package root by `upload-device.sh` (canonical `scripts/provision/software-update`) → `/usr/local/bin/software-update` (the helper the worker execs; without it every apply fails with `executable file not found in $PATH` while all units report healthy) |
 
@@ -353,6 +353,14 @@ argument. `HAL_CAMERA_INDEX` is unused by this backend — libcamera selects the
 sensor by pipeline — and `requires_v4l2_index = False` keeps boot from probing
 `/dev/video*` for a node it will never open.
 
+Pollen OS ships its own libcamera build under `/usr/local`. The daemon's
+`launcher.sh` exports `LD_LIBRARY_PATH=/usr/local/lib/aarch64-linux-gnu/`,
+`LIBCAMERA_IPA_MODULE_PATH=/usr/local/lib/aarch64-linux-gnu/libcamera/ipa` and
+`LIBCAMERA_IPA_CONFIG_PATH=/usr/local/share/libcamera/ipa`; without them
+`rpicam-vid` never delivers a frame ("no frame since HAL start").
+`spike-hal.sh` writes the same three as `Environment=` lines in `hal.service`
+when that IPA directory exists.
+
 Known tuning gap: at the 5 fps idle rate libcamera may pick exposures long
 enough to smear moving subjects. Raise the idle rate or cap `--shutter` when
 sharp stills matter more than CPU.
@@ -521,6 +529,19 @@ driver honours whatever it lets through. Both flags used to be missing here, so
 the route saw no hold at all, dispatched anyway, and the driver dropped the
 animation with only a debug line — the robot went quiet after a hold for no
 visible reason.
+
+`release()` (`/servo/release`, going to sleep) first waits up to 2 s for the
+cancelled move's play thread, then calls `goto_sleep()` up to 5 times 0.3 s
+apart, because the daemon refuses it with "a move is already running" while the
+cancelled move winds down. Torque goes off only after `goto_sleep()` succeeds;
+if every attempt fails, the motors stay on holding the current pose and the
+error comes back as `{"sleep": ...}`. Cutting torque away from the sleep pose
+used to drop the head.
+
+`idle_recording` is `P.SERVO_IDLE`, the same attribute the Feetech
+`AnimationService` exposes: tracking hands the body back by playing it
+(`drivers/tracking/body.py`, `tracker_service.py`). Without it every hand-back
+raised `AttributeError` and the head stayed where tracking left it.
 
 `freeze()` never cancels the move in flight: vision snapshots are frequent, and
 chopping a move for each one broke the animation being watched and restarted the

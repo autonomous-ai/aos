@@ -74,6 +74,12 @@ if [ "$SKIP_DEPS" = "0" ]; then
   apt-get install -y --no-install-recommends \
     libcairo2-dev libgirepository1.0-dev pkg-config >/dev/null 2>&1 \
     || info "WARN: apt install failed — pygobject may fail to build"
+  # TTS decodes provider audio through ffmpeg; without it the robot stays silent.
+  if ! command -v ffmpeg >/dev/null; then
+    info "installing ffmpeg"
+    { apt-get update -qq && apt-get install -y --no-install-recommends ffmpeg; } >/dev/null 2>&1 \
+      || info "WARN: ffmpeg install failed — the robot will not speak until it is installed"
+  fi
 
   UV="$(command -v uv || true)"
   [ -n "$UV" ] || [ ! -x /home/pollen/.local/bin/uv ] || UV=/home/pollen/.local/bin/uv
@@ -96,7 +102,22 @@ else
   [ -x "$HAL_DIR/.venv/bin/uvicorn" ] || die "no venv at $HAL_DIR/.venv — drop --no-deps"
 fi
 
+command -v ffmpeg >/dev/null || info "WARN: ffmpeg is missing — TTS will be silent (apt-get install ffmpeg)"
+
 say "4/4  Install the unit and start"
+# Pollen OS ships its own libcamera under /usr/local; rpicam-vid only finds the
+# camera with the same paths the daemon's launcher.sh exports
+# (pollen-robotics/reachy_mini src/reachy_mini/daemon/app/services/wireless/launcher.sh).
+LIBCAMERA_ENV=""
+POLLEN_LIB=/usr/local/lib/aarch64-linux-gnu
+if [ -d "$POLLEN_LIB/libcamera/ipa" ]; then
+  LIBCAMERA_ENV="Environment=LD_LIBRARY_PATH=$POLLEN_LIB/
+Environment=LIBCAMERA_IPA_MODULE_PATH=$POLLEN_LIB/libcamera/ipa
+Environment=LIBCAMERA_IPA_CONFIG_PATH=/usr/local/share/libcamera/ipa"
+  info "camera: using Pollen's libcamera at $POLLEN_LIB"
+else
+  info "camera: no Pollen libcamera at $POLLEN_LIB — using the system one"
+fi
 write_unit "$SERVICE" <<UNIT
 [Unit]
 Description=HAL Hardware Runtime
@@ -115,6 +136,7 @@ WorkingDirectory=$HAL_DIR
 EnvironmentFile=$HAL_DIR/.env
 # Safe as an Environment= line only because the .env does not set HF_HOME.
 Environment=HF_HOME=$HF_HOME_PATH
+$LIBCAMERA_ENV
 # --timeout-graceful-shutdown: without it uvicorn waits forever for open
 # connections (an SSE/MJPEG stream holds SIGTERM until systemd's 90s SIGKILL).
 ExecStart=$HAL_DIR/.venv/bin/uvicorn hal.server:app --host 127.0.0.1 --port 5001 --timeout-graceful-shutdown 5

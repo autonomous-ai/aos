@@ -112,6 +112,21 @@ server {
     proxy_read_timeout 86400s;
   }
 
+  # Direct Harness device connection (pairing), same as the production vhost.
+  # Without the upgrade headers the handshake reaches os-server as plain HTTP
+  # and pairing fails with 400.
+  location = /api/harness/ws {
+    proxy_pass http://spike_backend;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade \$http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_read_timeout 86400s;
+    proxy_send_timeout 86400s;
+  }
+
   # HAL is loopback-only, exactly as in production. The browser must reach
   # hardware through os-server's authenticated /api/hardware/* proxy — exposing
   # /hw/ to the LAN would hand every host on the network unauthenticated servo,
@@ -136,6 +151,27 @@ ln -sfn "/etc/nginx/sites-available/$VHOST" "/etc/nginx/sites-enabled/$VHOST"
 nginx -t || die "nginx config test failed"
 systemctl reload nginx 2>/dev/null || systemctl restart nginx
 info "nginx reloaded"
+
+# _autonomous._tcp mDNS advertisement so Harness and Buddy can discover the
+# robot (same record as scripts/provision/setup.sh). Pollen OS ships avahi.
+if [ -d /etc/avahi ]; then
+  mkdir -p /etc/avahi/services
+  cat >/etc/avahi/services/autonomous.service <<'AVAHI'
+<?xml version="1.0" standalone='no'?>
+<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
+<service-group>
+  <name replace-wildcards="yes">%h</name>
+  <service>
+    <type>_autonomous._tcp</type>
+    <port>80</port>
+  </service>
+</service-group>
+AVAHI
+  systemctl reload avahi-daemon 2>/dev/null || systemctl restart avahi-daemon 2>/dev/null || true
+  info "mDNS _autonomous._tcp advertised"
+else
+  info "WARN: avahi not installed — Harness/Buddy cannot discover this robot"
+fi
 
 say "4/4  Verify"
 code() { curl -s -o /dev/null -w "%{http_code}" -m 10 "$1"; }
