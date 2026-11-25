@@ -34,9 +34,9 @@ or change filler scheduling.
 
 ## Region (mainland China)
 
-The backend tells the device its market region in the periodic status ping reply (top-level `region`, for example `"CN"`). os-server stores it as `region` in `config/config.json` (`Config.Region`, helper `Config.InChina()`, true for `CN` in any letter case). A reply without the field never clears a stored value, and the config is written only when the value changes. `GET /api/device/config` returns `region` and `in_china`; `GET /api/system/info` returns `inChina`; HAL reads `region` from the same config file (`hal/config.py` `in_china()`).
+The backend tells the device its market region in the periodic status ping reply (top-level `region`, for example `"CN"`). os-server stores it as `region` in `config/config.json` (`Config.Region`, helper `Config.InChina()`, true for `CN` in any letter case). The value is read leniently: 1-8 letters, upper-cased; a missing field, `null`, a number or anything else reads as no region, and the rest of the reply is still used. The backend leaves `region` out when the device has none, so a successful reply without it clears a stored region. The config is written only when the value changes, never for a failed ping, and after a save the region subscribers (`Service.OnRegionChange`, for other features that depend on the region) are called. Entering or leaving China restarts HAL and re-runs the agent onboarding so the text below follows the region. `GET /api/device/config` returns `region` and `in_china`; `GET /api/system/info` returns `inChina`; HAL reads `region` from the same config file (`hal/config.py` `in_china()`).
 
-When the region first becomes `CN` and the owner never chose a timezone (`timezone` is empty in the config), the device applies `Asia/Shanghai` through the same path as `timezone.set`. A zone the owner or the app already set is never replaced.
+When the region first becomes `CN` and the owner never chose a timezone (`timezone` is empty in the config), the device applies `Asia/Shanghai` through the same path as `timezone.set`. A zone the owner or the app already set is never replaced, and leaving China does not undo the zone.
 
 In China the device changes these behaviours; every other region is unchanged:
 
@@ -44,7 +44,8 @@ In China the device changes these behaviours; every other region is unchanged:
 - **Chat channels:** a new Telegram, Slack or WhatsApp setup is refused (`POST /api/device/channel`, MQTT `add_channel` with `channel_unavailable_in_region`, and a `channel` change in `PUT /api/device/config`). A channel the owner already configured keeps working and can be edited. Discord stays available.
 - **Skill catalog language:** the skill store request sends `zh-CN` instead of `en-US`.
 - **Music:** HAL `POST /audio/play` for a search query answers HTTP 503 `Music isn't available in this region yet.` without starting yt-dlp. Local files still play. `music_source_available()` in `hal/drivers/voice/music_service.py` is the single hook where a China music source can be added later.
-- **Bring-your-own providers:** `domain.ProvidersForRegion(true)` omits the Google providers.
+- **Voice pipeline:** HAL does not use Gemini Live in China (when the realtime provider is `gemini`, the default); it uses the normal STT, agent, TTS pipeline, the same one used when realtime is off. `HAL_REALTIME_ENABLED` still overrides, and another realtime provider is untouched.
+- **First-response waits:** the default realtime waits for a first response (`REALTIME_RECV_QUEUE_TIMEOUT_S`, fast-voice silent timeout) are 5/3 longer in China (the same 3 s to 5 s widening the lamp uses); explicit settings are used as given. Wake sounds, cues and the filler delay stay local and unchanged.
 
 ## Japanese language support
 

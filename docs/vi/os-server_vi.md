@@ -32,9 +32,9 @@ Sửa nội dung này không bật lại việc tự chọn câu theo tool và k
 
 ## Khu vực (Trung Quốc đại lục)
 
-Backend cho thiết bị biết khu vực thị trường trong phản hồi của ping trạng thái định kỳ (trường cấp cao nhất `region`, ví dụ `"CN"`). os-server lưu vào `region` trong `config/config.json` (`Config.Region`, helper `Config.InChina()`, true với `CN` không phân biệt hoa thường). Phản hồi không có trường này không bao giờ xoá giá trị đã lưu, và config chỉ được ghi khi giá trị đổi. `GET /api/device/config` trả `region` và `in_china`; `GET /api/system/info` trả `inChina`; HAL đọc `region` từ cùng file config (`hal/config.py` `in_china()`).
+Backend cho thiết bị biết khu vực thị trường trong phản hồi của ping trạng thái định kỳ (trường cấp cao nhất `region`, ví dụ `"CN"`). os-server lưu vào `region` trong `config/config.json` (`Config.Region`, helper `Config.InChina()`, true với `CN` không phân biệt hoa thường). Giá trị được đọc linh hoạt: 1-8 chữ cái, viết hoa; thiếu trường, `null`, số hoặc bất kỳ giá trị nào khác được coi là không có khu vực, và phần còn lại của phản hồi vẫn được dùng. Backend bỏ trường `region` khi thiết bị không có khu vực, nên một phản hồi thành công không có trường này sẽ xoá khu vực đã lưu. Config chỉ được ghi khi giá trị đổi, không bao giờ ghi khi ping thất bại, và sau khi lưu các subscriber (`Service.OnRegionChange`, cho các tính năng khác phụ thuộc khu vực) được gọi. Vào hoặc rời Trung Quốc sẽ khởi động lại HAL và chạy lại onboarding agent để nội dung dưới đây theo đúng khu vực. `GET /api/device/config` trả `region` và `in_china`; `GET /api/system/info` trả `inChina`; HAL đọc `region` từ cùng file config (`hal/config.py` `in_china()`).
 
-Khi khu vực lần đầu thành `CN` và chủ máy chưa từng chọn múi giờ (`timezone` trống trong config), thiết bị áp `Asia/Shanghai` qua cùng đường với `timezone.set`. Múi giờ do chủ máy hoặc app đã đặt không bao giờ bị thay.
+Khi khu vực lần đầu thành `CN` và chủ máy chưa từng chọn múi giờ (`timezone` trống trong config), thiết bị áp `Asia/Shanghai` qua cùng đường với `timezone.set`. Múi giờ do chủ máy hoặc app đã đặt không bao giờ bị thay, và rời Trung Quốc không hoàn lại múi giờ.
 
 Ở Trung Quốc thiết bị đổi các hành vi sau; các khu vực khác giữ nguyên:
 
@@ -42,7 +42,8 @@ Khi khu vực lần đầu thành `CN` và chủ máy chưa từng chọn múi g
 - **Kênh chat:** thiết lập mới Telegram, Slack hoặc WhatsApp bị từ chối (`POST /api/device/channel`, MQTT `add_channel` với `channel_unavailable_in_region`, và đổi `channel` trong `PUT /api/device/config`). Kênh chủ máy đã cấu hình vẫn chạy và sửa được. Discord vẫn dùng được.
 - **Ngôn ngữ catalog skill:** request tới skill store gửi `zh-CN` thay cho `en-US`.
 - **Nhạc:** HAL `POST /audio/play` với câu tìm kiếm trả HTTP 503 `Music isn't available in this region yet.` mà không chạy yt-dlp. File cục bộ vẫn phát được. `music_source_available()` trong `hal/drivers/voice/music_service.py` là hook duy nhất để thêm nguồn nhạc cho Trung Quốc sau này.
-- **Provider tự mang key:** `domain.ProvidersForRegion(true)` bỏ các provider Google.
+- **Pipeline giọng nói:** HAL không dùng Gemini Live ở Trung Quốc (khi provider realtime là `gemini`, mặc định); dùng pipeline thường STT, agent, TTS, cùng pipeline khi realtime tắt. `HAL_REALTIME_ENABLED` vẫn ghi đè, và provider realtime khác không bị đổi.
+- **Thời gian chờ phản hồi đầu:** các mặc định chờ phản hồi đầu của realtime (`REALTIME_RECV_QUEUE_TIMEOUT_S`, fast-voice silent timeout) dài hơn 5/3 lần ở Trung Quốc (cùng mức nới 3 s lên 5 s của lamp); cài đặt tường minh được dùng nguyên. Âm thanh đánh thức, cue và độ trễ filler vẫn cục bộ và không đổi.
 
 ## Hỗ trợ tiếng Nhật
 

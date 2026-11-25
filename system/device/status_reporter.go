@@ -148,15 +148,62 @@ func mqttConfigChanged(m *beclient.MQTTConfig, c *config.Config) bool {
 // when the backend first places it in China (images start on America/New_York).
 const chinaDefaultTimezone = "Asia/Shanghai"
 
-// applyPingRegion stores the region from a ping reply. An empty region (older
-// backend, or a reply without the field) never clears a stored value, and the
-// config is written only when the value changed. The first time the region
-// becomes CN, a device whose owner never set a timezone gets Asia/Shanghai
-// through setTimezone (the same path as timezone.set); an owner-chosen zone is
-// never replaced.
+// RegionChange describes a saved change of the device's region.
+type RegionChange struct {
+	// Region and Previous are upper-case region codes; "" means none.
+	Region, Previous string
+	// InChina and WasInChina are the same facts as booleans.
+	InChina, WasInChina bool
+}
+
+// OnRegionChange subscribes fn to region changes, called after the new region
+// is saved. fn runs on the status reporter goroutine and must return quickly;
+// start slow work in a goroutine. Subscribe before StartStatusReporter.
+func (s *Service) OnRegionChange(fn func(RegionChange)) {
+	s.regionMu.Lock()
+	defer s.regionMu.Unlock()
+	s.regionSubs = append(s.regionSubs, fn)
+}
+
+func (s *Service) notifyRegionChange(ch RegionChange) {
+	s.regionMu.Lock()
+	subs := append([]func(RegionChange){}, s.regionSubs...)
+	s.regionMu.Unlock()
+	for _, fn := range subs {
+		fn(ch)
+	}
+}
+
+// applyRegionEffects is the built-in subscriber: when the device enters or
+// leaves China, HAL restarts to pick the voice pipeline and waits for the
+// region, and the agent instruction text is rewritten for the region.
+func (s *Service) applyRegionEffects(ch RegionChange) {
+	if ch.InChina == ch.WasInChina {
+		return
+	}
+	s.restartHAL("region change")
+	if s.agentGateway == nil {
+		return
+	}
+	go func() {
+		if err := s.agentGateway.EnsureOnboarding(); err != nil {
+			slog.Warn("onboarding refresh after region change failed", "component", "status-reporter", "error", err)
+		}
+	}()
+}
+
+// applyPingRegion stores the region from a successfully parsed ping reply. The
+// backend leaves `region` out when the device has none, so an empty region means
+// "not in a region" and clears a stored one; callers must not pass a region for a
+// failed ping. The config is written only when the value changes, and region
+// subscribers are told afterwards. The first time the region becomes CN, a
+// device whose owner never set a timezone gets Asia/Shanghai through setTimezone
+// (the same path as timezone.set); an owner-chosen zone is never replaced, and
+// leaving China does not undo it.
 func (s *Service) applyPingRegion(region string, setTimezone func(string) error) {
-	region = strings.ToUpper(strings.TrimSpace(region))
-	if region == "" || region == strings.ToUpper(strings.TrimSpace(s.config.Region)) {
+	region = beclient.NormalizeRegion(region)
+	previous := strings.ToUpper(strings.TrimSpace(s.config.Region))
+	if region == previous {
 		return
 	}
 	wasChina := s.config.InChina()
@@ -170,4 +217,8 @@ func (s *Service) applyPingRegion(region string, setTimezone func(string) error)
 			slog.Warn("set default China timezone failed", "component", "status-reporter", "error", err)
 		}
 	}
+	s.notifyRegionChange(RegionChange{
+		Region: region, Previous: previous,
+		InChina: s.config.InChina(), WasInChina: wasChina,
+	})
 }

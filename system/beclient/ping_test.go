@@ -117,9 +117,17 @@ func TestPingBodyMQTTTLS(t *testing.T) {
 
 func TestPingResponseRegion(t *testing.T) {
 	cases := map[string]string{
-		`{"status":"ok","region":"CN"}`: "CN",
-		`{"status":"ok"}`:               "",
-		`{"status":"ok","region":""}`:   "",
+		`{"status":"ok","region":"CN"}`:        "CN",
+		`{"status":"ok","region":"cn"}`:        "CN",
+		`{"status":"ok"}`:                      "",
+		`{"status":"ok","region":""}`:          "",
+		`{"status":"ok","region":null}`:        "",
+		`{"status":"ok","region":5}`:           "",
+		`{"status":"ok","region":["CN"]}`:      "",
+		`{"status":"ok","region":"zz-1"}`:      "",
+		`{"status":"ok","region":"C N"}`:       "",
+		`{"status":"ok","region":"../x"}`:      "",
+		`{"status":"ok","region":"ABCDEFGHI"}`: "",
 	}
 	for body, want := range cases {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -133,6 +141,20 @@ func TestPingResponseRegion(t *testing.T) {
 		}
 		if resp.Region != want {
 			t.Errorf("%s: region = %q, want %q", body, resp.Region, want)
+		}
+	}
+}
+
+// A strange region must not lose the rest of the reply.
+func TestPingResponseStrangeRegionKeepsReply(t *testing.T) {
+	for _, strange := range []string{`5`, `null`, `["CN"]`, `"zz-1"`, `{}`} {
+		var resp PingResponse
+		body := `{"status":"ok","device_id":"d-1","mqtt":{"mqtt_server":"b.example"},"region":` + strange + `}`
+		if err := json.Unmarshal([]byte(body), &resp); err != nil {
+			t.Fatalf("%s: %v", strange, err)
+		}
+		if resp.Region != "" || resp.DeviceID != "d-1" || !resp.HasMQTT() {
+			t.Errorf("%s: region=%q device=%q mqtt=%v", strange, resp.Region, resp.DeviceID, resp.HasMQTT())
 		}
 	}
 }

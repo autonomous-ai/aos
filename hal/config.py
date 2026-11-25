@@ -621,9 +621,13 @@ def _rt_enabled() -> bool:
     env = os.environ.get("HAL_REALTIME_ENABLED")
     if env is not None:
         return env.lower() in ("1", "true", "yes")
-    if "enabled" in _RT:
-        return bool(_RT["enabled"])
-    return True
+    enabled = bool(_RT["enabled"]) if "enabled" in _RT else True
+    # Gemini Live is not reachable from mainland China: use the normal
+    # STT -> agent -> TTS pipeline there, the same one used when realtime is off.
+    provider = _rt_str("HAL_REALTIME_PROVIDER", _RT.get("provider"), "gemini")
+    if enabled and in_china() and provider.strip().lower() == "gemini":
+        return False
+    return enabled
 
 
 REALTIME_ENABLED: bool = _rt_enabled()
@@ -660,9 +664,20 @@ def wake_followup_timeout_s() -> float:
 VOICE_OPENING_FILLERS_ONLY: bool = os.environ.get(
     "HAL_VOICE_OPENING_FILLERS_ONLY", "false"
 ).lower() in ("1", "true", "yes")
+# In mainland China the first reply crosses a slower border: the default waits for a
+# first response are 5/3 longer there (the lamp uses 5 s where it uses 3 s elsewhere).
+# Cues and wake sounds stay local and immediate; an explicit setting always wins.
+CN_FIRST_RESPONSE_SCALE: float = 5.0 / 3.0
+
+
+def first_response_wait_default(seconds: float) -> float:
+    """A default first-response wait, loosened in China."""
+    return seconds * CN_FIRST_RESPONSE_SCALE if in_china() else seconds
+
+
 # Max gap between output events before the turn falls back (keep just above first-token latency).
 REALTIME_RECV_QUEUE_TIMEOUT_S: float = float(
-    os.environ.get("HAL_REALTIME_RECV_QUEUE_TIMEOUT_S", "8.0")
+    os.environ.get("HAL_REALTIME_RECV_QUEUE_TIMEOUT_S", str(first_response_wait_default(8.0)))
 )
 # Grace after turn_complete on NON_BLOCKING-tool models for late delegate/reject calls (#453). 0 disables.
 REALTIME_NONBLOCKING_TOOL_GRACE_S: float = float(
@@ -814,7 +829,7 @@ FAST_VOICE_SILENT_TIMEOUT_DEFAULT_S = 5.0
 try:
     REALTIME_FAST_VOICE_SILENT_TIMEOUT_S: float = float(os.environ.get(
         "HAL_FAST_VOICE_SILENT_TIMEOUT_S",
-        _RT.get("fast_voice_silent_timeout_s", FAST_VOICE_SILENT_TIMEOUT_DEFAULT_S),
+        _RT.get("fast_voice_silent_timeout_s", first_response_wait_default(FAST_VOICE_SILENT_TIMEOUT_DEFAULT_S)),
     ))
 except (TypeError, ValueError):
     REALTIME_FAST_VOICE_SILENT_TIMEOUT_S = FAST_VOICE_SILENT_TIMEOUT_DEFAULT_S
