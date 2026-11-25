@@ -6,6 +6,7 @@ import { SecretUpdateField } from "@/components/SecretUpdateField";
 import { getAgentRuntime } from "@/lib/api";
 import type { ChannelType } from "@/types";
 import type { ChannelLoadedState } from "@/hooks/setup/types";
+import { channelOffered, useInChina } from "@/hooks/useInChina";
 
 // Messaging channel settings; bot tokens are write-only.
 export function ChannelSection({
@@ -37,6 +38,7 @@ export function ChannelSection({
   bluebubblesUserAddress: string; setBluebubblesUserAddress: (v: string) => void;
   bluebubblesCallerContext: string; setBluebubblesCallerContext: (v: string) => void;
 }) {
+  const inChina = useInChina();
   const [imessageGuideOpen, setImessageGuideOpen] = useState<boolean>(() => {
     try { return localStorage.getItem("imessage-guide-open") === "1"; } catch { return false; }
   });
@@ -71,11 +73,16 @@ export function ChannelSection({
             fontSize: 12.5, color: C.text, outline: "none", cursor: "pointer",
           }}
         >
-          <option value="telegram">Telegram</option>
-          <option value="slack">Slack</option>
+          {channelOffered("telegram", inChina, channelLoaded, channel) && <option value="telegram">Telegram</option>}
+          {channelOffered("slack", inChina, channelLoaded, channel) && <option value="slack">Slack</option>}
           <option value="discord">Discord</option>
           <option value="imessage">iMessage (BlueBubbles)</option>
         </SettingsSelect>
+        {inChina && (
+          <p style={{ fontSize: 12, color: C.textMuted, margin: "6px 0 0" }}>
+            Discord is the supported chat in this region.
+          </p>
+        )}
       </div>
       {channel === "telegram" && (
         <>

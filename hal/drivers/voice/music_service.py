@@ -12,6 +12,7 @@ import threading
 import time
 from pathlib import Path
 
+from hal import config
 from hal.clock import device_fromtimestamp, device_now
 from typing import Optional
 
@@ -168,6 +169,21 @@ def _detect_alsa_output_device() -> str:
 
 
 ALSA_DEVICE = _detect_alsa_output_device()
+
+# What the agent or voice path says when a search cannot run in this region.
+MUSIC_UNAVAILABLE_MESSAGE = "Music isn't available in this region yet."
+
+
+def music_source_available() -> bool:
+    """Whether a music search source works for this device's region.
+
+    Search uses YouTube through yt-dlp, which is not reachable from mainland China, so
+    there it fails fast instead of hanging on yt-dlp retries. This is the one place to
+    plug in a China music source later: return True once one exists and route
+    `_resolve_audio_url` and `_start_stream` to it. Local files are never gated.
+    """
+    return not config.in_china()
+
 
 MUSIC_RESOLVE_TRIES = 2
 MUSIC_STREAM_TRIES = 2
@@ -684,6 +700,9 @@ class MusicService:
 
     def _resolve_audio_url(self, query: str) -> tuple[Optional[str], Optional[str]]:
         """Use yt-dlp to search YouTube and return (watch_url, title)."""
+        if not music_source_available():
+            logger.info("Music search skipped: no music source in this region")
+            return None, None
         last_err = ""
         for attempt in range(MUSIC_RESOLVE_TRIES):
             if attempt > 0:

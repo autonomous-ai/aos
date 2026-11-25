@@ -67,6 +67,7 @@ func (h *HealthHandler) SystemInfo(c *gin.Context) {
 		"version":       config.OSVersion,
 		"deviceId":      h.config.DeviceID,
 		"capabilities":  h.deviceCapabilities(),
+		"inChina":       h.config.InChina(),
 		"agent":         h.agentInfo(),
 	}
 

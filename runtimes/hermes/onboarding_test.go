@@ -20,7 +20,7 @@ func ownMarkerSoulRuleBlock() string {
 const testPersona = "# Lamp\n\n## Skill-driven turns (Non-Negotiable)\n- `[sensing:*]` → `skills/sensing/SKILL.md`."
 
 func TestUpsertAgentsMDBlock_SeedsEmptyFile(t *testing.T) {
-	got := upsertAgentsMDBlock("")
+	got := upsertAgentsMDBlock("", false)
 	if !strings.HasPrefix(got, soulOSMarker) {
 		t.Fatalf("block missing from a fresh AGENTS.md:\n%q", got)
 	}
@@ -33,13 +33,13 @@ func TestUpsertAgentsMDBlock_SeedsEmptyFile(t *testing.T) {
 	if !strings.HasSuffix(got, "---\n") {
 		t.Fatalf("block must close with --- separator:\n%q", got)
 	}
-	if upsertAgentsMDBlock(got) != got {
+	if upsertAgentsMDBlock(got, false) != got {
 		t.Fatal("not idempotent on a freshly seeded file")
 	}
 }
 
 func TestUpsertAgentsMDBlock_KeepsOwnerContent(t *testing.T) {
-	got := upsertAgentsMDBlock("## Notes\n\nowner notes\n")
+	got := upsertAgentsMDBlock("## Notes\n\nowner notes\n", false)
 	if !strings.HasPrefix(got, soulOSMarker) {
 		t.Fatalf("block must sit at the top:\n%q", got)
 	}
@@ -51,7 +51,7 @@ func TestUpsertAgentsMDBlock_KeepsOwnerContent(t *testing.T) {
 // An OTA ships new wording: replace in place, never stack a second copy.
 func TestUpsertAgentsMDBlock_RefreshesWithoutDuplicating(t *testing.T) {
 	stale := soulOSMarker + "\n" + soulSkillPrioritySentinel + " old wording\n---\n\nowner notes\n"
-	got := upsertAgentsMDBlock(stale)
+	got := upsertAgentsMDBlock(stale, false)
 
 	if strings.Contains(got, "old wording") {
 		t.Fatalf("stale block survived:\n%q", got)
@@ -176,7 +176,7 @@ func TestUpsertSoulPersonaBlock_KeepsPersonalSectionUnderDefault(t *testing.T) {
 // Every boot runs the persona upsert, the SOUL prune and the AGENTS.md upsert.
 func TestPromptFiles_StableAcrossBoots(t *testing.T) {
 	boot := func(soul, agents string) (string, string) {
-		return stripSoulOSRuleBlock(upsertSoulPersonaBlock(soul, testPersona)), upsertAgentsMDBlock(agents)
+		return stripSoulOSRuleBlock(upsertSoulPersonaBlock(soul, testPersona)), upsertAgentsMDBlock(agents, false)
 	}
 
 	soul1, agents1 := boot("", "")
@@ -204,7 +204,7 @@ func TestPromptFiles_MigratesRuleBlockOutOfSoul(t *testing.T) {
 		"## Your identity card\n\n- **Name:** Ngan\n\n" + legacySoulRuleBlock()
 
 	gotSoul := stripSoulOSRuleBlock(upsertSoulPersonaBlock(soul, testPersona))
-	gotAgents := upsertAgentsMDBlock("")
+	gotAgents := upsertAgentsMDBlock("", false)
 
 	if strings.Contains(gotSoul, "old wording") {
 		t.Errorf("rule block still in SOUL.md:\n%q", gotSoul)

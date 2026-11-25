@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"strconv"
+	"strings"
 	"time"
 
 	"go.autonomous.ai/os/system/beclient"
@@ -112,6 +113,7 @@ func (s *Service) StartStatusReporter(ctx context.Context) {
 			if resp.DeviceID != "" && resp.DeviceID != s.config.DeviceID {
 				s.config.DeviceID = resp.DeviceID
 			}
+			s.applyPingRegion(resp.Region, s.SetTimezone)
 			// Apply when the broker, port or channels change: moving to the TLS port on
 			// the same broker changes only the port.
 			if resp.HasMQTT() && mqttConfigChanged(resp.GetMQTT(), s.config) {
@@ -140,4 +142,32 @@ func mqttConfigChanged(m *beclient.MQTTConfig, c *config.Config) bool {
 		(port != 0 && port != c.MQTTPort) ||
 		(m.FaChannel != "" && m.FaChannel != c.FAChannel) ||
 		(m.FdChannel != "" && m.FdChannel != c.FDChannel)
+}
+
+// chinaDefaultTimezone is the zone a device that has no owner-chosen zone gets
+// when the backend first places it in China (images start on America/New_York).
+const chinaDefaultTimezone = "Asia/Shanghai"
+
+// applyPingRegion stores the region from a ping reply. An empty region (older
+// backend, or a reply without the field) never clears a stored value, and the
+// config is written only when the value changed. The first time the region
+// becomes CN, a device whose owner never set a timezone gets Asia/Shanghai
+// through setTimezone (the same path as timezone.set); an owner-chosen zone is
+// never replaced.
+func (s *Service) applyPingRegion(region string, setTimezone func(string) error) {
+	region = strings.ToUpper(strings.TrimSpace(region))
+	if region == "" || region == strings.ToUpper(strings.TrimSpace(s.config.Region)) {
+		return
+	}
+	wasChina := s.config.InChina()
+	if err := s.config.WithLockSave(func(c *config.Config) { c.Region = region }); err != nil {
+		slog.Error("save region failed", "component", "status-reporter", "error", err)
+		return
+	}
+	slog.Info("region updated from backend", "component", "status-reporter", "region", region)
+	if !wasChina && s.config.InChina() && s.config.Timezone == "" {
+		if err := setTimezone(chinaDefaultTimezone); err != nil {
+			slog.Warn("set default China timezone failed", "component", "status-reporter", "error", err)
+		}
+	}
 }

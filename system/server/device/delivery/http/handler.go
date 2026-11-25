@@ -490,6 +490,10 @@ func (h *DeviceHandler) ChangeChannel(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, serializers.ResponseError("whatsapp pairing not supported via HTTP; use MQTT add_channel"))
 		return
 	}
+	if h.service.ChannelUnavailableInRegion(req.EffectiveChannel()) {
+		c.JSON(http.StatusBadRequest, serializers.ResponseError(req.EffectiveChannel()+" is not available in this region"))
+		return
+	}
 	if !h.service.SupportsChannel(req.EffectiveChannel()) {
 		c.JSON(http.StatusBadRequest, serializers.ResponseError(req.EffectiveChannel()+" not supported on the active runtime"))
 		return

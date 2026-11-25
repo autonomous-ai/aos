@@ -214,6 +214,9 @@ type PingResponse struct {
 	Status   string      `json:"status"`
 	DeviceID string      `json:"device_id,omitempty"`
 	MQTT     *MQTTConfig `json:"mqtt,omitempty"`
+	// Region is the market region the backend assigned to this device (e.g. "CN").
+	// Absent on older backend replies.
+	Region string `json:"region,omitempty"`
 }
 
 // HasMQTT returns true if the response contains MQTT configuration.

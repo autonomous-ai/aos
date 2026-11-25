@@ -622,6 +622,8 @@ Các tài khoản bên thứ ba mà robot có thể dùng được gom trong **S
 
 Trang lưu credential trên thiết bị và chỉ báo trạng thái đã kết nối lên tài khoản, nên dòng quyền riêng tư ghi "Saved on this device. Only the connected status is shared with your account."
 
+Ở Trung Quốc đại lục (`in_china` từ `GET /api/device/config`, `inChina` từ `GET /api/system/info`) trang Facebook bị ẩn khỏi sidebar và Settings. Tuỳ chọn Telegram và Slack bị ẩn khỏi bộ chọn kênh (Settings và setup) trừ khi chủ máy đã cấu hình kênh đó, và có ghi chú rằng Discord là chat được hỗ trợ ở khu vực này.
+
 ### Khả năng đọc của Settings
 
 Dropdown Settings dùng menu Radix cùng theme, mục chọn màu amber, tự đặt vị trí theo viewport, có cuộn, điều hướng bàn phím và đóng bằng Escape. Các lựa chọn Auto/default có giá trị rỗng vẫn chọn được. General giữ control hiện có.

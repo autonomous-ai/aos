@@ -26,6 +26,21 @@ var ListProviders = []LLMProvider{
 	{Key: "github-copilot", Name: "GitHub Copilot"},
 }
 
+// ProvidersForRegion returns the bring-your-own provider list for the device's
+// region. Google's providers are left out in China, where they are not reachable.
+func ProvidersForRegion(inChina bool) []LLMProvider {
+	if !inChina {
+		return ListProviders
+	}
+	out := make([]LLMProvider, 0, len(ListProviders))
+	for _, p := range ListProviders {
+		if !strings.HasPrefix(p.Key, "google") {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 type LLMModelCapabilities struct {
 	SupportsReasoning       bool `json:"supportsReasoning"`
 	SupportsVision          bool `json:"supportsVision"`

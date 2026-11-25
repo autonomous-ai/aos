@@ -119,6 +119,8 @@ export function SettingsPanel({ activeSection }: { activeSection: SettingsSectio
     }
   }, []);
 
+  // Set from config.in_china: hides the Facebook connector section in mainland China.
+  const [inChina, setInChina] = useState(false);
   const [ssid, setSsid] = useState("");
   const [password, setPassword] = useState("");
   // Empty = keep the current password.
@@ -263,6 +265,7 @@ export function SettingsPanel({ activeSection }: { activeSection: SettingsSectio
     getDeviceConfig()
       .then((cfg: DeviceConfig) => {
         // Secrets come back as has_* flags; their inputs stay empty until typed.
+        setInChina(cfg.in_china === true);
         setSsid(cfg.network_ssid ?? "");
         setDeviceId(cfg.device_id ?? "");
         setMac(cfg.mac ?? "");
@@ -937,7 +940,7 @@ export function SettingsPanel({ activeSection }: { activeSection: SettingsSectio
               bluebubblesCallerContext={bluebubblesCallerContext} setBluebubblesCallerContext={setBluebubblesCallerContext}
             />
 
-            <FacebookSection active={activeSection === "facebook"} />
+            {!inChina && <FacebookSection active={activeSection === "facebook"} />}
             <ShopifySection active={activeSection === "shopify"} />
             <EbaySection active={activeSection === "ebay"} />
 

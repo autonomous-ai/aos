@@ -14,6 +14,7 @@ import (
 
 	"go.autonomous.ai/os/system/device"
 	"go.autonomous.ai/os/system/domain"
+	"go.autonomous.ai/os/system/lib/regiontext"
 	"go.autonomous.ai/os/system/skills"
 )
 
@@ -180,7 +181,7 @@ func (s *CodexService) EnsureOnboarding() error {
 	}
 	// Global user AGENTS.md ($CODEX_HOME/AGENTS.md): reaches coding sessions in any
 	// cwd, which never load the workspace AGENTS.md.
-	ensureUserAgentsMDBlock()
+	ensureUserAgentsMDBlock(s.config.InChina())
 
 	needRestart := false
 
@@ -242,6 +243,7 @@ func (s *CodexService) notifySkillChangesWhenReady(changedSkills []string) {
 
 // ensureAgentsMDBlock injects/refreshes the OS-managed block in workspace/AGENTS.md.
 func (s *CodexService) ensureAgentsMDBlock() (bool, error) {
+	block := regiontext.ForRegion(agentsMDBlock, s.config.InChina())
 	agentsFile := filepath.Join(codexWorkspaceDir, "AGENTS.md")
 
 	content, err := os.ReadFile(agentsFile)
@@ -251,7 +253,7 @@ func (s *CodexService) ensureAgentsMDBlock() (bool, error) {
 	text := string(content)
 
 	// Already has the exact current block → nothing to do.
-	if strings.Contains(text, agentsMDBlock) {
+	if strings.Contains(text, block) {
 		return false, nil
 	}
 
@@ -266,12 +268,12 @@ func (s *CodexService) ensureAgentsMDBlock() (bool, error) {
 	for _, line := range lines {
 		result = append(result, line)
 		if !injected && strings.Contains(strings.ToLower(line), "your workspace") {
-			result = append(result, agentsMDBlock)
+			result = append(result, block)
 			injected = true
 		}
 	}
 	if !injected {
-		result = append([]string{agentsMDBlock, ""}, result...)
+		result = append([]string{block, ""}, result...)
 	}
 
 	if err := os.WriteFile(agentsFile, []byte(strings.Join(result, "\n")), 0644); err != nil {
@@ -566,14 +568,15 @@ func (s *CodexService) ensureHeartbeatMDBlock() (bool, error) {
 // ensureUserAgentsMDBlock injects/refreshes the OS-managed block in codex's
 // GLOBAL user-instructions file (codexUserAgentsMD = $CODEX_HOME/AGENTS.md),
 // which codex loads in every session regardless of cwd.
-func ensureUserAgentsMDBlock() bool {
-	return ensureUserAgentsMDBlockAt(codexUserAgentsMD)
+func ensureUserAgentsMDBlock(inChina bool) bool {
+	return ensureUserAgentsMDBlockAt(codexUserAgentsMD, inChina)
 }
 
 // ensureUserAgentsMDBlockAt is the path-parameterized body of
 // ensureUserAgentsMDBlock (codexUserAgentsMD is a hardcoded const — the parameter
 // exists so tests can point it at a temp dir).
-func ensureUserAgentsMDBlockAt(path string) bool {
+func ensureUserAgentsMDBlockAt(path string, inChina bool) bool {
+	block := regiontext.ForRegion(userAgentsMDBlock, inChina)
 	content, err := os.ReadFile(path)
 	if err != nil && !os.IsNotExist(err) {
 		slog.Warn("ensure user AGENTS.md: read failed", "component", "codex-onboarding", "error", err)
@@ -581,14 +584,14 @@ func ensureUserAgentsMDBlockAt(path string) bool {
 	}
 	text := string(content)
 
-	if strings.Contains(text, userAgentsMDBlock) {
+	if strings.Contains(text, block) {
 		return false
 	}
 	if strings.Contains(text, osMandatoryMarker) {
 		text = stripMarkedBlock(text)
 	}
 
-	output := userAgentsMDBlock + "\n"
+	output := block + "\n"
 	if strings.TrimSpace(text) != "" {
 		output += "\n" + strings.TrimLeft(text, " \t\r\n")
 	}

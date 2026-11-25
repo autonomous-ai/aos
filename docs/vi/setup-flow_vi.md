@@ -93,6 +93,8 @@ Thay đổi messaging channel sau khi đã setup. Chấp nhận `telegram`, `sla
 
 **WhatsApp bị reject ở đây** (`400 whatsapp pairing not supported via HTTP; use MQTT add_channel`) — WhatsApp pairing stream rotating QR về caller, HTTP fire-and-forget không carry được. Đường chính tắc là MQTT `add_channel` command (xem `docs/mqtt.md`) — thiết bị publish một message fd_channel cho mỗi pairing event. Re-pair không re-bootstrap dùng MQTT `whatsapp_pair` command.
 
+Ở Trung Quốc đại lục, thiết lập mới Telegram, Slack hoặc WhatsApp bị từ chối (`400 <channel> is not available in this region`; kết quả MQTT `channel_unavailable_in_region`). Kênh đã cấu hình không bị ảnh hưởng và Discord vẫn dùng được. Xem `docs/vi/os-server_vi.md`, mục Khu vực.
+
 ## Network Setup
 
 `device.Setup` đi một trong hai nhánh mạng, chọn theo việc request có SSID hay không.
@@ -691,6 +693,7 @@ Config lưu tại `config/config.json`. Managed bởi `system/server/config/conf
 | `MQTTPort` | MQTT broker port |
 | `FAChannel` | MQTT subscribe topic (server→device) |
 | `FDChannel` | MQTT publish topic (device→server) |
+| `Region` | Khu vực thị trường từ phản hồi ping trạng thái (vd `CN`); trống đến khi được báo, không bị xoá bởi phản hồi thiếu trường này |
 
 ## Bridge sự kiện về cửa sổ cha (parent window)
 

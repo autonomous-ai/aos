@@ -16,6 +16,7 @@ import (
 
 	"go.autonomous.ai/os/system/device"
 	"go.autonomous.ai/os/system/domain"
+	"go.autonomous.ai/os/system/lib/regiontext"
 )
 
 // knowledgeFS holds the KNOWLEDGE.md skeleton, embedded so a fresh
@@ -262,6 +263,7 @@ func ensurePersonaFiles() bool {
 // USER-level ~/.claude/CLAUDE.md, which Claude Code loads in every session
 // whatever the cwd — so the device persona + rules reach the coding sessions too.
 func (s *ClaudeCodeService) ensureClaudeMDBlock() (bool, error) {
+	block := regiontext.ForRegion(claudeMDBlock, s.config.InChina())
 	claudeFile := claudeUserMDPath
 
 	content, err := os.ReadFile(claudeFile)
@@ -271,7 +273,7 @@ func (s *ClaudeCodeService) ensureClaudeMDBlock() (bool, error) {
 	text := string(content)
 
 	// Already has the exact current block → nothing to do.
-	if strings.Contains(text, claudeMDBlock) {
+	if strings.Contains(text, block) {
 		return false, nil
 	}
 
@@ -282,9 +284,9 @@ func (s *ClaudeCodeService) ensureClaudeMDBlock() (bool, error) {
 
 	var output string
 	if strings.TrimSpace(text) == "" {
-		output = claudeMDBlock + "\n\n## Notes\n\n_Owner-editable. Add device-specific notes or personality tweaks here. The block above is managed by the OS and refreshed on each update — keep your edits in this section._\n"
+		output = block + "\n\n## Notes\n\n_Owner-editable. Add device-specific notes or personality tweaks here. The block above is managed by the OS and refreshed on each update — keep your edits in this section._\n"
 	} else {
-		output = claudeMDBlock + "\n\n" + strings.TrimLeft(text, " \t\r\n")
+		output = block + "\n\n" + strings.TrimLeft(text, " \t\r\n")
 	}
 
 	if err := os.MkdirAll(claudeUserDir, 0o755); err != nil {

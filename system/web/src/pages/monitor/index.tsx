@@ -58,6 +58,9 @@ const EMBED_SECTIONS = new Set<Section>(["api-docs", "agent-config"]);
 // Sections shown without ?debug=true.
 const PUBLIC_SECTIONS = new Set<Section>(["sensing", "chat", "pairing", "overview", "system", "flow", "camera", "face-owners", "bluetooth", "logs", "cli", "settings:device", "settings:realtime", "settings:wifi", "settings:voice", "settings:face", "settings:privacy", "settings:mcp", "settings:plugins", "settings:timezone", "settings:led", "settings:scheduled", "settings:facebook", "settings:shopify", "settings:ebay"]);
 
+// Sections hidden when the device is in mainland China (Facebook is blocked there).
+const CHINA_HIDDEN_SECTIONS = new Set<Section>(["settings:facebook"]);
+
 // Prune a group's children by debug mode and capability; drops subgroups left empty.
 function filterNavChildren(
   children: NavChild[],
@@ -588,14 +591,15 @@ export default function Monitor() {
   const caps = sys?.capabilities ? new Set(sys.capabilities) : null;
   const hasCap = (c: string): boolean => !caps || caps.has(c);
   const sectionVisible = (id: Section): boolean => {
+    if (sys?.inChina && CHINA_HIDDEN_SECTIONS.has(id)) return false;
     const cap = sectionCap(id);
     return !cap || (typeof cap === "string" ? hasCap(cap) : cap.some(hasCap));
   };
 
   useEffect(() => {
-    if (caps && !sectionVisible(section)) setSection("overview");
+    if ((caps || sys?.inChina) && !sectionVisible(section)) setSection("overview");
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sys?.capabilities, section]);
+  }, [sys?.capabilities, sys?.inChina, section]);
 
   const sectionRef = useRef(section);
   useEffect(() => { sectionRef.current = section; }, [section]);

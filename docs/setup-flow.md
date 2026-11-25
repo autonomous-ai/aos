@@ -93,6 +93,8 @@ Change messaging channel after setup is complete. Accepts `telegram`, `slack`, `
 
 **WhatsApp is rejected here** (`400 whatsapp pairing not supported via HTTP; use MQTT add_channel`) — WhatsApp pairing streams a rotating QR back to the caller, which HTTP's fire-and-forget shape can't carry. The canonical path is the MQTT `add_channel` command (see `docs/mqtt.md`) which publishes one fd_channel message per pairing event. Re-pairing without re-bootstrapping uses the MQTT `whatsapp_pair` command.
 
+In mainland China a new Telegram, Slack or WhatsApp setup is refused (`400 <channel> is not available in this region`; MQTT result `channel_unavailable_in_region`). A channel already configured is unaffected and Discord stays available. See `docs/os-server.md`, Region.
+
 ## Network Setup
 
 `device.Setup` takes one of two network paths, chosen by whether the request carries
@@ -717,6 +719,7 @@ Config stored at `config/config.json`. Managed by `system/server/config/config.g
 | `MQTTPort` | MQTT broker port |
 | `FAChannel` | MQTT subscribe topic (server→device) |
 | `FDChannel` | MQTT publish topic (device→server) |
+| `Region` | Market region from the status ping reply (e.g. `CN`); empty until reported, never cleared by a reply without it |
 
 ## Parent-window event bridge
 

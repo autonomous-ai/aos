@@ -253,6 +253,11 @@ type Config struct {
 	// picked in Settings.
 	Timezone string `json:"timezone,omitempty" yaml:"timezone"`
 
+	// Region is the market region the backend reports in the ping reply (e.g.
+	// "CN"). Empty until the backend sends one; a reply without the field never
+	// clears it.
+	Region string `json:"region,omitempty" yaml:"region"`
+
 	// DeviceType is the device class/profile id — the folder name under
 	// robots/ (e.g. "lamp", "intern-v2", "unitree-go2w").
 	DeviceType string `json:"device_type,omitempty" yaml:"deviceType"`
@@ -381,6 +386,14 @@ func Default() Config {
 
 		notify: make(chan bool, 1),
 	}
+}
+
+// RegionCN is the region code the backend sends for mainland China.
+const RegionCN = "CN"
+
+// InChina reports whether the backend placed this device in mainland China.
+func (c *Config) InChina() bool {
+	return c != nil && strings.EqualFold(strings.TrimSpace(c.Region), RegionCN)
 }
 
 // BackendBase returns the base URL for the Autonomous backend channel

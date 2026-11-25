@@ -304,6 +304,10 @@ export interface CloudPerception {
 
 export interface DeviceConfig {
   llm_config_mode?: LLMConfigMode;
+  // Backend-assigned market region ("CN", ...); empty or absent when unknown.
+  region?: string;
+  // True when the device is in mainland China: Google, Facebook, Telegram and Slack are hidden.
+  in_china?: boolean;
   channel: string;
   telegram_user_id: string;
   slack_user_id: string;

@@ -188,6 +188,14 @@ def _os_cfg_get(key: str, default: str = "") -> str:
     except Exception:
         return default
 
+def in_china() -> bool:
+    """True when the backend placed this device in mainland China (config.json `region` == "CN").
+
+    Read fresh on every call: the region arrives from a ping after boot.
+    """
+    return str(_os_cfg_get("region", "")).strip().upper() == "CN"
+
+
 def wake_chime_enabled() -> bool:
     """Owner toggle (config.json `wake_chime`, default on) for the chime on a spoken wake phrase."""
     return _os_cfg_get("wake_chime", True) is not False

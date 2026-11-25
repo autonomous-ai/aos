@@ -114,3 +114,25 @@ func TestPingBodyMQTTTLS(t *testing.T) {
 		t.Fatalf("mqtt_tls = %s, want true", body["mqtt_tls"])
 	}
 }
+
+func TestPingResponseRegion(t *testing.T) {
+	cases := map[string]string{
+		`{"status":"ok","region":"CN"}`: "CN",
+		`{"status":"ok"}`:               "",
+		`{"status":"ok","region":""}`:   "",
+	}
+	for body, want := range cases {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte(body))
+		}))
+		cfg := &config.Config{BackendBaseURL: srv.URL + "/api/v1/ai/v1", BackendAPIKey: "k"}
+		resp, err := New(cfg).Ping(cfg.BackendKey(), PingPayload{})
+		srv.Close()
+		if err != nil || resp == nil {
+			t.Fatalf("%s: ping resp=%v err=%v", body, resp, err)
+		}
+		if resp.Region != want {
+			t.Errorf("%s: region = %q, want %q", body, resp.Region, want)
+		}
+	}
+}
