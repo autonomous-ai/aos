@@ -9,11 +9,14 @@ BINARY_URL = (
     "piper_linux_aarch64.tar.gz"
 )
 
-# Optional mirror of the same files, tried after the upstream URL fails (for
-# networks where the upstream hosts are unreachable). Layout below it:
+# CDN copy of the same files, tried before the upstream URL with a short
+# timeout (for networks where the upstream hosts are unreachable); a copy that
+# is missing or slow costs seconds, then upstream is used. Layout below it:
 # <version>/piper_linux_aarch64.tar.gz and voices/<path>/<name>.onnx(.json).
-# Empty (the default) adds none.
-MIRROR_BASE = os.environ.get("HAL_PIPER_MIRROR_BASE", "").strip().rstrip("/")
+# Empty disables it.
+MIRROR_BASE = os.environ.get(
+    "HAL_PIPER_MIRROR_BASE", "https://cdn.autonomous.ai/models/piper",
+).strip().rstrip("/")
 
 CATALOG = {
     "en_US-ljspeech-medium": {
@@ -96,12 +99,11 @@ def voice_urls(name: str):
     return f"{base}.onnx", f"{base}.onnx.json"
 
 
-def binary_urls() -> list:
-    """Engine archive URLs in try order: upstream first, then the mirror."""
-    urls = [BINARY_URL]
-    if MIRROR_BASE:
-        urls.append(f"{MIRROR_BASE}/{BINARY_URL.split('/download/', 1)[1]}")
-    return urls
+def binary_mirror_url():
+    """The engine archive on the mirror, or None when the mirror is off."""
+    if not MIRROR_BASE:
+        return None
+    return f"{MIRROR_BASE}/{BINARY_URL.split('/download/', 1)[1]}"
 
 
 def voice_mirror_urls(name: str):

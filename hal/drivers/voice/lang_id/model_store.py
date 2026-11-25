@@ -24,6 +24,9 @@ logger = logging.getLogger("hal.voice.lang_id")
 _CHUNK = 1 << 20
 _CONNECT_TIMEOUT_S = 15.0
 _READ_TIMEOUT_S = 60.0
+# A copy tried before the pinned URL must connect and answer within this, so a
+# missing or unreachable copy costs seconds before the pinned URL is asked.
+_QUICK_TIMEOUT_S = 5.0
 
 
 def sha256_of(path: Path) -> str:
@@ -61,13 +64,16 @@ class ModelStore:
     """Makes one pinned model file available; `on_ready(path)` runs once it is verified."""
 
     def __init__(self, cache_dir: Path, filename: str, url: str, sha256: str, *,
-                 mirrors: Sequence[str] = (), size: int = 0, retry_s: float = 30.0,
+                 mirrors: Sequence[str] = (), quick: Sequence[str] = (),
+                 size: int = 0, retry_s: float = 30.0,
                  max_retry_s: float = 600.0,
                  fetch: Optional[Callable[[str, Path, threading.Event], None]] = None):
         self.path = Path(cache_dir) / f"{Path(filename).stem}-{sha256[:12]}{Path(filename).suffix}"
         self.url = url
         # Tried in order; the first that downloads and matches the hash wins.
-        self.urls = list(dict.fromkeys([url, *mirrors]))
+        # `quick` copies go first, each with a short timeout.
+        self.urls = list(dict.fromkeys([*quick, url, *mirrors]))
+        self._quick = set(quick) - {url, *mirrors}
         self.sha256 = sha256
         self.size = size
         self._retry_s = retry_s
@@ -133,7 +139,10 @@ class ModelStore:
         started = time.monotonic()
         logger.info("Language ID model downloading %s -> %s", url, self.path)
         try:
-            self._fetch(url, part, self._stop)
+            if url in self._quick:
+                self._fetch(url, part, self._stop, timeout=(_QUICK_TIMEOUT_S, _QUICK_TIMEOUT_S))
+            else:
+                self._fetch(url, part, self._stop)
             if self._stop.is_set():
                 raise RuntimeError("stopped")
             got = sha256_of(part)
@@ -148,10 +157,11 @@ class ModelStore:
         )
 
 
-def _http_fetch(url: str, dest: Path, stop: threading.Event) -> None:
+def _http_fetch(url: str, dest: Path, stop: threading.Event,
+                timeout: tuple = (_CONNECT_TIMEOUT_S, _READ_TIMEOUT_S)) -> None:
     import requests
 
-    with requests.get(url, stream=True, timeout=(_CONNECT_TIMEOUT_S, _READ_TIMEOUT_S)) as r:
+    with requests.get(url, stream=True, timeout=timeout) as r:
         r.raise_for_status()
         with open(dest, "wb") as f:
             for chunk in r.iter_content(_CHUNK):

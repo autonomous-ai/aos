@@ -247,7 +247,7 @@ def test_mirror_with_wrong_hash_is_rejected(tmp_path):
     assert not store.path.exists()
 
 
-def test_build_gate_tries_mirror_override_last(tmp_path, monkeypatch):
+def test_build_gate_tries_cdn_copy_first(tmp_path, monkeypatch):
     manifest = tmp_path / "ambernet.model.json"
     manifest.write_text(json.dumps({"url": "https://x/ambernet.onnx", "sha256": SHA,
                                     "mirrors": ["https://m/ambernet.onnx"]}))
@@ -260,8 +260,36 @@ def test_build_gate_tries_mirror_override_last(tmp_path, monkeypatch):
     monkeypatch.setattr(model_store, "_http_fetch", lambda url, dest, stop: release.wait(5))
     gate = build_gate("en")
     try:
-        assert gate.store.urls == ["https://x/ambernet.onnx", "https://m/ambernet.onnx",
-                                   "https://override/ambernet.onnx"]
+        assert gate.store.urls == ["https://override/ambernet.onnx", "https://x/ambernet.onnx",
+                                   "https://m/ambernet.onnx"]
     finally:
         gate.store.stop()
         release.set()
+
+
+def test_cdn_copy_is_asked_quickly_then_pinned_url(tmp_path):
+    calls = []
+
+    def fetch(url, dest, stop, **kw):
+        calls.append((url, kw.get("timeout")))
+        if url == "https://cdn/m.onnx":
+            raise OSError("404")
+        dest.write_bytes(MODEL)
+
+    store = ModelStore(tmp_path, "ambernet.onnx", "https://primary/m.onnx", SHA,
+                       quick=["https://cdn/m.onnx"], fetch=fetch)
+    ready = threading.Event()
+    store.ensure(lambda path: ready.set())
+    wait_ready(ready)
+    assert calls == [("https://cdn/m.onnx", (model_store._QUICK_TIMEOUT_S, model_store._QUICK_TIMEOUT_S)),
+                     ("https://primary/m.onnx", None)]
+
+
+def test_cdn_copy_with_wrong_hash_is_rejected(tmp_path):
+    def fetch(url, dest, stop, **kw):
+        dest.write_bytes(b"not the model" if url == "https://cdn/m.onnx" else MODEL)
+
+    store = ModelStore(tmp_path, "ambernet.onnx", "https://primary/m.onnx", SHA,
+                       quick=["https://cdn/m.onnx"], fetch=fetch)
+    store._download()
+    assert store.path.read_bytes() == MODEL

@@ -3641,9 +3641,13 @@ một release asset) và giữ model trong `HAL_LANG_ID_CACHE_DIR` (mặc địn
 về `<file>.part`, kiểm tra SHA-256 rồi rename vào đúng chỗ, nên đường dẫn cuối cùng
 chỉ chứa model đã được xác minh; một lần tải lỗi bị xóa và thử lại sau 30 s, gấp
 đôi dần tới 600 s. Cả HAL khi khởi động lẫn voice loop đều không chờ việc tải này.
-Mỗi lần thử tải từ `url` đã pin, rồi tới các `mirrors` https trong file pin, rồi
-tới `HAL_LANG_ID_MODEL_MIRROR_URL` nếu có đặt (mặc định rỗng); mọi nguồn đều được
-kiểm tra cùng SHA-256.
+Mỗi lần thử tải trước từ bản trên CDN (`HAL_LANG_ID_MODEL_MIRROR_URL`, mặc định
+`https://cdn.autonomous.ai/models/ambernet/ambernet.onnx`, để rỗng là tắt) với
+timeout kết nối và đọc 5s, nên bản bị thiếu hoặc chậm chỉ tốn vài giây, rồi tới
+`url` đã pin, rồi tới các `mirrors` https trong file pin. Mọi nguồn đều được kiểm
+tra cùng SHA-256. Model chất lượng giọng (`HAL_SPEAKER_MODEL_MIRROR_BASE`, kiểm
+tra với SHA-256 đã pin) và các file Piper (`HAL_PIPER_MIRROR_BASE`) cũng thử bản
+trên CDN trước theo cách này.
 
 Cổng chỉ **active** khi model đã load xong (`Language gate active`). Trước đó (đang
 tải, đang load lúc boot), hoặc khi model load lỗi, mọi capture ghi log

@@ -98,9 +98,12 @@ LANG_ID_LABELS_PATH = Path(os.environ.get("HAL_LANG_ID_LABELS_PATH", str(_VOICE_
 # downloaded in the background into LANG_ID_CACHE_DIR. The cache sits beside the
 # HAL tree (/opt/.models-hal on a device) because OTA replaces /opt/hal.
 LANG_ID_MODEL_MANIFEST = Path(os.environ.get("HAL_LANG_ID_MODEL_MANIFEST", str(_VOICE_RESOURCES / "ambernet.model.json")))
-# Optional https mirror of the same file, tried after the pinned URL fails and
-# checked against the same pinned sha256. Empty (the default) adds none.
-LANG_ID_MODEL_MIRROR_URL = os.environ.get("HAL_LANG_ID_MODEL_MIRROR_URL", "").strip()
+# CDN copy of the same file, tried before the pinned URL with a short timeout
+# (a copy that is missing or slow costs seconds, then the pinned URL is used)
+# and checked against the same pinned sha256. Empty disables it.
+LANG_ID_MODEL_MIRROR_URL = os.environ.get(
+    "HAL_LANG_ID_MODEL_MIRROR_URL", "https://cdn.autonomous.ai/models/ambernet/ambernet.onnx",
+).strip()
 LANG_ID_CACHE_DIR = Path(os.environ.get(
     "HAL_LANG_ID_CACHE_DIR", str(Path(__file__).resolve().parents[4] / ".models-hal"),
 ))

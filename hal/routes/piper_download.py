@@ -48,10 +48,16 @@ def _flush(force: bool = False, **over) -> None:
         pass
 
 
-def _download(url: str, dest: str, w_from: int, w_to: int, track: bool) -> None:
+# Socket timeout for an upstream URL, and for a mirror copy tried before it.
+DOWNLOAD_TIMEOUT_S = 60
+QUICK_TIMEOUT_S = 5
+
+
+def _download(url: str, dest: str, w_from: int, w_to: int, track: bool,
+              timeout: float = DOWNLOAD_TIMEOUT_S) -> None:
     """Fetch url to dest via a .part file, mapping progress onto a slice of the whole job."""
     tmp = dest + ".part"
-    with urllib.request.urlopen(url, timeout=60) as resp, open(tmp, "wb") as out:
+    with urllib.request.urlopen(url, timeout=timeout) as resp, open(tmp, "wb") as out:
         total = int(resp.headers.get("Content-Length") or 0)
         if track:
             _flush(force=True, bytes_total=total, bytes_done=0)
@@ -70,11 +76,11 @@ def _download(url: str, dest: str, w_from: int, w_to: int, track: bool) -> None:
 
 
 def _download_any(urls, dest: str, w_from: int, w_to: int, track: bool) -> None:
-    """Try each URL in order (upstream first, then mirrors); raise the last error."""
+    """Try each (url, timeout) in order; raise the last error."""
     last = None
-    for url in urls:
+    for url, timeout in urls:
         try:
-            _download(url, dest, w_from, w_to, track)
+            _download(url, dest, w_from, w_to, track, timeout)
             return
         except Exception as exc:  # noqa: BLE001 — any failure moves to the next URL
             last = exc
@@ -83,8 +89,10 @@ def _download_any(urls, dest: str, w_from: int, w_to: int, track: bool) -> None:
 
 
 def _urls(spec: dict) -> list:
-    """The primary URL plus any mirrors a spec carries (older specs have none)."""
-    return [spec["url"], *[u for u in spec.get("mirrors") or [] if u]]
+    """(url, timeout) in try order: the spec's mirror copies first, each with a
+    short timeout, then its URL (a spec without `quick` has only the URL)."""
+    quick = [(u, QUICK_TIMEOUT_S) for u in spec.get("quick") or [] if u]
+    return [*quick, (spec["url"], DOWNLOAD_TIMEOUT_S)]
 
 
 def _discard(paths) -> None:
