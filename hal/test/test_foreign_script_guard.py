@@ -28,3 +28,15 @@ if __name__ == "__main__":
     test_english_kept()
     test_matching_language_kept()
     print("ok")
+
+
+def test_chinese_reply_allowed_for_a_chinese_turn():
+    # SOUL.md: a turn in Chinese is answered in Chinese characters.
+    assert not reply_is_foreign_script("你好，今天怎么样？", "English", "你好")
+    assert not reply_is_foreign_script("妳好，今天怎麼樣？", "English", "妳好")
+    # Without a Chinese turn the guard still blocks it.
+    assert reply_is_foreign_script("你好", "English", "hello")
+    assert reply_is_foreign_script("你好", "English")
+    # Kana or Hangul in the reply are still blocked after a Chinese turn.
+    assert reply_is_foreign_script("こんにちは", "English", "你好")
+    assert reply_is_foreign_script("안녕하세요", "English", "你好")
