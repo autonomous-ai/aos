@@ -150,14 +150,42 @@ var publicIPCache = struct {
 	fetchedAt time.Time
 }{}
 
+const (
+	// publicIPTimeout bounds the lookup so the monitor page never waits long
+	// on networks where the lookup service is slow or unreachable.
+	publicIPTimeout = 2 * time.Second
+	// publicIPTTL is how long a found IP is reused.
+	publicIPTTL = 5 * time.Minute
+	// publicIPFailTTL is how long a failed lookup is remembered, so every
+	// refresh of the page does not wait for the timeout again.
+	publicIPFailTTL = time.Minute
+)
+
+// publicIPURL is a variable so tests can point it at a local server.
+var publicIPURL = "https://ifconfig.me/ip"
+
 func getPublicIP() string {
 	publicIPCache.mu.Lock()
 	defer publicIPCache.mu.Unlock()
-	if time.Since(publicIPCache.fetchedAt) < 5*time.Minute && publicIPCache.ip != "" {
-		return publicIPCache.ip
+	age := time.Since(publicIPCache.fetchedAt)
+	if !publicIPCache.fetchedAt.IsZero() {
+		if publicIPCache.ip != "" && age < publicIPTTL {
+			return publicIPCache.ip
+		}
+		if publicIPCache.ip == "" && age < publicIPFailTTL {
+			return ""
+		}
 	}
-	client := &http.Client{Timeout: 3 * time.Second}
-	req, err := http.NewRequest("GET", "https://ifconfig.me/ip", nil)
+	ip := fetchPublicIP()
+	publicIPCache.ip = ip
+	publicIPCache.fetchedAt = time.Now()
+	return ip
+}
+
+// fetchPublicIP returns the public IP, or "" when the lookup fails or times out.
+func fetchPublicIP() string {
+	client := &http.Client{Timeout: publicIPTimeout}
+	req, err := http.NewRequest("GET", publicIPURL, nil)
 	if err != nil {
 		return ""
 	}
@@ -167,12 +195,12 @@ func getPublicIP() string {
 		return ""
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return ""
+	}
 	buf := make([]byte, 64)
 	n, _ := resp.Body.Read(buf)
-	ip := strings.TrimSpace(string(buf[:n]))
-	publicIPCache.ip = ip
-	publicIPCache.fetchedAt = time.Now()
-	return ip
+	return strings.TrimSpace(string(buf[:n]))
 }
 
 // getTailscaleIP returns the device's Tailscale IPv4 address, or empty string
