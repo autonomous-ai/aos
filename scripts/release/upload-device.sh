@@ -5,6 +5,11 @@ set -e
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ota-config.sh"
 source "${RELEASE_DIR}/ota-metadata.sh"
+source "${RELEASE_DIR}/mirror-check.sh"
+# The software-update shipped here pins these mirrored files; each must be on the mirror.
+MIRROR_PIN_KEYS=$(awk "/^MIRROR_PINS='/ { on = 1; next } on && /^'/ { exit } on && NF { print \$1 }" "$MIRROR_PINS_FILE")
+# shellcheck disable=SC2086
+mirror_require "make upload-mirror" $MIRROR_PIN_KEYS
 
 DEVICE_TYPE="${1:-}"
 if [[ -z "$DEVICE_TYPE" ]]; then
@@ -63,7 +68,7 @@ ZIP_SHA256=$(ota_artifact_sha256 "$ZIP_PATH")
 METADATA_PATH="${BUCKET_PREFIX}/ota/metadata.json"
 METADATA_TMP=$(mktemp)
 PAYLOAD_TMP=$(mktemp)
-DEVICE_URL="${DEVICE_URL:-https://storage.googleapis.com/${GCS_BUCKET}/${GCS_PATH}}"
+DEVICE_URL="${DEVICE_URL:-$(ota_public_url "${GCS_PATH}")}"
 
 echo "========== Fetch metadata from gs://${GCS_BUCKET}/${METADATA_PATH} =========="
 if ota_metadata_fetch "gs://${GCS_BUCKET}/${METADATA_PATH}" "$METADATA_TMP" 2>/dev/null; then

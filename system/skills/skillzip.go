@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,28 +13,33 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"go.autonomous.ai/os/system/lib/otamirror"
 )
 
 // FetchSkillVersions returns skill name -> version from OTA metadata; (nil, nil) if unprovisioned.
+// An OTA storage URL is tried on the CDN first, then on the storage host.
 func FetchSkillVersions(otaMetadataURL string) (map[string]string, error) {
 	if strings.TrimSpace(otaMetadataURL) == "" {
 		return nil, nil
 	}
-	resp, err := http.Get(otaMetadataURL)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
-	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
+	// A reply that is not JSON (an HTML page, a cut body) moves on to the next host.
 	var meta map[string]json.RawMessage
-	if err := json.Unmarshal(body, &meta); err != nil {
-		return nil, err
+	var errs []error
+	for _, u := range otamirror.Candidates(otaMetadataURL) {
+		b, err := fetchMetadataBody(u)
+		if err == nil {
+			meta = nil
+			if err = json.Unmarshal(b, &meta); err == nil {
+				break
+			}
+			err = fmt.Errorf("%s: metadata is not JSON: %w", u, err)
+		}
+		meta = nil
+		errs = append(errs, err)
+	}
+	if meta == nil {
+		return nil, errors.Join(errs...)
 	}
 	raw, ok := meta["skills"]
 	if !ok {
@@ -52,8 +58,37 @@ func FetchSkillVersions(otaMetadataURL string) (map[string]string, error) {
 	return result, nil
 }
 
+func fetchMetadataBody(url string) ([]byte, error) {
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	return io.ReadAll(resp.Body)
+}
+
 // DownloadToTempFile fetches url into a temp file; the caller removes it.
+// An OTA storage URL is tried on the CDN first, then on the storage host.
 func DownloadToTempFile(url, pattern string) (string, error) {
+	var errs []error
+	for _, u := range otamirror.Candidates(url) {
+		name, err := downloadOnce(u, pattern)
+		if err == nil {
+			return name, nil
+		}
+		errs = append(errs, err)
+	}
+	if len(errs) == 0 {
+		return "", fmt.Errorf("empty url")
+	}
+	return "", errors.Join(errs...)
+}
+
+func downloadOnce(url, pattern string) (string, error) {
 	client := &http.Client{Timeout: 60 * time.Second}
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {

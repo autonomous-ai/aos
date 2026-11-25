@@ -455,6 +455,11 @@ upload-lamp-os:
 upload-hal:
 	bash scripts/release/upload-hal.sh
 
+# Copy the pinned third-party tools devices download (uv, Node, agent CLIs) to the CDN mirror.
+.PHONY: upload-mirror
+upload-mirror:
+	bash scripts/release/upload-mirror.sh
+
 upload-claude-desktop-buddy:
 	bash scripts/release/upload-claude-desktop-buddy.sh
 

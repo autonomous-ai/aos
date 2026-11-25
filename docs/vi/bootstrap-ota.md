@@ -338,6 +338,13 @@ nhưng nằm cùng thư mục `/root/config/`.
 5m, `state_file`), nên file một phần (chỉ có `metadata_url`) vẫn chạy được, và
 file thiếu thì dùng default với URL rỗng.
 
+`metadata_url` nằm trong kho OTA được chuyển sang CDN phục vụ cùng các file đó
+(`https://cdn.autonomous.ai/<path>`): bootstrap dùng URL CDN và ghi lại một lần
+riêng khóa này trong file, giữ nguyên mọi khóa khác, để os-server, tải skill và
+việc refresh updater đi theo. Biến môi trường `OTA_METADATA_URL` trên service
+bootstrap thay `metadata_url` chỉ cho tiến trình đó và không bao giờ được ghi
+lại. Xem [Tải file trên mạng bị chặn](#tải-file-trên-mạng-bị-chặn).
+
 Khi được truyền vào, `setup.sh` và image builder lưu `OTA_SIGNING_PUBLIC_KEY`
 thành `signing_public_key`. Khi đó Bootstrap xác thực envelope trước khi đọc
 component; updater được provision xác thực lần nữa và hash mọi ZIP trước khi
@@ -907,7 +914,9 @@ worker gọi script này để thực hiện cập nhật.
 
 Khi cài đặt, script đọc URL metadata OTA từ `metadata_url` trong `/root/config/bootstrap.json`
 (biến môi trường `OTA_METADATA_URL` nếu set sẽ override, dùng cho chạy thủ công/debug),
-và exit lỗi nếu cả hai đều rỗng — không có URL hardcode.
+và exit lỗi nếu cả hai đều rỗng — không có URL hardcode. Mọi lượt tải thử bản
+trên CDN trước, rồi kho OTA, và tải tiếp khi bị ngắt; xem
+[Tải file trên mạng bị chặn](#tải-file-trên-mạng-bị-chặn).
 
 ### Update bị gián đoạn và binary core
 
@@ -976,9 +985,11 @@ máy cũ có thể mang uv cũ hơn:
 
 Cả hai trường hợp sync đều lỗi và máy vẫn ở HAL cũ. Khi uv tìm được bị thiếu
 hoặc cũ hơn mức tối thiểu, updater dùng `/usr/local/lib/autonomous/uv/uv` nếu
-bản đó đủ mới. Nếu không, nó cài uv ghim sẵn (`HAL_UV_PIN`, 0.12.23) vào đó
-bằng bộ cài của astral cho đúng bản này, với `UV_UNMANAGED_INSTALL`: không ghi
-receipt và không sửa PATH. uv có sẵn của máy giữ nguyên. Nếu cài lỗi, cập nhật
+bản đó đủ mới. Nếu không, nó cài uv ghim sẵn (`HAL_UV_PIN`, 0.12.23) vào đó:
+trước hết là file release từ mirror trên CDN hoặc từ vendor, phải khớp sha256
+ghim trong `MIRROR_PINS`, sau đó là bộ
+cài của astral cho đúng bản này, với `UV_UNMANAGED_INSTALL`: không ghi receipt
+và không sửa PATH. uv có sẵn của máy giữ nguyên. Nếu cài lỗi, cập nhật
 dừng trước khi HAL bị dừng.
 
 Trước khi dừng HAL, script chọn Python extras theo `DEVICE_TYPE` trong `/opt/hal/.env`, fallback sang
@@ -1358,6 +1369,154 @@ Version của HAL là file text `hal/VERSION_HAL` (cài thành `/opt/hal/VERSION
 - [x] **Đóng gói HAL**: Tạo venv trên thiết bị qua `uv sync --python 3.12 --extra hardware`, thêm `--extra reachy` cho Reachy Mini hoặc `--extra aec --extra pipecat` cho thiết bị khác. OTA tạo venv mới bằng cache dùng chung, giữ `.env` và runtime cũ để rollback.
 - [x] **Display driver**: DisplayService (GC9A01) là một phần của HAL Python tại `hal/drivers/display/display_service.py`.
 - [x] **HAL config**: Dựa trên biến môi trường (`config.py` đọc env vars). Hỗ trợ file `.env` qua `python-dotenv`. Không cần config file riêng.
+
+## Tải file trên mạng bị chặn
+
+Thiết bị ở mạng chặn host lưu trữ, Python package index, GitHub hoặc vendor khác
+vẫn cập nhật được. Mỗi lượt tải có một danh sách nguồn theo thứ tự; thiết bị lấy
+nguồn đầu tiên có phản hồi qua được các bước kiểm tra dưới đây, và nguồn của
+vendor vẫn nằm trong danh sách.
+
+### File OTA: CDN trước
+
+`https://cdn.autonomous.ai` phục vụ kho OTA y nguyên từng byte (cùng object, cùng
+ETag, hỗ trợ range). Script release ghi URL CDN vào metadata cho kho mặc định
+(`ota_public_url` trong `scripts/release/ota-config.sh`; bucket khác giữ URL lưu
+trữ, `OTA_PUBLIC_BASE` để override). `scripts/provision/install.sh` mặc định
+dùng URL metadata trên CDN.
+
+Thiết bị đang giữ URL lưu trữ tải cùng các file đó theo cách này:
+
+| Thành phần | Thứ tự | Phản hồi được nhận khi |
+|---|---|---|
+| bootstrap (`system/bootstrap/config`) | chuyển `metadata_url` trỏ vào kho lưu trữ sang CDN và ghi lại một lần, giữ lock cập nhật và giữ mọi khóa khác; `OTA_METADATA_URL` override mà không ghi | — |
+| bootstrap tải metadata | CDN, rồi kho lưu trữ; 60 s mỗi request | chữ ký khớp khóa đã cấp; không có khóa thì là object JSON |
+| bootstrap tải updater | CDN, rồi kho lưu trữ | bắt đầu bằng `#!` và qua `bash -n` |
+| os-server (`otaMetadataURLFromBootstrap`) | đổi URL sang CDN, nên base của skill và hook đi theo | — |
+| tải skill và role skill (`system/skills`) | CDN, rồi kho lưu trữ | metadata là JSON |
+| file hook của openclaw (`HOOK.md`, `handler.ts`) | CDN, rồi kho lưu trữ | không phải trang HTML, không rỗng, tối đa 1 MiB |
+| software-update: metadata | CDN, rồi kho lưu trữ (`ota_url_candidates`) | object JSON, và có chữ ký khớp khóa khi thiết bị có khóa |
+| software-update: file component | CDN, rồi kho lưu trữ | sha256 trong metadata |
+
+Phản hồi không qua kiểm tra (trang HTML của captive portal, nội dung bị cắt) thì
+chuyển sang nguồn kế tiếp.
+
+Việc đổi chỉ là đổi host (`system/lib/otamirror`); host và bucket khác dùng
+nguyên như cũ.
+
+### Tải tiếp được
+
+`software-update` tải bằng `curl -C -`. Mỗi lần thử có giới hạn
+(`OTA_DOWNLOAD_MAX_TIME`, 600 s, và dừng khi dưới 1 KB/s trong 60 s); lượt tải bị
+ngắt được tải tiếp khi mỗi lần thử còn thêm byte, tối đa `OTA_DOWNLOAD_ATTEMPTS`
+(30) lần. Sai checksum thì chuyển sang nguồn kế tiếp. Snapshot tiến độ báo đủ
+kích thước khi response là 206.
+
+### Vùng
+
+`software-update` đọc vùng của thiết bị từ `region` trong
+`/root/config/config.json` (os-server lưu từ phản hồi của cloud; không có nghĩa
+là "không phải CN"). `OTA_REGION` override giá trị này. Vùng chỉ đổi thứ tự các
+nguồn.
+
+### Dependency của HAL: wheelhouse
+
+Bản release HAL có thể publish một wheelhouse: mọi wheel thiết bị cài cho một
+nền tảng, build từ cùng `uv.lock`. Metadata liệt kê nó trong `hal.wheelhouse`:
+
+```json
+"hal": {
+  "wheelhouse": {
+    "linux-aarch64-aec": {"url": "https://cdn.autonomous.ai/os/ota/hal/wheelhouse/linux-aarch64-aec-<sha256>.tar.gz",
+                          "sha256": "<sha256 của file nén>", "lock_sha256": "<sha256 của hal/uv.lock>"}
+  }
+}
+```
+
+Khóa là `linux-<uname -m>-<extra>` (`aec`, hoặc `reachy` trên Reachy Mini).
+Thiết bị chỉ dùng khi `lock_sha256` khớp `uv.lock` của HAL đang stage. Khi đó nó
+tạo `.venv` bằng Python 3.12 có sẵn trên máy, chạy
+`uv pip install --offline --no-index --find-links <wheels> -r requirements.txt`
+rồi cài project dạng editable, giống `uv sync`.
+
+Wheelhouse được tải, kiểm sha256 và giải nén trong lúc HAL vẫn chạy; sau khi HAL
+dừng chỉ còn bước cài offline. Trước khi tải, thiết bị kiểm dung lượng trống đủ
+cho file nén, bản giải nén và 512 MB dự phòng (`HAL_WHEELHOUSE_MARGIN_MB`), nếu
+không đủ thì bỏ qua wheelhouse và ghi log. Bản giải nén được giữ ở
+`/opt/.hal-wheelhouse/<sha256>` (tải dở thì lần chạy sau tải tiếp; chỉ giữ bản
+mới nhất), nên bản HAL cùng lock không phải tải thêm gì. Ở thứ tự dự phòng, thiết
+bị có `uv sync` lỗi mà chưa có wheelhouse trên đĩa sẽ tải nó trước khi dừng HAL ở
+lần cập nhật sau.
+
+| Vùng | Thứ tự (`HAL_WHEELHOUSE` override: `first`, `fallback`, `off`) |
+|---|---|
+| CN | wheelhouse, rồi `uv sync` |
+| khác hoặc chưa biết | `uv sync`, rồi wheelhouse nếu sync lỗi |
+
+Cách build (cho người phát hành): `make upload-hal` chạy `scripts/release/build_hal_wheelhouse.py` khi
+wheelhouse đã publish được build từ `uv.lock` khác (`HAL_WHEELHOUSE=auto`; `1`
+luôn build, `0` không build; ở auto, build lỗi chỉ cảnh báo). Builder chọn wheel
+từ registry cho Linux aarch64 CPython 3.12 (glibc tối đa 2.35, `--glibc`), tải
+wheel URL trực tiếp, build nguồn git thành wheel, và compile các gói chỉ có sdist
+trong container Python 3.12 `linux/arm64` (Docker). Xem trước, không tải gì:
+
+```bash
+uv run --no-project --python 3.12 --with packaging \
+  python3 scripts/release/build_hal_wheelhouse.py --dry-run
+```
+
+### Công cụ bên thứ ba: mirror trên CDN
+
+`scripts/release/upload-mirror.sh` (`make upload-mirror`, `--dry-run` để xem
+trước) chép nguyên file của vendor vào `<prefix>/mirror/` trong kho OTA, phục vụ
+tại `https://cdn.autonomous.ai/os/mirror/`. `OS_MIRROR_BASE` override base trên
+thiết bị.
+
+Mọi file trên mirror đều có sha256 ghim trong repo: `MIRROR_PINS` trong
+`scripts/provision/software-update`, và cùng các dòng đó trong
+`runtimes/*/install.sh` nào tải file. Thiết bị chỉ lấy file từ mirror khi phiên
+bản đó có pin, và cả bản trên mirror lẫn bản của vendor phải khớp pin trước khi
+được giải nén, chạy hay cài. Phiên bản không có pin chỉ tải từ vendor.
+`upload-mirror.sh` từ chối file tải về khác pin đang có và in ra các dòng pin
+(`--digests` chỉ in, không upload), nên lần nâng phiên bản và pin đi cùng một
+thay đổi; `scripts/release/tests/test_mirror_pins.py` lỗi khi một phiên bản
+đã ghim không có digest. `make upload-codex`, `upload-opencode`,
+`upload-picoclaw`, `upload-hermes`, `upload-device` và `upload-setup` dừng trước
+khi publish nếu file chúng ghim chưa có trên mirror CDN, và in ra lệnh
+`make upload-mirror` để chép file đó (`scripts/release/mirror-check.sh`).
+
+| Công cụ | Đường dẫn mirror | Thứ tự trên thiết bị (khi có pin) |
+|---|---|---|
+| uv `HAL_UV_PIN` | `uv/<ver>/uv-<triple>.tar.gz` | mirror, rồi file release, rồi bộ cài astral |
+| Node (`NODE_MIRROR_DEB`) | `node/<deb>` | CN: mirror hoặc file .deb của vendor, rồi apt setup của vendor; vùng khác: ngược lại |
+| Codex | `codex/<ver>/codex-<triple>.tar.gz` | mirror, rồi GitHub releases |
+| PicoClaw | `picoclaw/<tag>/picoclaw-linux-arm64` | mirror, rồi GitHub releases |
+| OpenCode | `opencode/<ver>/opencode-linux-<arch>.tar.gz` | mirror, rồi GitHub releases (không pin: bộ cài của vendor) |
+| yq | `yq/v4.46.1/yq_linux_<arch>` | mirror, rồi GitHub releases |
+| Bộ cài Hermes ghim commit | `hermes/<commit>/install.sh` | mirror, rồi GitHub |
+
+Phiên bản lấy từ metadata và từ các pin trong `runtimes/*/install.sh`.
+
+openclaw lấy từ registry npm mặc định. Ở vùng CN `software-update` dùng
+`OTA_NPM_MIRROR` (`https://registry.npmmirror.com`) thay thế, và
+`OTA_NPM_REGISTRY` chọn registry trên mọi thiết bị. Registry đó chỉ được truyền
+cho các lệnh npm của openclaw (`npm --registry`), và chỉ cho phiên bản có
+`openclaw.integrity` trong metadata, tức `dist.integrity` của registry mặc định
+do `make upload-openclaw` ghi vào. Tarball được tải bằng `npm pack`, so với giá
+trị đó, rồi cài từ file; plugin discord và slack chỉ cài từ registry đó khi nó
+báo đúng integrity trong `openclaw.plugins`. Không có các giá trị này, hoặc ngoài
+CN và không override, thì dùng registry mặc định.
+
+Vẫn cần vendor: checkout Hermes và các gói Python của nó, bộ cài Claude Code,
+lần đầu tải Python do uv quản lý, và các gói apt.
+
+### Mỗi file lên CDN từ đâu (cho người phát hành)
+
+| File | Chép lên CDN bằng |
+|---|---|
+| `os/ota/metadata.json`, `os/software-update`, ZIP component, skill | target `make upload-*` tương ứng (CDN phục vụ kho OTA) |
+| HAL wheelhouse (`hal.wheelhouse`) | `make upload-hal` |
+| `os/mirror/…` (bảng trên) | `make upload-mirror` |
 
 ---
 

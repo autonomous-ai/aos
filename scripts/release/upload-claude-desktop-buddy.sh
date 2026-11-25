@@ -42,7 +42,7 @@ ZIP_SHA256=$(ota_artifact_sha256 "$ZIP_PATH")
 METADATA_PATH="${BUCKET_PREFIX}/ota/metadata.json"
 METADATA_TMP=$(mktemp)
 PAYLOAD_TMP=$(mktemp)
-BUDDY_URL="${BUDDY_URL:-https://storage.googleapis.com/${GCS_BUCKET}/${GCS_PATH}}"
+BUDDY_URL="${BUDDY_URL:-$(ota_public_url "${GCS_PATH}")}"
 
 echo "========== Fetch metadata from gs://${GCS_BUCKET}/${METADATA_PATH} =========="
 if ota_metadata_fetch "gs://${GCS_BUCKET}/${METADATA_PATH}" "$METADATA_TMP" 2>/dev/null; then

@@ -15,6 +15,28 @@ OPENCODE_BIN="/usr/local/bin/opencode"
 # Latest published tag as of this build; see https://github.com/anomalyco/opencode/releases for
 # newer.
 OPENCODE_VERSION="${OPENCODE_VERSION:-1.18.4}"
+# The CDN mirror holds the vendor's release archive; the official installer is the fallback.
+OS_MIRROR_BASE="${OS_MIRROR_BASE:-https://cdn.autonomous.ai/os/mirror}"
+# sha256 of the files this installer may take from the mirror ("<path> <sha256>"),
+# the same values as MIRROR_PINS in software-update. A file without a pin comes
+# from its vendor as before; a pinned file must match from the mirror or the vendor.
+MIRROR_PINS='
+opencode/1.18.4/opencode-linux-arm64.tar.gz eba87efba3976d533a24cca0316f8ef375b5f8e797c0a95c25ee919700b7ba35
+opencode/1.18.4/opencode-linux-x64.tar.gz bab463c3fb3224d388bb7cfad63f38703df9cf0be2cfd2ce8cb49d886b53a174
+'
+mirror_pin() { printf '%s\n' "$MIRROR_PINS" | awk -v k="$1" '$1 == k { print $2; exit }'; }
+# fetch_pinned <dest> <sha256> <url>...: the first URL whose download matches the digest.
+fetch_pinned() {
+  local dest="$1" digest="$2" url
+  shift 2
+  for url in "$@"; do
+    if curl -fsSL "$url" -o "$dest" && echo "$digest  $dest" | sha256sum -c - >/dev/null 2>&1; then
+      return 0
+    fi
+    rm -f "$dest"
+  done
+  return 1
+}
 
 echo "[install-opencode] prerequisites (jq, curl, tar)"
 apt-get update || true
@@ -27,8 +49,26 @@ if [ -x "$OPENCODE_BIN" ] && "$OPENCODE_BIN" --version 2>/dev/null | grep -qw "$
   echo "[install-opencode] opencode ${WANT_VERSION} already installed at $OPENCODE_BIN — skipping download"
 else
   echo "[install-opencode] install opencode CLI ${WANT_VERSION} → /usr/local/bin"
-  curl -fsSL https://opencode.ai/install \
-    | OPENCODE_INSTALL_DIR=/usr/local/bin bash -s -- --version "$WANT_VERSION"
+  case "$(uname -m)" in
+    aarch64|arm64) OC_ASSET="opencode-linux-arm64.tar.gz" ;;
+    x86_64)        OC_ASSET="opencode-linux-x64.tar.gz" ;;
+    *)             OC_ASSET="" ;;
+  esac
+  OC_SHA256=""
+  [ -z "$OC_ASSET" ] || OC_SHA256="$(mirror_pin "opencode/${WANT_VERSION}/${OC_ASSET}")"
+  OC_TMP="$(mktemp -d)"
+  if [ -n "$OC_SHA256" ]; then
+    # Pinned release archive from the mirror or the vendor; it must match before it is unpacked.
+    fetch_pinned "$OC_TMP/$OC_ASSET" "$OC_SHA256" "${OS_MIRROR_BASE}/opencode/${WANT_VERSION}/${OC_ASSET}" \
+      "https://github.com/anomalyco/opencode/releases/download/v${WANT_VERSION}/${OC_ASSET}"
+    tar -xzf "$OC_TMP/$OC_ASSET" -C "$OC_TMP"
+    install -m 0755 "$OC_TMP/opencode" "$OPENCODE_BIN"
+    echo "[install-opencode] installed opencode ${WANT_VERSION} (pinned archive)"
+  else
+    curl -fsSL https://opencode.ai/install \
+      | OPENCODE_INSTALL_DIR=/usr/local/bin bash -s -- --version "$WANT_VERSION"
+  fi
+  rm -rf "$OC_TMP"
 fi
 # Belt-and-suspenders: if the installer ignored OPENCODE_INSTALL_DIR (its behavior has drifted
 # before), locate the binary it produced and copy it into /usr/local/bin so the systemd unit +

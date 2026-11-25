@@ -1,13 +1,12 @@
 package bootstrap
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
-	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
@@ -143,38 +142,29 @@ func (b *Bootstrap) refreshUpdater(ctx context.Context) bool {
 	return true
 }
 
-// fetchUpdater downloads the published script, size-capped against captive portals.
+// fetchUpdater downloads the published script (CDN copy first, then the bucket),
+// size-capped against captive portals.
 func (b *Bootstrap) fetchUpdater(ctx context.Context, src string) ([]byte, error) {
-	const maxUpdaterBytes = 1 << 20 // 1 MiB; the real script is ~40 KB
+	const maxUpdaterBytes = 1 << 20 // 1 MiB; the real script is ~100 KB
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, src, nil)
-	if err != nil {
-		return nil, fmt.Errorf("build request: %w", err)
-	}
 	// The updater is republished in place; a cached copy would hide the fix.
-	req.Header.Set("Cache-Control", "no-cache")
+	return b.fetchFirst(ctx, otaMirror.Candidates(src), maxUpdaterBytes, true, func(data []byte) ([]byte, error) {
+		return data, checkUpdaterScript(ctx, data)
+	})
+}
 
-	resp, err := b.client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("fetch %s: %w", src, err)
+// checkUpdaterScript rejects a reply that is not a bash script: it must start
+// with a shebang and pass bash -n.
+func checkUpdaterScript(ctx context.Context, data []byte) error {
+	if !bytes.HasPrefix(data, []byte("#!")) {
+		return errors.New("updater does not start with #!")
 	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("fetch %s: status %s", src, resp.Status)
+	cmd := exec.CommandContext(ctx, "bash", "-n", "/dev/stdin")
+	cmd.Stdin = bytes.NewReader(data)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("updater failed bash -n: %w: %s", err, out)
 	}
-
-	data, err := io.ReadAll(io.LimitReader(resp.Body, maxUpdaterBytes+1))
-	if err != nil {
-		return nil, fmt.Errorf("read %s: %w", src, err)
-	}
-	if len(data) > maxUpdaterBytes {
-		return nil, fmt.Errorf("fetch %s: larger than %d bytes", src, maxUpdaterBytes)
-	}
-	if len(data) == 0 {
-		return nil, fmt.Errorf("fetch %s: empty body", src)
-	}
-	return data, nil
+	return nil
 }
 
 // installUpdater validates the script and installs it atomically.

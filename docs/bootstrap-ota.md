@@ -343,6 +343,14 @@ file is loaded as an overlay on operational defaults (`httpPort` 8080,
 `poll_interval` 5m, `state_file`), so a partial file (just `metadata_url`) works
 and a missing file yields defaults with an empty URL.
 
+A `metadata_url` in the OTA storage is moved to the CDN that serves the same
+files (`https://cdn.autonomous.ai/<path>`): bootstrap uses the CDN URL and
+rewrites only that key in this file once, keeping every other key, so os-server,
+skill downloads and the updater refresh follow. An `OTA_METADATA_URL`
+environment variable on the bootstrap service replaces `metadata_url` for that
+process only and is never written back. See
+[Downloads on restricted networks](#downloads-on-restricted-networks).
+
 When supplied, `setup.sh` and golden-image builders persist
 `OTA_SIGNING_PUBLIC_KEY` as `signing_public_key`. Bootstrap then verifies the
 envelope before reading any component; the provisioned updater verifies it
@@ -938,7 +946,9 @@ Called by bootstrap worker to apply updates.
 
 For installation, it reads the OTA metadata URL from `metadata_url` in `/root/config/bootstrap.json`
 (an explicit `OTA_METADATA_URL` env var overrides it for manual/debug runs), and
-aborts with an error if neither is set — no compiled-in URL.
+aborts with an error if neither is set — no compiled-in URL. Every download tries
+the CDN copy first and the OTA storage second, and resumes after an interruption;
+see [Downloads on restricted networks](#downloads-on-restricted-networks).
 
 ### Interrupted updates and core binaries
 
@@ -1009,7 +1019,8 @@ Older images can ship an older uv:
 Either way the sync fails, and the device stays on its old HAL. When the found
 uv is missing or older than the floor, the updater uses `/usr/local/lib/autonomous/uv/uv`
 if that one is new enough. Otherwise it installs the pinned uv (`HAL_UV_PIN`,
-0.12.23) there with astral's installer for that version and
+0.12.23) there: first the release archive from the CDN mirror or the vendor,
+which must match the sha256 pinned in `MIRROR_PINS`, then astral's installer for that version with
 `UV_UNMANAGED_INSTALL`, which writes no receipt and changes no PATH. The device's
 own uv is left as it is. A failed install stops the update before HAL is stopped.
 
@@ -1397,6 +1408,160 @@ HAL version is the plain text file `hal/VERSION_HAL` (installed as `/opt/hal/VER
 - [x] **HAL packaging**: On-device venv via `uv sync --python 3.12 --extra hardware` plus `--extra reachy` for Reachy Mini or `--extra aec --extra pipecat` for other devices. OTA builds a fresh venv using the shared cache, preserves `.env`, and retains the old runtime for rollback.
 - [x] **Display driver**: DisplayService (GC9A01) is part of HAL Python at `hal/drivers/display/display_service.py`.
 - [x] **HAL config**: Environment variable-based (`config.py` reads from env vars). `.env` file support via `python-dotenv`. No separate config file needed.
+
+## Downloads on restricted networks
+
+A device on a network that blocks the storage host, the Python package index,
+GitHub or other vendors still updates. Each download has an ordered list of
+sources; the device takes the first source whose reply passes the checks below,
+and the vendor source stays in the list.
+
+### OTA files: CDN first
+
+`https://cdn.autonomous.ai` serves the OTA storage byte for byte (same object,
+same ETag, ranges supported). Release scripts write CDN URLs into the metadata
+for the default storage (`ota_public_url` in `scripts/release/ota-config.sh`;
+any other bucket keeps its storage URL, `OTA_PUBLIC_BASE` overrides).
+`scripts/provision/install.sh` defaults to the CDN metadata URL.
+
+A device that holds a storage URL fetches the same files this way:
+
+| Reader | Order | Reply accepted when |
+|---|---|---|
+| bootstrap (`system/bootstrap/config`) | moves a storage `metadata_url` to the CDN and writes it back once, under the update lock and keeping every other key; `OTA_METADATA_URL` overrides without writing | — |
+| bootstrap metadata fetch | CDN, then storage; 60 s per request | signature verifies with the provisioned key; without a key, a JSON object |
+| bootstrap updater fetch | CDN, then storage | starts with `#!` and passes `bash -n` |
+| os-server (`otaMetadataURLFromBootstrap`) | maps the URL to the CDN, so skill and hook bases follow | — |
+| skill and role-skill downloads (`system/skills`) | CDN, then storage | metadata is JSON |
+| openclaw hook files (`HOOK.md`, `handler.ts`) | CDN, then storage | not an HTML page, not empty, at most 1 MiB |
+| software-update metadata | CDN, then storage (`ota_url_candidates`) | a JSON object, and signed with the provisioned key when one is set |
+| software-update component files | CDN, then storage | the metadata's sha256 |
+
+A reply that fails its check (an HTML page from a captive portal, a cut body)
+moves on to the next source.
+
+The mapping is a host swap only (`system/lib/otamirror`); other hosts and
+buckets are used as given.
+
+### Resumable downloads
+
+`software-update` downloads with `curl -C -`. Each attempt is bounded
+(`OTA_DOWNLOAD_MAX_TIME`, 600 s, and aborted below 1 KB/s for 60 s); an
+interrupted transfer resumes while each attempt adds bytes, up to
+`OTA_DOWNLOAD_ATTEMPTS` (30). A checksum mismatch moves to the next source. The
+progress snapshot reports the full size of a resumed (206) response.
+
+### Region
+
+`software-update` reads the device region from `region` in
+`/root/config/config.json` (stored by os-server from the cloud reply; absent
+means "not CN"). `OTA_REGION` overrides it. Only the order of sources changes by
+region.
+
+### HAL dependencies: wheelhouse
+
+The HAL release can publish a wheelhouse: every wheel the device installs for
+one platform, built from the same `uv.lock`. The metadata lists it under
+`hal.wheelhouse`:
+
+```json
+"hal": {
+  "wheelhouse": {
+    "linux-aarch64-aec": {"url": "https://cdn.autonomous.ai/os/ota/hal/wheelhouse/linux-aarch64-aec-<sha256>.tar.gz",
+                          "sha256": "<archive sha256>", "lock_sha256": "<sha256 of hal/uv.lock>"}
+  }
+}
+```
+
+The key is `linux-<uname -m>-<extra>` (`aec`, or `reachy` on Reachy Mini). The
+device uses it only when `lock_sha256` matches the staged HAL's `uv.lock`. It
+then creates `.venv` with Python 3.12 already on the device and runs
+`uv pip install --offline --no-index --find-links <wheels> -r requirements.txt`
+and the editable project install, as `uv sync` would.
+
+The wheelhouse is downloaded, checked against its sha256 and unpacked while HAL
+is still running; only the offline install runs after HAL stops. Before the
+download the device checks free space for the archive, its unpacked copy and a
+512 MB margin (`HAL_WHEELHOUSE_MARGIN_MB`), and skips the wheelhouse with a log
+line when it does not fit. The unpacked copy is kept in
+`/opt/.hal-wheelhouse/<sha256>` (partial downloads resume across runs; only the
+newest is kept), so a HAL release with the same lock downloads nothing more. In
+the fallback order, a device whose `uv sync` failed with no wheelhouse on disk
+downloads it before HAL stops on its next update.
+
+| Region | Order (`HAL_WHEELHOUSE` overrides: `first`, `fallback`, `off`) |
+|---|---|
+| CN | wheelhouse, then `uv sync` |
+| other or unknown | `uv sync`, then the wheelhouse if it failed |
+
+Building it (maintainers): `make upload-hal` runs `scripts/release/build_hal_wheelhouse.py`
+when the published wheelhouse was built from another `uv.lock`
+(`HAL_WHEELHOUSE=auto`; `1` always, `0` never; a failed build in auto mode only
+warns). The builder picks registry wheels for Linux aarch64 CPython 3.12 (glibc
+up to 2.35, `--glibc`), downloads direct wheel URLs, builds git sources into a
+wheel, and compiles sdist-only packages in a `linux/arm64` Python 3.12 container
+(Docker). Preview without downloading:
+
+```bash
+uv run --no-project --python 3.12 --with packaging \
+  python3 scripts/release/build_hal_wheelhouse.py --dry-run
+```
+
+### Third-party tools: CDN mirror
+
+`scripts/release/upload-mirror.sh` (`make upload-mirror`, `--dry-run` to
+preview) copies vendor files unchanged to `<prefix>/mirror/` in the OTA storage,
+served at `https://cdn.autonomous.ai/os/mirror/`. `OS_MIRROR_BASE` overrides the
+base on the device.
+
+Every mirrored file has its sha256 pinned in the repo: `MIRROR_PINS` in
+`scripts/provision/software-update`, and the same lines in the
+`runtimes/*/install.sh` that download it. The device takes a file from the
+mirror only when its version has a pin, and the mirror copy and the vendor copy
+must both match that pin before the file is unpacked, run or installed. A
+version without a pin downloads only from its vendor.
+`upload-mirror.sh` refuses a download that differs from an existing pin and
+prints the pin lines (`--digests` prints them without uploading), so a version
+bump and its pins go in the same change; `scripts/release/tests/test_mirror_pins.py`
+fails when a pinned version has no digest. `make upload-codex`, `upload-opencode`,
+`upload-picoclaw`, `upload-hermes`, `upload-device` and `upload-setup` stop
+before publishing when a file they pin is not on the CDN mirror yet, and name
+the `make upload-mirror` command that copies it (`scripts/release/mirror-check.sh`).
+
+| Tool | Mirror path | Device order (with a pin) |
+|---|---|---|
+| uv `HAL_UV_PIN` | `uv/<ver>/uv-<triple>.tar.gz` | mirror, then the release archive, then astral's installer |
+| Node (`NODE_MIRROR_DEB`) | `node/<deb>` | CN: mirror or the vendor's .deb, then the vendor apt setup; other: the reverse |
+| Codex | `codex/<ver>/codex-<triple>.tar.gz` | mirror, then GitHub releases |
+| PicoClaw | `picoclaw/<tag>/picoclaw-linux-arm64` | mirror, then GitHub releases |
+| OpenCode | `opencode/<ver>/opencode-linux-<arch>.tar.gz` | mirror, then GitHub releases (no pin: the vendor installer) |
+| yq | `yq/v4.46.1/yq_linux_<arch>` | mirror, then GitHub releases |
+| Hermes pinned installer | `hermes/<commit>/install.sh` | mirror, then GitHub |
+
+Versions come from the metadata and from the pins in `runtimes/*/install.sh`.
+
+openclaw comes from the default npm registry. In region CN `software-update`
+uses `OTA_NPM_MIRROR` (`https://registry.npmmirror.com`) instead, and
+`OTA_NPM_REGISTRY` selects a registry on any device. That registry is passed to
+the openclaw npm commands only (`npm --registry`), and only for a version whose
+metadata carries `openclaw.integrity`, the default registry's `dist.integrity`
+written by `make upload-openclaw`. The package tarball is fetched with
+`npm pack`, compared with that value, and installed from the file; the discord
+and slack plugins install from that registry only when it reports the integrity
+in `openclaw.plugins`. Without these values, or outside CN with no override, the
+default registry is used.
+
+Still needing the vendor: the Hermes checkout and its Python packages, the
+Claude Code installer, a first-time uv-managed Python download, and apt
+packages.
+
+### Where each file comes from (maintainers)
+
+| File | Copied to the CDN by |
+|---|---|
+| `os/ota/metadata.json`, `os/software-update`, component ZIPs, skills | the matching `make upload-*` target (the CDN serves the OTA storage) |
+| HAL wheelhouse (`hal.wheelhouse`) | `make upload-hal` |
+| `os/mirror/…` (table above) | `make upload-mirror` |
 
 ---
 

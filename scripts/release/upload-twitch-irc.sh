@@ -42,7 +42,7 @@ gsutil -h "Cache-Control:no-cache, no-store, must-revalidate" cp "$ZIP_PATH" "gs
 METADATA_PATH="${BUCKET_PREFIX}/ota/metadata.json"
 METADATA_TMP=$(mktemp)
 PAYLOAD_TMP=$(mktemp)
-BACKEND_URL="${BACKEND_URL:-https://storage.googleapis.com/${GCS_BUCKET}/${GCS_PATH}}"
+BACKEND_URL="${BACKEND_URL:-$(ota_public_url "${GCS_PATH}")}"
 
 echo "========== Fetch metadata from gs://${GCS_BUCKET}/${METADATA_PATH} =========="
 if ota_metadata_fetch "gs://${GCS_BUCKET}/${METADATA_PATH}" "$METADATA_TMP" 2>/dev/null; then
