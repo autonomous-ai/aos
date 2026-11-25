@@ -1412,9 +1412,9 @@ HAL version is the plain text file `hal/VERSION_HAL` (installed as `/opt/hal/VER
 ## Downloads on restricted networks
 
 A device on a network that blocks the storage host, the Python package index,
-GitHub or other vendors must still update. All of the following keep today's
-behaviour as the fallback, so a device that can reach the vendors updates as
-before.
+GitHub or other vendors still updates. Each download has an ordered list of
+sources; the device takes the first source whose reply passes the checks below,
+and the vendor source stays in the list.
 
 ### OTA files: CDN first
 
@@ -1424,15 +1424,21 @@ for the default storage (`ota_public_url` in `scripts/release/ota-config.sh`;
 any other bucket keeps its storage URL, `OTA_PUBLIC_BASE` overrides).
 `scripts/provision/install.sh` defaults to the CDN metadata URL.
 
-Devices already in the field handle storage URLs the same way:
+A device that holds a storage URL fetches the same files this way:
 
-| Reader | What it does |
-|---|---|
-| bootstrap (`system/bootstrap/config`) | moves a storage `metadata_url` to the CDN and writes it back once; `OTA_METADATA_URL` overrides without writing |
-| bootstrap metadata and updater fetch | CDN first, storage second; 60 s per request |
-| os-server (`otaMetadataURLFromBootstrap`) | maps the URL to the CDN, so skill and hook bases follow |
-| skill and role-skill downloads (`system/skills`) | CDN first, storage second |
-| software-update metadata and every file URL in it | CDN first, storage second (`ota_url_candidates`) |
+| Reader | Order | Reply accepted when |
+|---|---|---|
+| bootstrap (`system/bootstrap/config`) | moves a storage `metadata_url` to the CDN and writes it back once, under the update lock and keeping every other key; `OTA_METADATA_URL` overrides without writing | — |
+| bootstrap metadata fetch | CDN, then storage; 60 s per request | signature verifies with the provisioned key; without a key, a JSON object |
+| bootstrap updater fetch | CDN, then storage | starts with `#!` and passes `bash -n` |
+| os-server (`otaMetadataURLFromBootstrap`) | maps the URL to the CDN, so skill and hook bases follow | — |
+| skill and role-skill downloads (`system/skills`) | CDN, then storage | metadata is JSON |
+| openclaw hook files (`HOOK.md`, `handler.ts`) | CDN, then storage | not an HTML page, not empty, at most 1 MiB |
+| software-update metadata | CDN, then storage (`ota_url_candidates`) | a JSON object, and signed with the provisioned key when one is set |
+| software-update component files | CDN, then storage | the metadata's sha256 |
+
+A reply that fails its check (an HTML page from a captive portal, a cut body)
+moves on to the next source.
 
 The mapping is a host swap only (`system/lib/otamirror`); other hosts and
 buckets are used as given.
@@ -1471,16 +1477,24 @@ The key is `linux-<uname -m>-<extra>` (`aec`, or `reachy` on Reachy Mini). The
 device uses it only when `lock_sha256` matches the staged HAL's `uv.lock`. It
 then creates `.venv` with Python 3.12 already on the device and runs
 `uv pip install --offline --no-index --find-links <wheels> -r requirements.txt`
-and the editable project install, as `uv sync` would. The archive is kept in
+and the editable project install, as `uv sync` would.
+
+The wheelhouse is downloaded, checked against its sha256 and unpacked while HAL
+is still running; only the offline install runs after HAL stops. Before the
+download the device checks free space for the archive, its unpacked copy and a
+512 MB margin (`HAL_WHEELHOUSE_MARGIN_MB`), and skips the wheelhouse with a log
+line when it does not fit. The unpacked copy is kept in
 `/opt/.hal-wheelhouse/<sha256>` (partial downloads resume across runs; only the
-newest is kept), so a HAL release with the same lock downloads nothing more.
+newest is kept), so a HAL release with the same lock downloads nothing more. In
+the fallback order, a device whose `uv sync` failed with no wheelhouse on disk
+downloads it before HAL stops on its next update.
 
 | Region | Order (`HAL_WHEELHOUSE` overrides: `first`, `fallback`, `off`) |
 |---|---|
 | CN | wheelhouse, then `uv sync` |
 | other or unknown | `uv sync`, then the wheelhouse if it failed |
 
-Building it: `make upload-hal` runs `scripts/release/build_hal_wheelhouse.py`
+Building it (maintainers): `make upload-hal` runs `scripts/release/build_hal_wheelhouse.py`
 when the published wheelhouse was built from another `uv.lock`
 (`HAL_WHEELHOUSE=auto`; `1` always, `0` never; a failed build in auto mode only
 warns). The builder picks registry wheels for Linux aarch64 CPython 3.12 (glibc
@@ -1505,7 +1519,7 @@ Every mirrored file has its sha256 pinned in the repo: `MIRROR_PINS` in
 `runtimes/*/install.sh` that download it. The device takes a file from the
 mirror only when its version has a pin, and the mirror copy and the vendor copy
 must both match that pin before the file is unpacked, run or installed. A
-version without a pin downloads from its vendor exactly as before.
+version without a pin downloads only from its vendor.
 `upload-mirror.sh` refuses a download that differs from an existing pin and
 prints the pin lines (`--digests` prints them without uploading), so a version
 bump and its pins go in the same change; `scripts/release/tests/test_mirror_pins.py`
@@ -1535,19 +1549,19 @@ written by `make upload-openclaw`. The package tarball is fetched with
 `npm pack`, compared with that value, and installed from the file; the discord
 and slack plugins install from that registry only when it reports the integrity
 in `openclaw.plugins`. Without these values, or outside CN with no override, the
-default registry is used as before.
+default registry is used.
 
 Still needing the vendor: the Hermes checkout and its Python packages, the
 Claude Code installer, a first-time uv-managed Python download, and apt
 packages.
 
-### What must be on the CDN
+### Where each file comes from (maintainers)
 
-| File | Status |
+| File | Copied to the CDN by |
 |---|---|
-| `os/ota/metadata.json`, `os/software-update`, every component ZIP, skills | already served by the CDN |
-| HAL wheelhouse (`hal.wheelhouse`) | published by the next `make upload-hal` |
-| `os/mirror/…` (table above) | published by `make upload-mirror` |
+| `os/ota/metadata.json`, `os/software-update`, component ZIPs, skills | the matching `make upload-*` target (the CDN serves the OTA storage) |
+| HAL wheelhouse (`hal.wheelhouse`) | `make upload-hal` |
+| `os/mirror/…` (table above) | `make upload-mirror` |
 
 ---
 

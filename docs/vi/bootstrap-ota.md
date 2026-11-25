@@ -1373,8 +1373,9 @@ Version của HAL là file text `hal/VERSION_HAL` (cài thành `/opt/hal/VERSION
 ## Tải file trên mạng bị chặn
 
 Thiết bị ở mạng chặn host lưu trữ, Python package index, GitHub hoặc vendor khác
-vẫn phải cập nhật được. Mọi thay đổi dưới đây giữ hành vi hiện tại làm phương án
-dự phòng, nên thiết bị vào được vendor vẫn cập nhật như trước.
+vẫn cập nhật được. Mỗi lượt tải có một danh sách nguồn theo thứ tự; thiết bị lấy
+nguồn đầu tiên có phản hồi qua được các bước kiểm tra dưới đây, và nguồn của
+vendor vẫn nằm trong danh sách.
 
 ### File OTA: CDN trước
 
@@ -1384,15 +1385,21 @@ ETag, hỗ trợ range). Script release ghi URL CDN vào metadata cho kho mặc 
 trữ, `OTA_PUBLIC_BASE` để override). `scripts/provision/install.sh` mặc định
 dùng URL metadata trên CDN.
 
-Thiết bị đã xuất xưởng xử lý URL lưu trữ theo cùng cách:
+Thiết bị đang giữ URL lưu trữ tải cùng các file đó theo cách này:
 
-| Thành phần | Hành vi |
-|---|---|
-| bootstrap (`system/bootstrap/config`) | chuyển `metadata_url` trỏ vào kho lưu trữ sang CDN và ghi lại một lần; `OTA_METADATA_URL` override mà không ghi |
-| bootstrap tải metadata và updater | CDN trước, kho lưu trữ sau; 60 s mỗi request |
-| os-server (`otaMetadataURLFromBootstrap`) | đổi URL sang CDN, nên base của skill và hook đi theo |
-| tải skill và role skill (`system/skills`) | CDN trước, kho lưu trữ sau |
-| software-update: metadata và mọi URL file trong đó | CDN trước, kho lưu trữ sau (`ota_url_candidates`) |
+| Thành phần | Thứ tự | Phản hồi được nhận khi |
+|---|---|---|
+| bootstrap (`system/bootstrap/config`) | chuyển `metadata_url` trỏ vào kho lưu trữ sang CDN và ghi lại một lần, giữ lock cập nhật và giữ mọi khóa khác; `OTA_METADATA_URL` override mà không ghi | — |
+| bootstrap tải metadata | CDN, rồi kho lưu trữ; 60 s mỗi request | chữ ký khớp khóa đã cấp; không có khóa thì là object JSON |
+| bootstrap tải updater | CDN, rồi kho lưu trữ | bắt đầu bằng `#!` và qua `bash -n` |
+| os-server (`otaMetadataURLFromBootstrap`) | đổi URL sang CDN, nên base của skill và hook đi theo | — |
+| tải skill và role skill (`system/skills`) | CDN, rồi kho lưu trữ | metadata là JSON |
+| file hook của openclaw (`HOOK.md`, `handler.ts`) | CDN, rồi kho lưu trữ | không phải trang HTML, không rỗng, tối đa 1 MiB |
+| software-update: metadata | CDN, rồi kho lưu trữ (`ota_url_candidates`) | object JSON, và có chữ ký khớp khóa khi thiết bị có khóa |
+| software-update: file component | CDN, rồi kho lưu trữ | sha256 trong metadata |
+
+Phản hồi không qua kiểm tra (trang HTML của captive portal, nội dung bị cắt) thì
+chuyển sang nguồn kế tiếp.
 
 Việc đổi chỉ là đổi host (`system/lib/otamirror`); host và bucket khác dùng
 nguyên như cũ.
@@ -1430,16 +1437,23 @@ Khóa là `linux-<uname -m>-<extra>` (`aec`, hoặc `reachy` trên Reachy Mini).
 Thiết bị chỉ dùng khi `lock_sha256` khớp `uv.lock` của HAL đang stage. Khi đó nó
 tạo `.venv` bằng Python 3.12 có sẵn trên máy, chạy
 `uv pip install --offline --no-index --find-links <wheels> -r requirements.txt`
-rồi cài project dạng editable, giống `uv sync`. File nén được giữ ở
+rồi cài project dạng editable, giống `uv sync`.
+
+Wheelhouse được tải, kiểm sha256 và giải nén trong lúc HAL vẫn chạy; sau khi HAL
+dừng chỉ còn bước cài offline. Trước khi tải, thiết bị kiểm dung lượng trống đủ
+cho file nén, bản giải nén và 512 MB dự phòng (`HAL_WHEELHOUSE_MARGIN_MB`), nếu
+không đủ thì bỏ qua wheelhouse và ghi log. Bản giải nén được giữ ở
 `/opt/.hal-wheelhouse/<sha256>` (tải dở thì lần chạy sau tải tiếp; chỉ giữ bản
-mới nhất), nên bản HAL cùng lock không phải tải thêm gì.
+mới nhất), nên bản HAL cùng lock không phải tải thêm gì. Ở thứ tự dự phòng, thiết
+bị có `uv sync` lỗi mà chưa có wheelhouse trên đĩa sẽ tải nó trước khi dừng HAL ở
+lần cập nhật sau.
 
 | Vùng | Thứ tự (`HAL_WHEELHOUSE` override: `first`, `fallback`, `off`) |
 |---|---|
 | CN | wheelhouse, rồi `uv sync` |
 | khác hoặc chưa biết | `uv sync`, rồi wheelhouse nếu sync lỗi |
 
-Cách build: `make upload-hal` chạy `scripts/release/build_hal_wheelhouse.py` khi
+Cách build (cho người phát hành): `make upload-hal` chạy `scripts/release/build_hal_wheelhouse.py` khi
 wheelhouse đã publish được build từ `uv.lock` khác (`HAL_WHEELHOUSE=auto`; `1`
 luôn build, `0` không build; ở auto, build lỗi chỉ cảnh báo). Builder chọn wheel
 từ registry cho Linux aarch64 CPython 3.12 (glibc tối đa 2.35, `--glibc`), tải
@@ -1462,7 +1476,7 @@ Mọi file trên mirror đều có sha256 ghim trong repo: `MIRROR_PINS` trong
 `scripts/provision/software-update`, và cùng các dòng đó trong
 `runtimes/*/install.sh` nào tải file. Thiết bị chỉ lấy file từ mirror khi phiên
 bản đó có pin, và cả bản trên mirror lẫn bản của vendor phải khớp pin trước khi
-được giải nén, chạy hay cài. Phiên bản không có pin tải từ vendor y như trước.
+được giải nén, chạy hay cài. Phiên bản không có pin chỉ tải từ vendor.
 `upload-mirror.sh` từ chối file tải về khác pin đang có và in ra các dòng pin
 (`--digests` chỉ in, không upload), nên lần nâng phiên bản và pin đi cùng một
 thay đổi; `scripts/release/tests/test_mirror_pins.py` lỗi khi một phiên bản
@@ -1491,18 +1505,18 @@ cho các lệnh npm của openclaw (`npm --registry`), và chỉ cho phiên bả
 do `make upload-openclaw` ghi vào. Tarball được tải bằng `npm pack`, so với giá
 trị đó, rồi cài từ file; plugin discord và slack chỉ cài từ registry đó khi nó
 báo đúng integrity trong `openclaw.plugins`. Không có các giá trị này, hoặc ngoài
-CN và không override, thì dùng registry mặc định như trước.
+CN và không override, thì dùng registry mặc định.
 
 Vẫn cần vendor: checkout Hermes và các gói Python của nó, bộ cài Claude Code,
 lần đầu tải Python do uv quản lý, và các gói apt.
 
-### Những file phải có trên CDN
+### Mỗi file lên CDN từ đâu (cho người phát hành)
 
-| File | Trạng thái |
+| File | Chép lên CDN bằng |
 |---|---|
-| `os/ota/metadata.json`, `os/software-update`, mọi ZIP component, skill | CDN đã phục vụ |
-| HAL wheelhouse (`hal.wheelhouse`) | publish ở lần `make upload-hal` tiếp theo |
-| `os/mirror/…` (bảng trên) | publish bằng `make upload-mirror` |
+| `os/ota/metadata.json`, `os/software-update`, ZIP component, skill | target `make upload-*` tương ứng (CDN phục vụ kho OTA) |
+| HAL wheelhouse (`hal.wheelhouse`) | `make upload-hal` |
+| `os/mirror/…` (bảng trên) | `make upload-mirror` |
 
 ---
 
