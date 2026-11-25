@@ -5,12 +5,13 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
 func TestInstallRoleSkillsInvalidRole(t *testing.T) {
 	for _, role := range []string{"", "../etc", "Bad", "a/b", "x.y", "UP", "a b"} {
-		if _, err := InstallRoleSkills(t.TempDir(), role); !errors.Is(err, ErrInvalidRole) {
+		if _, err := InstallRoleSkills(t.TempDir(), "", role); !errors.Is(err, ErrInvalidRole) {
 			t.Errorf("role %q: want ErrInvalidRole, got %v", role, err)
 		}
 	}
@@ -58,5 +59,32 @@ func TestExtractDirFromZip(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dest, "ignore.txt")); !os.IsNotExist(err) {
 		t.Errorf("ignore.txt should not be extracted")
+	}
+}
+
+func TestPluginsSkillsRoots(t *testing.T) {
+	cases := []struct {
+		in   string
+		want []string
+	}{
+		{"", []string{defaultPluginsSkillsRoot}},
+		{"https://cdn.autonomous.ai/os/ota/metadata.json", []string{"https://cdn.autonomous.ai/plugins-skills", defaultPluginsSkillsRoot}},
+		{"https://cdn.autonomous.ai/os/ota/metadata.json?v=3", []string{"https://cdn.autonomous.ai/plugins-skills", defaultPluginsSkillsRoot}},
+		{strings.TrimSuffix(defaultPluginsSkillsRoot, "/plugins-skills") + "/os/ota/metadata.json", []string{defaultPluginsSkillsRoot}},
+		{"https://example.test/metadata.json", []string{defaultPluginsSkillsRoot}},
+		{"file:///tmp/os/ota/metadata.json", []string{defaultPluginsSkillsRoot}},
+		{"http://cdn.autonomous.ai/os/ota/metadata.json", []string{defaultPluginsSkillsRoot}},
+		{"HTTP://cdn.autonomous.ai/os/ota/metadata.json", []string{defaultPluginsSkillsRoot}},
+	}
+	for _, c := range cases {
+		got := pluginsSkillsRoots(c.in)
+		if len(got) != len(c.want) {
+			t.Fatalf("%q: got %v, want %v", c.in, got, c.want)
+		}
+		for i := range got {
+			if got[i] != c.want[i] {
+				t.Fatalf("%q: got %v, want %v", c.in, got, c.want)
+			}
+		}
 	}
 }

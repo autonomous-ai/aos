@@ -17,7 +17,8 @@ When the OS server is not yet configured (`SetUpCompleted = false`), the device 
       goroutine publishes the STA LAN IP into setup state as soon as wlan0
       gets one (before internet is up), so the Web UI can read it while the
       AP is still briefly alive (see "AP→STA Auto-Redirect")
-   b. Wait for internet (up to 60s wall clock; ICMP to 8.8.8.8, falling back
+   b. Wait for internet (up to 60s wall clock; ICMP to 8.8.8.8, then to
+      223.5.5.5 when 8.8.8.8 fails or has not replied within 1s, falling back
       to a TLS handshake with the cloud API host for networks that drop ICMP)
    c. Save config, then resync the clock (no RTC: the device boots with a
       stale time and every TLS call fails "certificate is not yet valid"):
@@ -104,8 +105,9 @@ an SSID. Everything after the network phase (LLM config, channel, agent setup,
 1. Call `connect-wifi` CLI tool with SSID + password
 2. Poll checks:
    - SSID match? (`iwgetid`)
-   - Internet OK? (`ping 8.8.8.8`, else a TLS handshake with the device's cloud
-     API host — `system/network/reachability.go`)
+   - Internet OK? (`ping 8.8.8.8`, or `223.5.5.5` when that fails or is slow,
+     else a TLS handshake with the device's cloud API host —
+     `system/network/reachability.go`)
 3. Timeout 60s of wall-clock time → fail. (It used to count 60 attempts, and
    each failed ping waits 5s, so a network that drops ICMP kept the device
    trying for ~6 minutes after the web client gave up at 80s.)

@@ -24,10 +24,9 @@ const (
 	wifiInterface = "wlan0"
 
 	// Network monitor: forgiving timeouts so brief WiFi hiccups don't flip to no-internet.
-	networkMonitorPingTarget    = "8.8.8.8"
 	networkMonitorFailsRequired = 5
 	networkMonitorInterval      = 5 * time.Second
-	networkMonitorPingTimeout   = 3 * time.Second
+	networkMonitorPingTimeout   = 4 * time.Second
 	// setupInternetWait bounds the internet check after connect-wifi.
 	setupInternetWait = 60 * time.Second
 	// wifiClockSyncWait bounds the NTP wait after connect; the customer is still waiting.
@@ -287,8 +286,8 @@ func ReadCurrentSSID() string {
 // rePingTime extracts the RTT from a ping reply line.
 var rePingTime = regexp.MustCompile(`time=([0-9.]+) ms`)
 
-// CheckInternet pings 8.8.8.8, then falls back to a TLS handshake with the
-// cloud API host for networks that drop ICMP.
+// CheckInternet pings public resolvers (icmpTargets), then falls back to a TLS
+// handshake with the cloud API host for networks that drop ICMP.
 func (s *Service) CheckInternet() (bool, error) {
 	_, icmpErr := s.pingRTT()
 	if icmpErr == nil {
@@ -299,7 +298,7 @@ func (s *Service) CheckInternet() (bool, error) {
 		slog.Info("internet reachable over TLS while ICMP is blocked", "component", "network", "probe", addr)
 		return true, nil
 	}
-	return false, fmt.Errorf("connected but no internet: ping 8.8.8.8 failed (%v) and %s unreachable: %w", icmpErr, addr, tlsErr)
+	return false, fmt.Errorf("connected but no internet: ping %v failed (%v) and %s unreachable: %w", icmpTargets, icmpErr, addr, tlsErr)
 }
 
 // CheckInternetRTT is CheckInternet plus the ICMP RTT in ms (0 if unparsed or
@@ -326,14 +325,15 @@ func (s *Service) pingRTT() (float64, error) {
 	return 0, nil
 }
 
-// pingNetworkMonitor runs a short ping for the network monitor.
-func (s *Service) pingNetworkMonitor(target string) bool {
+// pingNetworkMonitor runs a short ping for the network monitor (see pingAny);
+// any target replying counts.
+func (s *Service) pingNetworkMonitor(targets []string) bool {
 	sec := int(networkMonitorPingTimeout.Seconds())
 	if sec < 1 {
 		sec = 1
 	}
-	cmd := exec.Command("ping", "-c", "1", "-W", strconv.Itoa(sec), target)
-	return cmd.Run() == nil
+	_, err := pingAny(targets, strconv.Itoa(sec))
+	return err == nil
 }
 
 // setupHotspotIP is the device's own address while it serves the setup hotspot.
@@ -359,7 +359,7 @@ func (s *Service) wifiJoinFailure(joinStart time.Time, ssid string) *SetupError 
 
 // monitorReachesCloud is the monitor's fallback when ICMP fails.
 func (s *Service) monitorReachesCloud() bool {
-	_, err := s.reachableOverTLS()
+	_, err := s.reachableOverTLSWithin(monitorCloudProbeTimeout)
 	return err == nil
 }
 
@@ -404,7 +404,7 @@ func (s *Service) runNetworkMonitorTick(ctx context.Context) {
 		s.recovery = wifiRecovery{}
 	}
 	// ICMP first; a network that drops ICMP but reaches our cloud is online.
-	if s.pingNetworkMonitor(networkMonitorPingTarget) || s.monitorReachesCloud() {
+	if s.pingNetworkMonitor(icmpTargets) || s.monitorReachesCloud() {
 		s.networkMonitorMu.Lock()
 		prev := s.networkMonitorConsecutive
 		s.networkMonitorConsecutive = 0
@@ -422,7 +422,7 @@ func (s *Service) runNetworkMonitorTick(ctx context.Context) {
 	n := s.networkMonitorConsecutive
 	s.networkMonitorMu.Unlock()
 
-	slog.Warn("no internet", "component", "network-monitor", "target", networkMonitorPingTarget, "fails", n, "required", networkMonitorFailsRequired)
+	slog.Warn("no internet", "component", "network-monitor", "targets", icmpTargets, "fails", n, "required", networkMonitorFailsRequired)
 	if n == networkMonitorFailsRequired && s.onConnectivityLost != nil {
 		s.onConnectivityLost()
 	}

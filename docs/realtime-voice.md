@@ -3721,7 +3721,19 @@ a release asset) and keeps the model in `HAL_LANG_ID_CACHE_DIR` (default
 thread to `<file>.part`, checked against the SHA-256 and renamed into place, so the
 final path only ever holds a verified model; a failed download is deleted and
 retried after 30 s, doubling up to 600 s. Neither HAL start nor the voice loop
-waits for it.
+waits for it. Each attempt first tries the CDN copy
+(`HAL_LANG_ID_MODEL_MIRROR_URL`, default
+`https://cdn.autonomous.ai/models/ambernet/ambernet.onnx`, empty disables it)
+which must connect and start its response within 5s, so a copy that is
+missing or unreachable costs seconds (once the response starts, reads get the
+normal timeout, so a short stall mid-transfer does not abort it), then the pinned `url`, then any https `mirrors` in the pin file. Every
+source is checked against the same SHA-256. The speech-quality model
+(`HAL_SPEAKER_MODEL_MIRROR_BASE`, checked against its pinned SHA-256) and Piper
+downloads (`HAL_PIPER_MIRROR_BASE`) try their CDN copy first the same way. The
+Piper engine archive and each catalogue voice file are checked against SHA-256
+hashes pinned in `tts/piper_catalog.py` (voices come from a fixed revision of
+the voices repository, `VOICES_REVISION`) before they are kept or extracted; a
+file that does not match is deleted and the next source is tried.
 
 The gate is **active** only once the model is loaded (`Language gate active`).
 Until then (download in flight, loading at boot), or when the model fails to load,

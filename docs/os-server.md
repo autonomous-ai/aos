@@ -256,9 +256,15 @@ Config field: `timezone` in `config/config.json` (IANA zone string, omitempty) â
 **Connectivity monitor** (`system/network/service.go` and `recovery.go`, active
 when `SetUpCompleted` is true). Internet checks run on a 5s monitor tick; 5
 consecutive failed checks raise the `Connectivity` LED state, and a successful
-one clears it. A check is a ping to `8.8.8.8`, falling back to a TLS handshake
-with the device's cloud API host when ICMP fails, so networks that drop ICMP are
-not reported offline. The monitor page's Overview uses the same fallback
+one clears it. A check is a ping to `8.8.8.8` (and to `223.5.5.5` only when
+`8.8.8.8` fails or has not replied within 1s, for networks where it is blocked),
+falling back to a TLS handshake with the device's cloud API host when ICMP
+fails, so networks that drop ICMP are not reported offline. The monitor's ping
+and TLS check each wait up to 4s; setup's TLS check waits up to 5s. HAL's own
+internet check (it decides whether a backend error flashes amber) asks
+`8.8.8.8` over TCP/53 first; only when that fails or has not answered within
+1s does it also try `223.5.5.5` over TCP/53 and a TLS handshake with the cloud
+API host from `config.json`. The first answer wins, within 4s. The monitor page's Overview uses the same fallback
 (`CheckInternetRTT`), showing no ping time when only TLS got through. Internet status is separate from WiFi recovery:
 association and a usable station IPv4 address keep WiFi active even without
 Internet. The monitor no longer reboots the device.
@@ -278,6 +284,33 @@ The scripts and web UI are unchanged. Join the device hotspot, then open
 `http://lamp-0c4e.local/wifi` (using the device's actual hostname) to change WiFi;
 use `http://192.168.100.1/wifi` if `.local` resolution is unavailable. Automatic
 retry resumes after hotspot clients disconnect.
+
+**Fallback time and DNS servers** (`system/lib/netfallback`, started at boot).
+They follow the region the cloud reports in the ping reply (read from
+`config.json` every 5 minutes, once the device is set up). While the region is
+`CN`: a systemd-timesyncd drop-in sets `FallbackNTP=0.debian.pool.ntp.org
+1.debian.pool.ntp.org ntp.aliyun.com ntp.tencent.com cn.pool.ntp.org` (fallback
+only, so a server the network hands out still comes first), chrony gets the
+last three as extra sources when it reads `/etc/chrony/sources.d`,
+`/etc/resolvconf.conf` gets `name_servers_append="223.5.5.5 119.29.29.29
+1.1.1.1 8.8.8.8"` (after the router's servers) in place of its `name_servers`
+line, and `device-sta-mode` lists the same servers after the DHCP lease's. In
+any other region, or with no region, the drop-in and the sources file are
+removed and the image's `name_servers="1.1.1.1 8.8.8.8"` line and
+`device-sta-mode` lines are put back, but only where ours are in place.
+timesyncd is restarted (if running), chrony reloaded and `resolv.conf`
+regenerated only after a change, or again on the next check when a step
+failed (a failed step is retried every 5 minutes until all succeed; an image without
+systemd-timesyncd gets no drop-in, and a missing timesyncd unit or `chronyc`
+is not a failure); the `device-sta-mode` change applies from the
+next WiFi join. Before setup nothing changes, so an image built with
+`IMAGE_REGION=CN` (`scripts/imager`) keeps these settings until the cloud has
+answered.
+
+**Download hosts.** Role and connector skill zips (`skills.install`, the
+`figma-api` connector) are fetched from the host that serves the device's OTA
+metadata first, then from the original storage URL. The monitor page looks up
+the public IP with a 2s timeout and remembers a failed lookup for a minute.
 
 ### Guard Mode
 

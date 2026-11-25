@@ -14,12 +14,17 @@ import (
 	"time"
 )
 
+// metadataFetchTimeout bounds one OTA metadata fetch so a stalled connection
+// cannot block a skill watcher forever.
+const metadataFetchTimeout = 30 * time.Second
+
 // FetchSkillVersions returns skill name -> version from OTA metadata; (nil, nil) if unprovisioned.
 func FetchSkillVersions(otaMetadataURL string) (map[string]string, error) {
 	if strings.TrimSpace(otaMetadataURL) == "" {
 		return nil, nil
 	}
-	resp, err := http.Get(otaMetadataURL)
+	client := &http.Client{Timeout: metadataFetchTimeout}
+	resp, err := client.Get(otaMetadataURL)
 	if err != nil {
 		return nil, err
 	}

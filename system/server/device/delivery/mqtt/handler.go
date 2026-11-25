@@ -120,7 +120,7 @@ func newSpecialConnectorWriters(cfg *config.Config, gw domain.AgentGateway) map[
 				}
 				// Idempotent — only downloads when missing, so token
 				// refreshes don't re-fetch.
-				if err := openclaw.EnsureMCPSkill(ocDir, "figma-api"); err != nil {
+				if err := openclaw.EnsureMCPSkill(ocDir, cfg.OTAMetadataURL, "figma-api"); err != nil {
 					slog.Warn("figma-api: skill install failed (continuing)", "component", "mqtt", "error", err)
 				}
 				return nil

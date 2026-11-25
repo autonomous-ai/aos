@@ -431,15 +431,24 @@ def is_nonactionable_transcript(combined: str) -> bool:
 # Scripts an English (or any non-CJK/non-Vietnamese) device must never speak.
 _CJK_KANA_HANGUL = re.compile(r"[぀-ヿ㐀-䶿一-鿿가-힯]")
 _VIET_CHARS = re.compile(r"[đĐăĂâÂêÊôÔơƠưƯẠ-ỿ]")
+# Chinese characters; a turn spoken in Chinese is answered in them (SOUL.md).
+_HAN = re.compile(r"[㐀-䶿一-鿿]")
 
 
-def reply_is_foreign_script(text: str, reply_language: str) -> bool:
-    """Return whether a realtime reply is in a script the device must not speak."""
+def reply_is_foreign_script(text: str, reply_language: str, user_text: str = "") -> bool:
+    """Return whether a realtime reply is in a script the device must not speak.
+
+    A reply in Chinese characters is allowed when the owner's own turn
+    (user_text) was in Chinese characters.
+    """
     if not text or not hal_config.REALTIME_FOREIGN_SCRIPT_GUARD:
         return False
     lang: str = (reply_language or "English").strip().lower()
     if not lang.startswith(("chin", "japan", "korea", "zh", "ja", "ko")):
-        if _CJK_KANA_HANGUL.search(text):
+        cjk = _CJK_KANA_HANGUL.search(text)
+        if cjk and _HAN.search(user_text or "") and not _CJK_KANA_HANGUL.search(_HAN.sub("", text)):
+            cjk = None
+        if cjk:
             return True
     if not lang.startswith(("viet", "vi")):
         if _VIET_CHARS.search(text):
@@ -815,7 +824,7 @@ def run_realtime_turn(
                         # Wrong-script reply (e.g. noise hallucinated as JP/KR, or a
                         # Vietnamese reply on an English device): never speak it.
                         if not foreign_suppressed and reply_is_foreign_script(
-                            "".join(text_parts), reply_lang
+                            "".join(text_parts), reply_lang, user_transcript or combined
                         ):
                             foreign_suppressed = True
                             logger.info(

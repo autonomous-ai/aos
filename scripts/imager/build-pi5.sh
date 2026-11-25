@@ -25,6 +25,20 @@ if [[ -n "$VARIANT" && ! "$VARIANT" =~ ^[a-z][a-z0-9_-]{0,63}$ ]]; then
   exit 1
 fi
 AP_BAND="${AP_BAND:-2.4}"   # 2.4 or 5 (5 GHz needs supported regulatory domain + chip)
+# Region the image is built for. Unset keeps the default settings; CN adds
+# fallback time and DNS servers that answer in mainland China. Once a device
+# is set up, os-server keeps them in line with the region the cloud reports.
+IMAGE_REGION="${IMAGE_REGION:-}"
+case "$IMAGE_REGION" in
+  ""|CN) ;;
+  *) echo "Invalid IMAGE_REGION: expected empty or CN" >&2; exit 1 ;;
+esac
+# device-sta-mode's fallback DNS lines, after the DHCP lease's servers.
+if [ "$IMAGE_REGION" = "CN" ]; then
+  STA_FALLBACK_DNS='nameserver 223.5.5.5\nnameserver 119.29.29.29\nnameserver 1.1.1.1\nnameserver 8.8.8.8\n'
+else
+  STA_FALLBACK_DNS='nameserver 1.1.1.1\nnameserver 8.8.8.8\n'
+fi
 AP_CHANNEL="${AP_CHANNEL:-}" # default: 6 for 2.4 GHz, 36 for 5 GHz
 COUNTRY_CODE="US"           # Regulatory country code for hostapd
 
@@ -545,6 +559,13 @@ install_binary_from_zip() {
 echo "[stage] NTP + fake-hwclock"
 DEBIAN_FRONTEND=noninteractive apt-get install -y systemd-timesyncd
 systemctl enable systemd-timesyncd
+if [ "${IMAGE_REGION}" = "CN" ]; then
+  # Time servers that answer in mainland China, after the Debian pool.
+  mkdir -p /etc/systemd/timesyncd.conf.d
+  printf '%s\n' "# Fallback time servers that answer in mainland China, after the Debian pool." "[Time]" \
+    "FallbackNTP=0.debian.pool.ntp.org 1.debian.pool.ntp.org ntp.aliyun.com ntp.tencent.com cn.pool.ntp.org" \
+    > /etc/systemd/timesyncd.conf.d/90-autonomous-fallback-ntp.conf
+fi
 # Seed fake-hwclock with current build timestamp so first boot has a valid clock.
 # fake-hwclock uses a SysV init script (auto-enabled on install) — no systemctl enable needed.
 date -u '+%Y-%m-%d %H:%M:%S' > /etc/fake-hwclock.data
@@ -1050,7 +1071,7 @@ if command -v dhcpcd >/dev/null 2>&1; then
     DNS_LINES="\${DNS_LINES}nameserver \$ns\\n"
   done
 fi
-DNS_LINES="\${DNS_LINES}nameserver 1.1.1.1\\nnameserver 8.8.8.8\\n"
+DNS_LINES="\${DNS_LINES}${STA_FALLBACK_DNS}"
 printf "%b" "\$DNS_LINES" > /etc/resolv.conf
 echo "resolv.conf:"; cat /etc/resolv.conf
 echo "STA MODE ENABLED"
@@ -1101,6 +1122,11 @@ if [ -f /etc/resolvconf.conf ]; then
   grep -q '^name_servers=' /etc/resolvconf.conf || echo 'name_servers="1.1.1.1 8.8.8.8"' >> /etc/resolvconf.conf
 else
   echo 'name_servers="1.1.1.1 8.8.8.8"' > /etc/resolvconf.conf
+fi
+if [ "${IMAGE_REGION}" = "CN" ]; then
+  # Resolvers that answer in mainland China, after the router's.
+  sed -i '/^[[:space:]]*name_servers/d' /etc/resolvconf.conf
+  echo 'name_servers_append="223.5.5.5 119.29.29.29 1.1.1.1 8.8.8.8"' >> /etc/resolvconf.conf
 fi
 
 # ── stage: PulseAudio echo cancellation (for HAL mic/speaker) ─────────────

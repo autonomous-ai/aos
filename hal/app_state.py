@@ -943,15 +943,99 @@ def _dismiss_mic_muted_led(source: str):
     logger.info("Mic-muted LED indicator dismissed by %s (mic stays muted)", source)
 
 
-def _has_internet() -> bool:
-    """True if a 1s TCP connect to a public DNS IP succeeds."""
+# Public resolvers probed over TCP/53; any answer counts. The first is asked
+# alone; the second answers on networks where the first is blocked. Same probe
+# set as os-server's internet check.
+_INTERNET_PROBE_IPS = ("8.8.8.8", "223.5.5.5")
+# Bound for one probe and for the whole check: a connection that takes 3s
+# across a slow border still counts. Only a check with nothing answering waits
+# this long.
+_INTERNET_PROBE_TIMEOUT_S = 4.0
+# How long the first resolver gets on its own before the other probes start
+# too, as os-server does. A network where it answers sees only that probe.
+_INTERNET_PROBE_HEDGE_S = 1.0
+
+
+def _tcp_probe(host: str, port: int) -> bool:
     import socket
 
     try:
-        with socket.create_connection(("8.8.8.8", 53), timeout=1.0):
+        with socket.create_connection((host, port), timeout=_INTERNET_PROBE_TIMEOUT_S):
             return True
     except OSError:
         return False
+
+
+def _tls_probe(host: str, port: int) -> bool:
+    """TLS handshake with host, nothing sent. The certificate is not checked on
+    purpose: this only proves reachability and must work before NTP fixes the clock."""
+    import socket
+    import ssl
+
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        with socket.create_connection((host, port), timeout=_INTERNET_PROBE_TIMEOUT_S) as sock:
+            sock.settimeout(_INTERNET_PROBE_TIMEOUT_S)
+            with ctx.wrap_socket(sock, server_hostname=host):
+                return True
+    except (OSError, ValueError):
+        return False
+
+
+def _cloud_probe_target():
+    """(host, port) of the device's Autonomous cloud API from config.json, or None.
+    An owner's own LLM provider is never probed."""
+    try:
+        from urllib.parse import urlparse
+
+        from hal.config import _os_cfg_get
+        from hal.cloud_hosts import is_autonomous_host
+
+        base = (_os_cfg_get("llm_base_url", "") or "").strip()
+        u = urlparse(base)
+        if u.scheme != "https" or not u.hostname or not is_autonomous_host(base):
+            return None
+        return u.hostname, u.port or 443
+    except Exception:
+        return None
+
+
+def _has_internet() -> bool:
+    """True if any probe answers: TCP/53 to each public resolver, or a TLS
+    handshake with the cloud API host. The first resolver is asked alone; the
+    others start when it fails or has not answered within
+    _INTERNET_PROBE_HEDGE_S. The first answer ends the check, which takes at
+    most _INTERNET_PROBE_TIMEOUT_S."""
+    from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+
+    first, *others = _INTERNET_PROBE_IPS
+    start = time.monotonic()
+    hedge_at = start + _INTERNET_PROBE_HEDGE_S
+    deadline = start + _INTERNET_PROBE_TIMEOUT_S
+    pool = ThreadPoolExecutor(max_workers=len(_INTERNET_PROBE_IPS) + 1, thread_name_prefix="net-probe")
+    try:
+        pending = {pool.submit(_tcp_probe, first, 53)}
+        hedged = False
+        while pending or not hedged:
+            now = time.monotonic()
+            if now >= deadline:
+                return False
+            until = deadline if hedged else min(hedge_at, deadline)
+            done, pending = wait(pending, timeout=until - now, return_when=FIRST_COMPLETED)
+            if any(f.result() for f in done):
+                return True
+            if not hedged and (not pending or time.monotonic() >= hedge_at):
+                hedged = True
+                for ip in others:
+                    pending.add(pool.submit(_tcp_probe, ip, 53))
+                cloud = _cloud_probe_target()
+                if cloud:
+                    pending.add(pool.submit(_tls_probe, cloud[0], cloud[1]))
+        return False
+    finally:
+        pool.shutdown(wait=False)
 
 
 def _flash_backend_error():

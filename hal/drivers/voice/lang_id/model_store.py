@@ -17,13 +17,17 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 
 logger = logging.getLogger("hal.voice.lang_id")
 
 _CHUNK = 1 << 20
 _CONNECT_TIMEOUT_S = 15.0
 _READ_TIMEOUT_S = 60.0
+# A copy tried before the pinned URL must connect within this, so a missing or
+# unreachable copy costs seconds before the pinned URL is asked. Its body reads
+# then get the normal read timeout, so a short stall mid-transfer is not fatal.
+_QUICK_TIMEOUT_S = 5.0
 
 
 def sha256_of(path: Path) -> str:
@@ -35,7 +39,11 @@ def sha256_of(path: Path) -> str:
 
 
 def read_manifest(path: Path) -> Optional[dict]:
-    """{"url", "sha256", "size"?} from the pin file, or None when absent or invalid."""
+    """{"url", "mirrors", "sha256", "size"} from the pin file, or None when absent or invalid.
+
+    `mirrors` (optional in the file) lists https URLs for the same file, tried in
+    order after `url` fails; non-https entries are ignored.
+    """
     try:
         data = json.loads(Path(path).read_text())
     except FileNotFoundError:
@@ -47,17 +55,26 @@ def read_manifest(path: Path) -> Optional[dict]:
     if not url.startswith("https://") or len(sha) != 64:
         logger.warning("Language ID: model manifest %s needs an https url and a sha256", path)
         return None
-    return {"url": url, "sha256": sha, "size": int(data.get("size") or 0)}
+    raw_mirrors = data.get("mirrors") or []
+    mirrors = [str(m) for m in raw_mirrors if isinstance(m, str) and m.startswith("https://")] \
+        if isinstance(raw_mirrors, list) else []
+    return {"url": url, "mirrors": mirrors, "sha256": sha, "size": int(data.get("size") or 0)}
 
 
 class ModelStore:
     """Makes one pinned model file available; `on_ready(path)` runs once it is verified."""
 
     def __init__(self, cache_dir: Path, filename: str, url: str, sha256: str, *,
-                 size: int = 0, retry_s: float = 30.0, max_retry_s: float = 600.0,
+                 mirrors: Sequence[str] = (), quick: Sequence[str] = (),
+                 size: int = 0, retry_s: float = 30.0,
+                 max_retry_s: float = 600.0,
                  fetch: Optional[Callable[[str, Path, threading.Event], None]] = None):
         self.path = Path(cache_dir) / f"{Path(filename).stem}-{sha256[:12]}{Path(filename).suffix}"
         self.url = url
+        # Tried in order; the first that downloads and matches the hash wins.
+        # `quick` copies go first, each with a short timeout.
+        self.urls = list(dict.fromkeys([*quick, url, *mirrors]))
+        self._quick = set(quick) - {url, *mirrors}
         self.sha256 = sha256
         self.size = size
         self._retry_s = retry_s
@@ -104,12 +121,29 @@ class ModelStore:
             delay = min(delay * 2, self._max_retry_s)
 
     def _download(self) -> None:
+        """Download from the first URL that works; raise the last error when none does."""
+        last: Optional[Exception] = None
+        for url in self.urls:
+            try:
+                self._download_from(url)
+                return
+            except Exception as e:
+                if self._stop.is_set():
+                    raise
+                last = e
+                logger.warning("Language ID model download from %s failed: %s", url, e)
+        raise last if last else RuntimeError("no model URL")
+
+    def _download_from(self, url: str) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         part = self.path.with_name(self.path.name + ".part")
         started = time.monotonic()
-        logger.info("Language ID model downloading %s -> %s", self.url, self.path)
+        logger.info("Language ID model downloading %s -> %s", url, self.path)
         try:
-            self._fetch(self.url, part, self._stop)
+            if url in self._quick:
+                self._fetch(url, part, self._stop, timeout=(_QUICK_TIMEOUT_S, _READ_TIMEOUT_S))
+            else:
+                self._fetch(url, part, self._stop)
             if self._stop.is_set():
                 raise RuntimeError("stopped")
             got = sha256_of(part)
@@ -124,10 +158,11 @@ class ModelStore:
         )
 
 
-def _http_fetch(url: str, dest: Path, stop: threading.Event) -> None:
+def _http_fetch(url: str, dest: Path, stop: threading.Event,
+                timeout: tuple = (_CONNECT_TIMEOUT_S, _READ_TIMEOUT_S)) -> None:
     import requests
 
-    with requests.get(url, stream=True, timeout=(_CONNECT_TIMEOUT_S, _READ_TIMEOUT_S)) as r:
+    with requests.get(url, stream=True, timeout=timeout) as r:
         r.raise_for_status()
         with open(dest, "wb") as f:
             for chunk in r.iter_content(_CHUNK):

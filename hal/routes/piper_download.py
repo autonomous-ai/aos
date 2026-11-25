@@ -4,6 +4,7 @@ Invoked as a script, never imported; must not import `hal`.
 Usage: python3 piper_download.py <job-file> <spec-json>
 """
 
+import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -48,10 +49,34 @@ def _flush(force: bool = False, **over) -> None:
         pass
 
 
-def _download(url: str, dest: str, w_from: int, w_to: int, track: bool) -> None:
-    """Fetch url to dest via a .part file, mapping progress onto a slice of the whole job."""
+# Socket timeout for reading a download. A mirror copy tried before the
+# upstream URL must connect and send its response headers within
+# QUICK_TIMEOUT_S; its body reads then get DOWNLOAD_TIMEOUT_S too.
+DOWNLOAD_TIMEOUT_S = 60
+QUICK_TIMEOUT_S = 5
+
+
+def _set_read_timeout(resp, timeout: float) -> None:
+    """Give an open urllib response's socket a new timeout for the body reads.
+    urlopen's own timeout covers connecting and the response headers."""
+    raw = getattr(getattr(resp, "fp", None), "raw", None)
+    sock = getattr(raw, "_sock", None)
+    if sock is not None:
+        sock.settimeout(timeout)
+
+
+def _download(url: str, dest: str, w_from: int, w_to: int, track: bool,
+              timeout: float = DOWNLOAD_TIMEOUT_S, sha256: str = "") -> None:
+    """Fetch url to dest via a .part file, mapping progress onto a slice of the
+    whole job. `timeout` bounds connecting and the response headers; the body
+    reads use DOWNLOAD_TIMEOUT_S. The file is kept only when its SHA-256
+    equals `sha256`."""
+    if len(sha256) != 64:
+        raise ValueError(f"no pinned sha256 for {url}")
     tmp = dest + ".part"
-    with urllib.request.urlopen(url, timeout=60) as resp, open(tmp, "wb") as out:
+    digest = hashlib.sha256()
+    with urllib.request.urlopen(url, timeout=timeout) as resp, open(tmp, "wb") as out:
+        _set_read_timeout(resp, DOWNLOAD_TIMEOUT_S)
         total = int(resp.headers.get("Content-Length") or 0)
         if track:
             _flush(force=True, bytes_total=total, bytes_done=0)
@@ -61,12 +86,38 @@ def _download(url: str, dest: str, w_from: int, w_to: int, track: bool) -> None:
             if not chunk:
                 break
             out.write(chunk)
+            digest.update(chunk)
             got += len(chunk)
             over = {"bytes_done": got} if track else {}
             if total:
                 over["percent"] = w_from + int((w_to - w_from) * got / total)
             _flush(**over)
+    if digest.hexdigest() != sha256.lower():
+        _discard([tmp])
+        raise ValueError(f"sha256 mismatch for {url}")
     os.replace(tmp, dest)
+
+
+def _download_any(urls, dest: str, w_from: int, w_to: int, track: bool,
+                  sha256: str) -> None:
+    """Try each (url, timeout) in order until one downloads a file matching
+    sha256; raise the last error when none does."""
+    last = None
+    for url, timeout in urls:
+        try:
+            _download(url, dest, w_from, w_to, track, timeout, sha256)
+            return
+        except Exception as exc:  # noqa: BLE001 — any failure moves to the next URL
+            last = exc
+            _discard([dest + ".part"])
+    raise last if last else RuntimeError("no download URL")
+
+
+def _urls(spec: dict) -> list:
+    """(url, timeout) in try order: the spec's mirror copies first, each with a
+    short timeout, then its URL (a spec without `quick` has only the URL)."""
+    quick = [(u, QUICK_TIMEOUT_S) for u in spec.get("quick") or [] if u]
+    return [*quick, (spec["url"], DOWNLOAD_TIMEOUT_S)]
 
 
 def _discard(paths) -> None:
@@ -82,8 +133,8 @@ def _run_voice(spec: dict) -> None:
     os.makedirs(os.path.dirname(steps[0]["dest"]), exist_ok=True)
     try:
         for step in steps:
-            _download(step["url"], step["dest"], step["from"], step["to"],
-                      step.get("track", False))
+            _download_any(_urls(step), step["dest"], step["from"], step["to"],
+                          step.get("track", False), step.get("sha256", ""))
     except Exception:
         # A half-installed voice is worse than none: discard every step's files.
         _discard([p for s in steps for p in (s["dest"], s["dest"] + ".part")])
@@ -135,7 +186,7 @@ def _run_engine(spec: dict) -> None:
     os.makedirs(piper_dir, exist_ok=True)
     with tempfile.TemporaryDirectory() as td:
         tar_path = os.path.join(td, "piper.tar.gz")
-        _download(spec["url"], tar_path, 0, 85, True)
+        _download_any(_urls(spec), tar_path, 0, 85, True, spec.get("sha256", ""))
         _flush(force=True, percent=88)
         src = _extract_engine(tar_path, os.path.join(td, "extracted"))
         for entry in os.listdir(src):

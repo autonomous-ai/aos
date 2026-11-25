@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -121,5 +122,79 @@ func TestCheckInternetRTTFallsBackToTLSWhenICMPIsBlocked(t *testing.T) {
 				t.Fatalf("CheckInternetRTT() = (%v, %v), want (%v, %v)", ok, rtt, tc.wantOK, tc.wantRTT)
 			}
 		})
+	}
+}
+
+func stubPing(t *testing.T, hedge time.Duration, fn func(target string) ([]byte, error)) *[]string {
+	t.Helper()
+	oldPing, oldHedge := pingOnce, icmpHedgeDelay
+	t.Cleanup(func() { pingOnce, icmpHedgeDelay = oldPing, oldHedge })
+	icmpHedgeDelay = hedge
+	var mu sync.Mutex
+	var started []string
+	pingOnce = func(target, _ string) ([]byte, error) {
+		mu.Lock()
+		started = append(started, target)
+		mu.Unlock()
+		return fn(target)
+	}
+	return &started
+}
+
+func TestPingAnyOnlyPingsFirstTargetWhenItReplies(t *testing.T) {
+	started := stubPing(t, time.Second, func(target string) ([]byte, error) {
+		return []byte("time=12.3 ms " + target), nil
+	})
+	out, err := pingAny([]string{"8.8.8.8", "223.5.5.5"}, "1")
+	if err != nil || string(out) != "time=12.3 ms 8.8.8.8" {
+		t.Fatalf("pingAny = %q, %v; want the first target's reply", out, err)
+	}
+	if len(*started) != 1 {
+		t.Fatalf("pinged %v; the second target must not be pinged when the first replies", *started)
+	}
+}
+
+func TestPingAnyFallsBackWhenFirstTargetFails(t *testing.T) {
+	stubPing(t, time.Hour, func(target string) ([]byte, error) {
+		if target == "223.5.5.5" {
+			return []byte("time=40.1 ms"), nil
+		}
+		return []byte("timeout"), errors.New("exit status 1")
+	})
+	out, err := pingAny([]string{"8.8.8.8", "223.5.5.5"}, "1")
+	if err != nil || string(out) != "time=40.1 ms" {
+		t.Fatalf("pingAny = %q, %v; want the second target's reply", out, err)
+	}
+}
+
+func TestPingAnyHedgesWhenFirstTargetIsSlow(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+	stubPing(t, 10*time.Millisecond, func(target string) ([]byte, error) {
+		if target == "8.8.8.8" {
+			<-release
+			return nil, errors.New("timeout")
+		}
+		return []byte("time=40.1 ms"), nil
+	})
+	done := make(chan error, 1)
+	go func() { _, err := pingAny([]string{"8.8.8.8", "223.5.5.5"}, "5"); done <- err }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("pingAny err = %v; want the second target's reply", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("pingAny waited for the slow first target instead of hedging")
+	}
+}
+
+func TestPingAnyFailsWhenNoTargetReplies(t *testing.T) {
+	stubPing(t, time.Hour, func(target string) ([]byte, error) {
+		return []byte(target), errors.New("down " + target)
+	})
+	_, err := pingAny([]string{"8.8.8.8", "223.5.5.5"}, "1")
+	if err == nil || err.Error() != "down 8.8.8.8" {
+		t.Fatalf("pingAny err = %v; want the first target's error", err)
 	}
 }

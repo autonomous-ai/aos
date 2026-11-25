@@ -51,6 +51,9 @@ DEFAULT_AGENT ?=
 # Optional hardware assembly from robots/<device>/overrides/<variant>.
 # Empty or standard preserves legacy defaults.
 VARIANT ?=
+# Region the image is built for: unset (default) or CN, which adds fallback
+# time and DNS servers that answer in mainland China.
+IMAGE_REGION ?=
 VARIANT_SUFFIX := $(if $(filter-out standard,$(VARIANT)),-$(VARIANT),)
 
 # Pi 5 V1 hardware (case đầu) không có loa/mic. Set PI5_NO_AUDIO=1 để build-pi5.sh
@@ -149,6 +152,7 @@ build: build-preflight
 	-e DEVICE_TYPE=$(DEVICE_TYPE) \
 	-e DEFAULT_AGENT=$(DEFAULT_AGENT) \
 	-e VARIANT=$(VARIANT) \
+	-e IMAGE_REGION=$(IMAGE_REGION) \
 	-e PI5_NO_AUDIO=$(PI5_NO_AUDIO) \
 	-e COMPRESS=$(COMPRESS) \
 	-e BUILD_GIT_SHA=$(shell git -C .. rev-parse HEAD 2>/dev/null || echo unknown) \
