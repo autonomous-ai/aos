@@ -32,7 +32,7 @@ func TestApplyPingRegionStoresClearsAndWritesOnlyOnChange(t *testing.T) {
 		t.Fatal("config written for an unchanged empty region")
 	}
 
-	// A region is stored (normalised) and persisted.
+	// CN is stored on the first reply that carries it (normalised) and persisted.
 	s.applyPingRegion("cn", setTZ)
 	if s.config.Region != "CN" || !s.config.InChina() {
 		t.Fatalf("region = %q, want CN", s.config.Region)
@@ -50,17 +50,32 @@ func TestApplyPingRegionStoresClearsAndWritesOnlyOnChange(t *testing.T) {
 		t.Fatal("unchanged region rewrote config")
 	}
 
-	// The backend leaves the field out when the device has no region: clear it.
+	// Two replies without CN do not leave China; a CN reply resets the count.
+	s.applyPingRegion("", setTZ)
+	s.applyPingRegion("", setTZ)
+	if !s.config.InChina() {
+		t.Fatal("left China after only 2 replies without CN")
+	}
+	s.applyPingRegion("CN", setTZ)
+	s.applyPingRegion("", setTZ)
+	s.applyPingRegion("", setTZ)
+	if !s.config.InChina() {
+		t.Fatal("the count was not reset by a CN reply")
+	}
+	// The third consecutive reply without CN clears it, and that is saved.
 	s.applyPingRegion("", setTZ)
 	if s.config.Region != "" || s.config.InChina() {
-		t.Fatalf("absent region did not clear: %q", s.config.Region)
+		t.Fatalf("3 replies without CN did not clear: %q", s.config.Region)
 	}
 	if _, err := os.Stat(cfgFile); err != nil {
 		t.Fatal("clearing the region must be saved")
 	}
-	// A region that is not letters reads as none.
+
+	// A region that is not letters reads as none: entering CN, then 3 strange replies.
 	s.applyPingRegion("CN", setTZ)
-	s.applyPingRegion("zz-1", setTZ)
+	for i := 0; i < 3; i++ {
+		s.applyPingRegion("zz-1", setTZ)
+	}
 	if s.config.Region != "" {
 		t.Fatalf("strange region stored: %q", s.config.Region)
 	}
@@ -78,10 +93,18 @@ func TestApplyPingRegionNotifiesSubscribers(t *testing.T) {
 	noTZ := func(string) error { return nil }
 
 	s.applyPingRegion("", noTZ)   // unchanged
-	s.applyPingRegion("CN", noTZ) // enter
+	s.applyPingRegion("CN", noTZ) // enter: once
 	s.applyPingRegion("CN", noTZ) // unchanged
-	s.applyPingRegion("US", noTZ) // leave China
-	s.applyPingRegion("", noTZ)   // US -> none
+	// A flapping reply (absent, CN, absent, CN) never flips the device.
+	s.applyPingRegion("", noTZ)
+	s.applyPingRegion("CN", noTZ)
+	s.applyPingRegion("", noTZ)
+	s.applyPingRegion("CN", noTZ)
+	// 3 consecutive replies without CN: leave once.
+	for i := 0; i < 3; i++ {
+		s.applyPingRegion("US", noTZ)
+	}
+	s.applyPingRegion("", noTZ) // outside China, applies at once
 
 	want := []RegionChange{
 		{Region: "CN", Previous: "", InChina: true, WasInChina: false},
@@ -177,5 +200,16 @@ func TestConfigInChina(t *testing.T) {
 	var nilCfg *config.Config
 	if nilCfg.InChina() {
 		t.Error("nil config must not be in China")
+	}
+}
+
+// The config read-back keeps the saved setting and reports what really runs.
+func TestRealtimePublicActiveInChina(t *testing.T) {
+	for region, wantActive := range map[string]bool{"": true, "CN": false} {
+		s := &Service{config: &config.Config{Region: region}}
+		pub := s.RealtimePublic()
+		if !pub.Enabled || pub.Active != wantActive {
+			t.Errorf("region %q: enabled=%v active=%v, want enabled=true active=%v", region, pub.Enabled, pub.Active, wantActive)
+		}
 	}
 }

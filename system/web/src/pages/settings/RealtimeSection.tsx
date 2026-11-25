@@ -63,7 +63,7 @@ const labelStyle = { display: "block", fontSize: 12, color: C.textDim, marginBot
 
 export function RealtimeSection({
   active,
-  realtimeLoaded, llmLoaded,
+  realtimeLoaded, llmLoaded, notRunningHere,
   enabled, setEnabled,
   provider, setProvider,
   voice, setVoice,
@@ -76,6 +76,8 @@ export function RealtimeSection({
   fastVoiceSilentS, setFastVoiceSilentS,
 }: {
   active: boolean;
+  // Saved setting is on but realtime does not run on this device (Gemini Live in China).
+  notRunningHere: boolean;
   realtimeLoaded: RealtimeLoadedState;
   llmLoaded: LlmLoadedState;
   enabled: boolean; setEnabled: (v: boolean) => void;
@@ -110,6 +112,11 @@ export function RealtimeSection({
         <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} style={{ flexShrink: 0 }} />
         <span style={{ whiteSpace: "nowrap" }}>Enable realtime voice</span>
       </label>
+      {notRunningHere && (
+        <p style={{ fontSize: 12, color: C.textMuted, margin: "0 0 12px" }}>
+          Realtime voice is not used in this region; replies use the standard voice pipeline. Your setting is kept.
+        </p>
+      )}
       <div style={{ marginBottom: 12 }}>
         <label htmlFor="realtime_provider" style={labelStyle}>Provider</label>
         <SettingsSelect id="realtime_provider" value={provider} onValueChange={(value) => onProviderChange(value)} style={selectStyle}>

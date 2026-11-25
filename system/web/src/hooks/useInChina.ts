@@ -3,7 +3,7 @@ import { getDeviceConfig } from "@/lib/api";
 import type { ChannelLoadedState } from "@/hooks/setup/types";
 import type { SetupChannelType } from "@/types";
 
-// True when the backend placed this device in mainland China (config.in_china).
+// True when the device's region is mainland China (config.in_china).
 // Unknown or unreachable counts as false, so a device never loses a feature it had.
 export function useInChina(): boolean {
   const [inChina, setInChina] = useState(false);
@@ -18,7 +18,7 @@ export function useInChina(): boolean {
 }
 
 // Chat apps hidden for new setup in China: Telegram is blocked there and Slack is unreliable.
-// Discord goes through the cloud relay and stays.
+// Discord stays.
 const CHINA_HIDDEN_CHANNELS: ReadonlySet<string> = new Set(["telegram", "slack"]);
 
 // Whether `channel` is offered in the channel picker. A channel the owner already configured, or

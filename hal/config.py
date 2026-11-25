@@ -189,7 +189,7 @@ def _os_cfg_get(key: str, default: str = "") -> str:
         return default
 
 def in_china() -> bool:
-    """True when the backend placed this device in mainland China (config.json `region` == "CN").
+    """True when the device's region is mainland China (config.json `region` == "CN").
 
     Read fresh on every call: the region arrives from a ping after boot.
     """

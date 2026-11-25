@@ -145,7 +145,7 @@ func mqttConfigChanged(m *beclient.MQTTConfig, c *config.Config) bool {
 }
 
 // chinaDefaultTimezone is the zone a device that has no owner-chosen zone gets
-// when the backend first places it in China (images start on America/New_York).
+// when its region first becomes China (images start on America/New_York).
 const chinaDefaultTimezone = "Asia/Shanghai"
 
 // RegionChange describes a saved change of the device's region.
@@ -192,10 +192,16 @@ func (s *Service) applyRegionEffects(ch RegionChange) {
 	}()
 }
 
-// applyPingRegion stores the region from a successfully parsed ping reply. The
-// backend leaves `region` out when the device has none, so an empty region means
-// "not in a region" and clears a stored one; callers must not pass a region for a
-// failed ping. The config is written only when the value changes, and region
+// regionLeaveAfter is how many consecutive successful replies without CN end a
+// stored CN region; one stray reply must not flap the device in and out.
+const regionLeaveAfter = 3
+
+// applyPingRegion stores the region from a successfully parsed status reply;
+// callers must not pass a region for a failed ping. A reply with no region
+// means no region. CN is stored on the first reply that carries it. Leaving CN
+// needs regionLeaveAfter consecutive replies without CN (kept in memory, reset
+// by any CN reply), so a flip runs its effects once. Other changes apply at
+// once. The config is written only when the value changes and region
 // subscribers are told afterwards. The first time the region becomes CN, a
 // device whose owner never set a timezone gets Asia/Shanghai through setTimezone
 // (the same path as timezone.set); an owner-chosen zone is never replaced, and
@@ -203,15 +209,25 @@ func (s *Service) applyRegionEffects(ch RegionChange) {
 func (s *Service) applyPingRegion(region string, setTimezone func(string) error) {
 	region = beclient.NormalizeRegion(region)
 	previous := strings.ToUpper(strings.TrimSpace(s.config.Region))
+	wasChina := s.config.InChina()
+	if region == previous || region == config.RegionCN {
+		s.leaveStreak = 0
+	}
 	if region == previous {
 		return
 	}
-	wasChina := s.config.InChina()
+	if wasChina && region != config.RegionCN {
+		s.leaveStreak++
+		if s.leaveStreak < regionLeaveAfter {
+			return
+		}
+		s.leaveStreak = 0
+	}
 	if err := s.config.WithLockSave(func(c *config.Config) { c.Region = region }); err != nil {
 		slog.Error("save region failed", "component", "status-reporter", "error", err)
 		return
 	}
-	slog.Info("region updated from backend", "component", "status-reporter", "region", region)
+	slog.Info("region updated from status reply", "component", "status-reporter", "region", region)
 	if !wasChina && s.config.InChina() && s.config.Timezone == "" {
 		if err := setTimezone(chinaDefaultTimezone); err != nil {
 			slog.Warn("set default China timezone failed", "component", "status-reporter", "error", err)

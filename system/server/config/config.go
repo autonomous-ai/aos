@@ -253,9 +253,9 @@ type Config struct {
 	// picked in Settings.
 	Timezone string `json:"timezone,omitempty" yaml:"timezone"`
 
-	// Region is the market region the backend reports in the ping reply (e.g.
-	// "CN"). Empty until the backend sends one; a reply without the field never
-	// clears it.
+	// Region is the market region from the status reply (e.g. "CN"), empty when
+	// none. CN is stored on the first reply that carries it; it is cleared only
+	// after 3 consecutive successful replies without it (see applyPingRegion).
 	Region string `json:"region,omitempty" yaml:"region"`
 
 	// DeviceType is the device class/profile id — the folder name under
@@ -388,10 +388,10 @@ func Default() Config {
 	}
 }
 
-// RegionCN is the region code the backend sends for mainland China.
+// RegionCN is the region code for mainland China.
 const RegionCN = "CN"
 
-// InChina reports whether the backend placed this device in mainland China.
+// InChina reports whether the device's region is mainland China.
 func (c *Config) InChina() bool {
 	return c != nil && strings.EqualFold(strings.TrimSpace(c.Region), RegionCN)
 }

@@ -105,6 +105,7 @@ func (s *Service) GetPublicConfig() domain.ConfigPublicResponse {
 func (s *Service) RealtimePublic() domain.RealtimePublic {
 	return domain.RealtimePublic{
 		Enabled:   s.config.RealtimeEnabled(),
+		Active:    s.config.RealtimeEffective(),
 		Provider:  s.config.RealtimeProvider(),
 		Model:     s.config.RealtimeModel(),
 		Voice:     s.config.RealtimeVoice(),

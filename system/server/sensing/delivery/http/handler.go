@@ -182,7 +182,7 @@ func ProvideSensingHandler(gw domain.AgentGateway, bus *monitor.Bus, cfg *config
 		return cfg.EnvironmentSettings().Enabled && device.Capabilities(cfg.DeviceTypeOrDefault())[device.CapEnvironment] &&
 			(isSleeping == nil || !isSleeping())
 	})
-	intent.SetChitchatEnabled(!cfg.RealtimeEnabled())
+	intent.SetChitchatEnabled(!cfg.RealtimeEffective())
 	return &SensingHandler{
 		intentResolver: jev.NewResolver(),
 		agentGateway:   gw,

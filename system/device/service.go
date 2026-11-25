@@ -43,8 +43,10 @@ type Service struct {
 	// foMu serializes Fo token refreshes (fo.go).
 	foMu sync.Mutex
 	// regionSubs are told when the region changes (status_reporter.go).
-	regionMu   sync.Mutex
-	regionSubs []func(RegionChange)
+	regionMu sync.Mutex
+	// leaveStreak counts consecutive successful replies without CN while CN is stored; touched only by the status reporter goroutine.
+	leaveStreak int
+	regionSubs  []func(RegionChange)
 }
 
 func ProvideService(config *config.Config, ns *network.Service, gw domain.AgentGateway, be *beclient.Client, sled *statusled.Service) *Service {

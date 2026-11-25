@@ -144,6 +144,8 @@ export function SettingsPanel({ activeSection }: { activeSection: SettingsSectio
   const [ttsSpeed, setTtsSpeed] = useState(1.2);
   const [ttsVoices, setTtsVoices] = useState<string[]>([]);
   const [realtimeEnabled, setRealtimeEnabled] = useState(true);
+  // The saved setting is on but realtime does not run on this device (Gemini Live in China).
+  const [realtimeNotRunning, setRealtimeNotRunning] = useState(false);
   const [voiceInputMode, setVoiceInputMode] = useState<VoiceInputMode>("automatic");
   const [wakeWord, setWakeWord] = useState(false);
   const [agentName, setAgentName] = useState("");
@@ -310,6 +312,7 @@ export function SettingsPanel({ activeSection }: { activeSection: SettingsSectio
         setTapLook(wakeLookFrom(cfg.tap_light));
         if (cfg.realtime) {
           setRealtimeEnabled(cfg.realtime.enabled ?? true);
+          setRealtimeNotRunning((cfg.realtime.enabled ?? true) && cfg.realtime.active === false);
           setRealtimeProvider(cfg.realtime.provider || "gemini");
           if (cfg.realtime.voice) setRealtimeVoice(cfg.realtime.voice);
           if (cfg.realtime.reasoning) setRealtimeReasoning(cfg.realtime.reasoning);
@@ -894,6 +897,7 @@ export function SettingsPanel({ activeSection }: { activeSection: SettingsSectio
             <RealtimeSection
               active={activeSection === "realtime"}
               realtimeLoaded={realtimeLoaded}
+              notRunningHere={realtimeNotRunning}
               llmLoaded={llmLoaded}
               enabled={realtimeEnabled} setEnabled={setRealtimeEnabled}
               provider={realtimeProvider} setProvider={setRealtimeProvider}

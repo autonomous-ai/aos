@@ -215,10 +215,9 @@ type PingResponse struct {
 	Status   string      `json:"status"`
 	DeviceID string      `json:"device_id,omitempty"`
 	MQTT     *MQTTConfig `json:"mqtt,omitempty"`
-	// Region is the market region the backend placed this device in (e.g. "CN"),
-	// upper-cased and read leniently: absent, null, a number or anything that is
-	// not 1-8 letters reads as "", and the rest of the reply is still used. The
-	// backend leaves the field out when the device has no region.
+	// Region is the market region from the status reply (e.g. "CN"), upper-cased
+	// and read leniently: absent, null, a number or anything that is not 1-8
+	// letters reads as "" (no region), and the rest of the reply is still used.
 	Region string `json:"-"`
 }
 
