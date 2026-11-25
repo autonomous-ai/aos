@@ -101,7 +101,7 @@ func (c *MQTT) Connect(ctx context.Context) error {
 	connCtx := c.connCtx
 	connCancel := c.connCancel
 	if c.sel == nil {
-		c.sel = NewSelector(DefaultPolicy, false, nil)
+		c.sel = NewSelector(DefaultPolicy, "", nil)
 	}
 	c.switchCh = make(chan struct{}, 1)
 	c.done = make(chan struct{})
@@ -114,9 +114,6 @@ func (c *MQTT) Connect(ctx context.Context) error {
 
 	up := make(chan struct{})
 	var upOnce sync.Once
-	if c.fallback {
-		c.sel.Started()
-	}
 	if err := c.start(connCtx, c.sel.Current(), func() { upOnce.Do(func() { close(up) }) }); err != nil {
 		connCancel()
 		return err
@@ -141,7 +138,11 @@ func (c *MQTT) Connect(ctx context.Context) error {
 // start opens a connection manager on transport t. onUp runs on every successful
 // connection (it is how Connect learns the first handshake finished).
 func (c *MQTT) start(parent context.Context, t Transport, onUp func()) error {
-	serverURL, err := c.opts.ServerURLFor(t)
+	opts := c.opts
+	if u := c.sel.WSURL(); u != "" {
+		opts.WSURL = u // the current URL, which may have changed since the client was made
+	}
+	serverURL, err := opts.ServerURLFor(t)
 	if err != nil {
 		return err
 	}
@@ -197,6 +198,12 @@ func (c *MQTT) start(parent context.Context, t Transport, onUp func()) error {
 		},
 		OnConnectError: func(err error) {
 			slog.Error("connect error", "component", "mqtt", "transport", string(t), "error", err)
+			// A broker that answers CONNACK with a refusal is reachable: another
+			// transport would not help, so only connects that never got there count.
+			var refused *autopaho.ConnackError
+			if errors.As(err, &refused) {
+				return
+			}
 			if c.fallback && current() && c.sel.Failure() {
 				select {
 				case c.switchCh <- struct{}{}:
@@ -242,7 +249,11 @@ func (c *MQTT) tlsFor(t Transport) *tls.Config {
 	if c.tlsOverride != nil {
 		return c.tlsOverride
 	}
-	return c.opts.TLSConfigFor(t)
+	opts := c.opts
+	if u := c.sel.WSURL(); u != "" {
+		opts.WSURL = u
+	}
+	return opts.TLSConfigFor(t)
 }
 
 func (c *MQTT) reconnectBackoff() autopaho.Backoff {

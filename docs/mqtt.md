@@ -49,19 +49,22 @@ Some networks block the broker's TCP port but allow HTTPS. When the ping reply c
 | Ping reply | What the device does |
 |------------|----------------------|
 | `mqtt_ws_url` absent | keeps the stored value (old backends keep working, nothing changes) |
-| `mqtt_ws_url` is a `wss://` URL | stores it; a new value restarts the MQTT client |
+| `mqtt_ws_url` is a `wss://` URL | stores it; a new value is used the next time a fallback happens and does not restart the client |
 | `mqtt_ws_url` is `""` | clears it; the fallback is off |
 | any other scheme (`ws://`, `https://`, …) | ignored, so credentials never travel over a plain WebSocket |
 
 Transport rules:
 
-- **TCP stays primary.** The client connects exactly as before (plain, or TLS when `mqtt_tls` is on). Nothing changes while TCP works, or when no `mqtt_ws_url` is known.
-- **TCP to WSS.** After a connection outage of at least 60 s with at least 2 failed attempts and no success, the client moves to the WSS URL, with the same client ID, credentials and subscriptions. Both conditions are needed, so a short broker restart does not move it. Dropped sessions count like failed first connects.
-- **WSS back to TCP.** While on WSS, the client dials the TCP broker port (and does the TLS handshake when TLS is on) every 30 minutes without disturbing the live session. When that works it reconnects over TCP; if TCP then keeps failing it returns to WSS by the same rule.
-- **Bad WSS URL.** If WSS itself is down for 120 s with 2 failed attempts, the client goes back to TCP, so a wrong URL cannot strand the device.
+- **TCP stays primary.** The client connects as before (plain, or TLS when `mqtt_tls` is on). Nothing changes while TCP works, or when no `mqtt_ws_url` is known.
+- **TCP to WSS.** After 3 failed connection attempts in a row, none of them reaching the broker's CONNACK, the client moves to the WSS URL, with the same client ID, credentials and subscriptions. There is no minimum outage time. A session that connected and then dropped does not count as a failure, and a broker that answers CONNACK with a refusal does not either (it is reachable, another transport would not help).
+- **WSS back to TCP.** While on WSS, the client dials the TCP broker port (and does the TLS handshake when TLS is on) every 10 minutes without disturbing the live session. When that works it reconnects over TCP; if TCP then fails 3 times in a row it returns to WSS.
+- **Bad WSS URL.** If WSS itself fails 6 times in a row, the client goes back to TCP, so a wrong URL cannot strand the device.
+- **A new `mqtt_ws_url` never moves a working connection.** It is stored and used the next time a fallback happens; it does not restart the client and does not reset the transport. A change to the broker, port, login, channel or TLS switch still restarts the client, on TCP.
 - WSS always uses TLS 1.2 or newer, verified against the system root CAs and the host name of the WSS URL.
-- A changed broker config (including a new `mqtt_ws_url`) restarts the client on TCP.
 - Short-lived MQTT clients (one-shot publishes) use whichever transport the main client is on.
+- The stored URL is kept across ping replies that omit `mqtt_ws_url`; a reply with `""` clears it.
+
+Timing that applies to every device, with or without a WSS URL: one connection attempt may take 10 s (it was 30 s), and the MQTT keepalive is 60 s (it was 65535 s). A dead broker link is now noticed within about a minute, so the client reconnects, and can fall back to WSS, instead of waiting on a half-open socket.
 
 The log shows the transport: `mqtt connected ... transport=tcp|wss connects=N switches=M` and `mqtt switching transport ... to=wss|tcp`. `connects` counts successful connections (reconnects are `connects-1`), `switches` counts TCP/WSS moves. Credentials are never logged. The ping body is unchanged.
 

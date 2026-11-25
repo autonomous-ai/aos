@@ -6,24 +6,20 @@ import (
 	"go.autonomous.ai/os/system/server/config"
 )
 
-// A new WSS fallback URL must restart the MQTT client; the same URL must not.
-func TestMQTTConfigSignatureTracksWSURL(t *testing.T) {
+// The WSS fallback URL is not part of the signature: a new URL must not
+// restart a working MQTT connection. Real broker changes still do.
+func TestMQTTConfigSignatureIgnoresWSURL(t *testing.T) {
 	t.Setenv("MQTT_TLS", "")
-	mk := func(ws string) *config.Config {
-		return &config.Config{MQTTEndpoint: "b.example", MQTTPort: 1883, MQTTUsername: "u", FAChannel: "fa", MQTTWSURL: ws}
+	mk := func(endpoint, ws string) *config.Config {
+		return &config.Config{MQTTEndpoint: endpoint, MQTTPort: 1883, MQTTUsername: "u", FAChannel: "fa", MQTTWSURL: ws}
 	}
-	sigNone := mqttConfigSignature(mk(""))
-	sigWS := mqttConfigSignature(mk("wss://b.example/mqtt"))
-	if sigWS == sigNone {
-		t.Fatal("adding a ws url must change the signature")
+	base := mqttConfigSignature(mk("b.example", ""))
+	for _, ws := range []string{"wss://b.example/mqtt", "wss://c.example/mqtt"} {
+		if mqttConfigSignature(mk("b.example", ws)) != base {
+			t.Fatalf("ws url %q changed the signature", ws)
+		}
 	}
-	if mqttConfigSignature(mk("wss://b.example/mqtt")) != sigWS {
-		t.Fatal("same config must give the same signature")
-	}
-	if mqttConfigSignature(mk("wss://c.example/mqtt")) == sigWS {
-		t.Fatal("a different ws url must change the signature")
-	}
-	if mqttConfigSignature(mk("")) != sigNone {
-		t.Fatal("clearing the ws url must return to the original signature")
+	if mqttConfigSignature(mk("other.example", "")) == base {
+		t.Fatal("a different broker must change the signature")
 	}
 }

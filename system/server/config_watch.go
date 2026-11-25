@@ -79,15 +79,22 @@ func (s *Server) handleDeviceIDChange(deviceID string) {
 }
 
 // mqttConfigSignature identifies the broker-connection settings; a change restarts the client.
+// The WSS fallback URL is left out on purpose: a new URL must not move a working
+// connection (see handleMQTTConfigChange).
 func mqttConfigSignature(c *config.Config) string {
-	return fmt.Sprintf("%s|%d|%s|%s|%s|%t|%s",
+	return fmt.Sprintf("%s|%d|%s|%s|%s|%t",
 		c.MQTTEndpoint, c.MQTTPort, c.MQTTUsername,
-		c.MQTTPassword, c.FAChannel, c.MQTTTLSEnabled(), c.MQTTWSURL)
+		c.MQTTPassword, c.FAChannel, c.MQTTTLSEnabled())
 }
 
 // handleMQTTConfigChange restarts the MQTT client when any broker-connection
-// field (endpoint, port, username, password, fa_channel, TLS switch, WSS fallback URL) changes.
+// field (endpoint, port, username, password, fa_channel, TLS switch) changes.
+// The WSS fallback URL is handed to the factory in place and used the next time
+// the client falls back.
 func (s *Server) handleMQTTConfigChange() {
+	if s.mqttFactory != nil {
+		s.mqttFactory.SetWSURL(s.config.MQTTWSURL)
+	}
 	sig := mqttConfigSignature(s.config)
 	if s.lastMQTTSig == nil {
 		s.lastMQTTSig = &sig

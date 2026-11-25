@@ -122,12 +122,11 @@ func TestFallbackToWSSAndBack(t *testing.T) {
 		portNum = portNum*10 + int(ch-'0')
 	}
 
-	sel := NewSelector(Policy{MinFailures: 2, MinOutage: 0, ProbeInterval: time.Hour}, true, time.Now)
+	sel := NewSelector(Policy{MinFailures: 3, ProbeInterval: time.Hour}, "wss://"+strings.TrimPrefix(srv.URL, "https://")+"/mqtt", time.Now)
 	c := ProvideClient(Options{
 		Endpoint:       host,
 		Port:           portNum,
 		ClientID:       "test-client",
-		WSURL:          "wss://" + strings.TrimPrefix(srv.URL, "https://") + "/mqtt",
 		ConnectTimeout: 2 * time.Second,
 	})
 	c.sel = sel
@@ -153,6 +152,14 @@ func TestFallbackToWSSAndBack(t *testing.T) {
 	if err := c.Publish(ctx, "t", 0, []byte("x")); err != nil {
 		t.Fatalf("publish over wss: %v", err)
 	}
+
+	// A new WSS URL while connected must not touch the session.
+	sel.SetWSURL("wss://elsewhere.example/mqtt")
+	time.Sleep(150 * time.Millisecond)
+	if wsAccepted.Load() != 1 || sel.Current() != TransportWSS || !sel.Status().Connected || sel.Status().Switches != 1 {
+		t.Fatalf("url change moved the connection: sessions=%d status=%+v", wsAccepted.Load(), sel.Status())
+	}
+	sel.SetWSURL("wss://" + strings.TrimPrefix(srv.URL, "https://") + "/mqtt")
 
 	// TCP still dead: a due probe fails and the client stays on WSS.
 	sel.mu.Lock()
@@ -187,7 +194,7 @@ func TestNoFallbackWithoutWSURL(t *testing.T) {
 		portNum = portNum*10 + int(ch-'0')
 	}
 	f, _ := ProvideFactory(Config{Endpoint: host, Port: portNum})
-	f.sel.policy = Policy{MinFailures: 1, MinOutage: 0, ProbeInterval: time.Hour}
+	f.sel.policy = Policy{MinFailures: 1, ProbeInterval: time.Hour}
 	c := f.GetFallbackClient("x")
 	c.backoff = fastBackoff
 	c.opts.ConnectTimeout = time.Second

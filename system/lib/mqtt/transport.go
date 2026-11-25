@@ -32,29 +32,26 @@ func NormalizeWSURL(raw string) (string, bool) {
 
 // Policy tunes when the client leaves TCP for WSS and when it tries TCP again.
 type Policy struct {
-	// MinFailures is the number of failed connection attempts in one outage
-	// before TCP is given up on.
+	// MinFailures is the number of failed connection attempts in a row, none of
+	// them reaching the broker's CONNACK, before TCP is given up on. A session
+	// that connected and then dropped does not count.
 	MinFailures int
-	// MinOutage is how long the connection must have been down, without one
-	// success, before TCP is given up on. Both thresholds must be met, so a
-	// short broker restart does not move the device off TCP.
-	MinOutage time.Duration
 	// ProbeInterval is how often a device on WSS checks whether TCP works again.
 	ProbeInterval time.Duration
 }
 
-// DefaultPolicy: two failed attempts over at least 60 s of outage, TCP re-check
-// every 30 minutes.
+// DefaultPolicy: three failed connects in a row move the client to WSS, and it
+// re-checks TCP every 10 minutes. If WSS itself fails twice as many times in a
+// row, the client returns to TCP.
 var DefaultPolicy = Policy{
-	MinFailures:   2,
-	MinOutage:     60 * time.Second,
-	ProbeInterval: 30 * time.Minute,
+	MinFailures:   3,
+	ProbeInterval: 10 * time.Minute,
 }
 
 // Status is a snapshot of the transport state.
 type Status struct {
 	Transport Transport
-	// WSURLKnown is true when a usable WSS URL is configured.
+	// WSURLKnown is true when a usable WSS URL is held.
 	WSURLKnown bool
 	Connected  bool
 	// Connects counts successful connections (the first one included);
@@ -72,34 +69,49 @@ type Selector struct {
 	now    func() time.Time
 	policy Policy
 
-	wsKnown bool
-	cur     Transport
+	wsURL string // normalized wss URL, "" when none
+	cur   Transport
 
-	connected   bool
-	failures    int       // failed attempts in the current outage
-	outageSince time.Time // zero while connected
-	wssSince    time.Time // when TCP was last given up on or last probed
-	connects    int
-	switches    int
+	connected bool
+	failures  int       // failed attempts in a row since the last success
+	wssSince  time.Time // when TCP was last given up on or last probed
+	connects  int
+	switches  int
 }
 
-// NewSelector starts on TCP. wsKnown says whether a WSS URL is available.
-func NewSelector(p Policy, wsKnown bool, now func() time.Time) *Selector {
+// NewSelector starts on TCP. wsURL is the wss fallback URL ("" or invalid: none).
+func NewSelector(p Policy, wsURL string, now func() time.Time) *Selector {
 	if now == nil {
 		now = time.Now
 	}
-	return &Selector{now: now, policy: p, wsKnown: wsKnown, cur: TransportTCP}
+	u, _ := NormalizeWSURL(wsURL)
+	return &Selector{now: now, policy: p, wsURL: u, cur: TransportTCP}
 }
 
-// Reset returns to TCP with fresh counters; call it when the broker config changed.
-func (s *Selector) Reset(wsKnown bool) {
+// SetWSURL replaces the wss URL in place. It never moves a working connection:
+// the new URL is used the next time the client falls back to WSS.
+func (s *Selector) SetWSURL(raw string) {
+	u, _ := NormalizeWSURL(raw)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.wsKnown = wsKnown
+	s.wsURL = u
+}
+
+// WSURL returns the wss URL to use for the WSS transport, "" when none.
+func (s *Selector) WSURL() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.wsURL
+}
+
+// Reset returns to TCP with fresh counters; call it when the broker config
+// changed and the client restarts. The wss URL is kept.
+func (s *Selector) Reset() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.cur = TransportTCP
 	s.connected = false
 	s.failures = 0
-	s.outageSince = time.Time{}
 	s.wssSince = time.Time{}
 	s.connects = 0
 	s.switches = 0
@@ -116,17 +128,7 @@ func (s *Selector) Current() Transport {
 func (s *Selector) Status() Status {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return Status{Transport: s.cur, WSURLKnown: s.wsKnown, Connected: s.connected, Connects: s.connects, Switches: s.switches}
-}
-
-// Started marks the beginning of a connection effort, so an outage is timed
-// from the first attempt and not from the first failure.
-func (s *Selector) Started() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if !s.connected && s.outageSince.IsZero() {
-		s.outageSince = s.now()
-	}
+	return Status{Transport: s.cur, WSURLKnown: s.wsURL != "", Connected: s.connected, Connects: s.connects, Switches: s.switches}
 }
 
 // Up records a successful connection.
@@ -136,41 +138,35 @@ func (s *Selector) Up() {
 	s.connected = true
 	s.connects++
 	s.failures = 0
-	s.outageSince = time.Time{}
 }
 
-// Down records a lost connection; the outage clock starts now.
+// Down records a lost session. It is not a failed connect: the count of failures
+// in a row starts from zero, as for a first connect.
 func (s *Selector) Down() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.connected = false
-	if s.outageSince.IsZero() {
-		s.outageSince = s.now()
-	}
+	s.failures = 0
 }
 
-// Failure records a failed connection attempt and reports whether the client
-// must switch to Current(). On TCP with a WSS URL known, TCP is dropped after
-// MinFailures failures over MinOutage. On WSS, when WSS itself stays down for
-// twice that, the client goes back to TCP so a bad WSS URL cannot strand it.
+// Failure records a failed connection attempt (one that never reached CONNACK)
+// and reports whether the client must switch to Current(). On TCP with a WSS URL
+// held, TCP is dropped after MinFailures failures in a row. On WSS, twice as many
+// failures in a row send the client back to TCP, so a bad WSS URL cannot strand it.
 func (s *Selector) Failure() (switched bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := s.now()
 	s.connected = false
-	if s.outageSince.IsZero() {
-		s.outageSince = now
-	}
 	s.failures++
-	outage := now.Sub(s.outageSince)
 	switch s.cur {
 	case TransportTCP:
-		if s.wsKnown && s.failures >= s.policy.MinFailures && outage >= s.policy.MinOutage {
+		if s.wsURL != "" && s.failures >= s.policy.MinFailures {
 			s.moveLocked(TransportWSS, now)
 			return true
 		}
 	case TransportWSS:
-		if s.failures >= s.policy.MinFailures && outage >= 2*s.policy.MinOutage {
+		if s.failures >= 2*s.policy.MinFailures {
 			s.moveLocked(TransportTCP, now)
 			return true
 		}
@@ -202,12 +198,11 @@ func (s *Selector) ProbeDone(ok bool) (switched bool) {
 	return true
 }
 
-// moveLocked changes transport and restarts the outage accounting for it.
+// moveLocked changes transport and restarts the failure count for it.
 func (s *Selector) moveLocked(t Transport, now time.Time) {
 	s.cur = t
 	s.switches++
 	s.failures = 0
-	s.outageSince = now
 	s.connected = false
 	if t == TransportWSS {
 		s.wssSince = now

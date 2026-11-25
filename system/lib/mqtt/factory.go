@@ -10,19 +10,21 @@ type Factory struct {
 
 // ProvideFactory creates a Factory from config.
 func ProvideFactory(cfg Config) (*Factory, error) {
-	return &Factory{config: cfg, sel: NewSelector(DefaultPolicy, hasWS(cfg.WSURL), nil)}, nil
-}
-
-func hasWS(raw string) bool {
-	_, ok := NormalizeWSURL(raw)
-	return ok
+	return &Factory{config: cfg, sel: NewSelector(DefaultPolicy, cfg.WSURL, nil)}, nil
 }
 
 // UpdateConfig refreshes the connection config; call before restartMQTT to pick up new credentials.
 // The transport state restarts on TCP.
 func (f *Factory) UpdateConfig(cfg Config) {
 	f.config = cfg
-	f.sel.Reset(hasWS(cfg.WSURL))
+	f.sel.SetWSURL(cfg.WSURL)
+	f.sel.Reset()
+}
+
+// SetWSURL updates the wss fallback URL without touching any live connection:
+// the new URL is used the next time a client falls back to WSS.
+func (f *Factory) SetWSURL(raw string) {
+	f.sel.SetWSURL(raw)
 }
 
 // Status reports the current transport and connect/switch counts.
@@ -38,7 +40,7 @@ func (f *Factory) options(clientID string) Options {
 		Password: f.config.Password,
 		ClientID: clientID,
 		TLS:      f.config.TLS,
-		WSURL:    f.config.WSURL,
+		WSURL:    f.sel.WSURL(),
 	}
 }
 

@@ -11,9 +11,23 @@ type fakeClock struct{ t time.Time }
 func (f *fakeClock) now() time.Time          { return f.t }
 func (f *fakeClock) advance(d time.Duration) { f.t = f.t.Add(d) }
 
+const testWSURL = "wss://ws.example/mqtt"
+
 func newTestSelector(ws bool) (*Selector, *fakeClock) {
 	clk := &fakeClock{t: time.Unix(1_700_000_000, 0)}
-	return NewSelector(DefaultPolicy, ws, clk.now), clk
+	url := ""
+	if ws {
+		url = testWSURL
+	}
+	return NewSelector(DefaultPolicy, url, clk.now), clk
+}
+
+// failN records n failed connects and returns whether the last one asked to switch.
+func failN(s *Selector, n int) (switched bool) {
+	for i := 0; i < n; i++ {
+		switched = s.Failure()
+	}
+	return switched
 }
 
 func TestNormalizeWSURL(t *testing.T) {
@@ -81,46 +95,34 @@ func TestTLSConfigForWSS(t *testing.T) {
 	}
 }
 
+func TestDefaultPolicy(t *testing.T) {
+	if DefaultPolicy.MinFailures != 3 || DefaultPolicy.ProbeInterval != 10*time.Minute {
+		t.Fatalf("DefaultPolicy = %+v", DefaultPolicy)
+	}
+	if DefaultKeepAlive != 60 || DefaultConnectTimeout != 10*time.Second {
+		t.Fatalf("keepalive %d, connect timeout %v", DefaultKeepAlive, DefaultConnectTimeout)
+	}
+}
+
 func TestSelectorStaysOnTCPWithoutWSURL(t *testing.T) {
-	s, clk := newTestSelector(false)
-	s.Started()
-	for i := 0; i < 20; i++ {
-		clk.advance(30 * time.Second)
-		if s.Failure() {
-			t.Fatal("no ws url: must never switch")
-		}
+	s, _ := newTestSelector(false)
+	if failN(s, 50) {
+		t.Fatal("no ws url: must never switch")
 	}
 	if s.Current() != TransportTCP {
 		t.Fatalf("current = %s", s.Current())
 	}
 }
 
-func TestSelectorSwitchesToWSSAfterOutage(t *testing.T) {
+func TestSelectorThreeFailuresInARowSwitchWithoutWaiting(t *testing.T) {
 	s, clk := newTestSelector(true)
-	s.Started()
-
-	// Failures alone are not enough: a broker restart must not leave TCP.
-	for i := 0; i < 5; i++ {
-		clk.advance(2 * time.Second)
-		if s.Failure() {
-			t.Fatalf("switched after only %ds of outage", (i+1)*2)
-		}
+	// No outage clause: three failures right away are enough.
+	if failN(s, 2) {
+		t.Fatal("two failures must not switch")
 	}
-	// Time alone is not enough either: one slow failure does not count as "failing".
-	s2, clk2 := newTestSelector(true)
-	s2.Started()
-	clk2.advance(5 * time.Minute)
-	if s2.Failure() {
-		t.Fatal("one failure must not switch, however long it took")
-	}
-	if s2.Current() != TransportTCP {
-		t.Fatalf("one failure switched transport: %s", s2.Current())
-	}
-
-	// 60 s down and at least two failures: give up on TCP.
-	clk.advance(60 * time.Second)
+	clk.advance(time.Second)
 	if !s.Failure() {
-		t.Fatal("expected switch to WSS")
+		t.Fatal("third failure in a row must switch to WSS")
 	}
 	if s.Current() != TransportWSS {
 		t.Fatalf("current = %s", s.Current())
@@ -130,65 +132,47 @@ func TestSelectorSwitchesToWSSAfterOutage(t *testing.T) {
 	}
 }
 
-func TestSelectorBlackholedTCP(t *testing.T) {
-	// TCP black-holed: each attempt takes the 30 s connect timeout plus ~7 s of
-	// backoff, so the second failure lands at about 75 s and decides.
-	s, clk := newTestSelector(true)
-	s.Started()
-	clk.advance(35 * time.Second)
-	if s.Failure() {
-		t.Fatal("first failure must not switch")
+func TestSelectorSuccessResetsFailureCount(t *testing.T) {
+	s, _ := newTestSelector(true)
+	failN(s, 2)
+	s.Up()
+	if failN(s, 2) {
+		t.Fatal("failures before a success must not count")
 	}
-	clk.advance(40 * time.Second)
 	if !s.Failure() {
-		t.Fatal("second failure after 75 s must switch")
+		t.Fatal("three in a row after the success must switch")
 	}
 }
 
-func TestSelectorUpResetsOutage(t *testing.T) {
-	s, clk := newTestSelector(true)
-	s.Started()
-	clk.advance(50 * time.Second)
-	s.Failure()
+func TestSelectorDroppedSessionIsNotAFailure(t *testing.T) {
+	s, _ := newTestSelector(true)
+	failN(s, 2)
 	s.Up()
-	st := s.Status()
-	if !st.Connected || st.Connects != 1 {
-		t.Fatalf("status = %+v", st)
+	s.Down() // a session that connected and dropped
+	if failN(s, 2) {
+		t.Fatal("a drop restarts the count from zero")
 	}
-	// Drop later: the outage clock restarts, so old failures do not count.
-	clk.advance(time.Hour)
-	s.Down()
-	clk.advance(30 * time.Second)
-	if s.Failure() {
-		t.Fatal("outage of 30 s with one failure must not switch")
-	}
-	// A dropped session that never comes back still times out like a first connect.
-	clk.advance(40 * time.Second)
 	if !s.Failure() {
-		t.Fatal("70 s outage with two failures must switch")
+		t.Fatal("three failed reconnects after the drop must switch")
 	}
 }
 
 func TestSelectorProbeBackToTCP(t *testing.T) {
 	s, clk := newTestSelector(true)
-	s.Started()
-	clk.advance(30 * time.Second)
-	s.Failure()
-	clk.advance(40 * time.Second)
-	if !s.Failure() {
+	if !failN(s, 3) {
 		t.Fatal("setup: expected WSS")
 	}
 	s.Up()
 	if s.ProbeDue() {
 		t.Fatal("probe due immediately after the switch")
 	}
-	clk.advance(29 * time.Minute)
+	clk.advance(9*time.Minute + 59*time.Second)
 	if s.ProbeDue() {
-		t.Fatal("probe due before 30 min")
+		t.Fatal("probe due before 10 min")
 	}
-	clk.advance(time.Minute)
+	clk.advance(time.Second)
 	if !s.ProbeDue() {
-		t.Fatal("probe must be due after 30 min")
+		t.Fatal("probe must be due at 10 min")
 	}
 	// Failed probe: stay on WSS and wait another interval.
 	if s.ProbeDone(false) {
@@ -197,9 +181,9 @@ func TestSelectorProbeBackToTCP(t *testing.T) {
 	if s.ProbeDue() {
 		t.Fatal("failed probe must restart the interval")
 	}
-	clk.advance(30 * time.Minute)
+	clk.advance(10 * time.Minute)
 	if !s.ProbeDue() {
-		t.Fatal("probe due again after another 30 min")
+		t.Fatal("probe due again after another 10 min")
 	}
 	if !s.ProbeDone(true) {
 		t.Fatal("working TCP must switch back")
@@ -217,78 +201,107 @@ func TestSelectorProbeBackToTCP(t *testing.T) {
 
 func TestSelectorTCPFailsAgainAfterSwitchBack(t *testing.T) {
 	s, clk := newTestSelector(true)
-	s.Started()
-	clk.advance(30 * time.Second)
-	s.Failure()
-	clk.advance(40 * time.Second)
-	s.Failure() // -> WSS
-	clk.advance(30 * time.Minute)
+	failN(s, 3) // -> WSS
+	clk.advance(10 * time.Minute)
 	if !s.ProbeDone(true) {
 		t.Fatal("expected switch back")
 	}
-	// TCP accepts the probe but then keeps failing: back to WSS after the same rule.
-	clk.advance(30 * time.Second)
-	if s.Failure() {
+	// TCP accepts the probe but then keeps failing: back to WSS by the same rule.
+	if failN(s, 2) {
 		t.Fatal("too early")
 	}
-	clk.advance(40 * time.Second)
 	if !s.Failure() || s.Current() != TransportWSS {
 		t.Fatalf("expected WSS again, current = %s", s.Current())
 	}
 }
 
 func TestSelectorBadWSSReturnsToTCP(t *testing.T) {
-	s, clk := newTestSelector(true)
-	s.Started()
-	clk.advance(30 * time.Second)
-	s.Failure()
-	clk.advance(40 * time.Second)
-	s.Failure() // -> WSS
-	clk.advance(60 * time.Second)
-	if s.Failure() {
-		t.Fatal("WSS must get 2x the outage before it is dropped")
+	s, _ := newTestSelector(true)
+	failN(s, 3) // -> WSS
+	if failN(s, 5) {
+		t.Fatal("WSS gets twice the failures before it is dropped")
 	}
-	clk.advance(70 * time.Second)
 	if !s.Failure() || s.Current() != TransportTCP {
 		t.Fatalf("expected TCP, current = %s", s.Current())
 	}
 }
 
-func TestSelectorReset(t *testing.T) {
+func TestSelectorNewWSURLNeverMovesTheConnection(t *testing.T) {
 	s, clk := newTestSelector(true)
-	s.Started()
-	clk.advance(30 * time.Second)
-	s.Failure()
-	clk.advance(40 * time.Second)
-	s.Failure()
-	s.Reset(false)
-	if st := s.Status(); st.Transport != TransportTCP || st.WSURLKnown || st.Switches != 0 || st.Connects != 0 {
+	s.Up() // working on TCP
+	s.SetWSURL("wss://other.example/mqtt")
+	if st := s.Status(); st.Transport != TransportTCP || !st.Connected || st.Connects != 1 || st.Switches != 0 {
+		t.Fatalf("status = %+v", st)
+	}
+	if s.WSURL() != "wss://other.example/mqtt" {
+		t.Fatalf("url = %q", s.WSURL())
+	}
+	// Now on WSS: a new URL keeps the session on WSS and does not reset to TCP.
+	s.Down()
+	failN(s, 3)
+	s.Up()
+	s.SetWSURL("wss://third.example/mqtt")
+	if st := s.Status(); st.Transport != TransportWSS || !st.Connected {
+		t.Fatalf("status = %+v", st)
+	}
+	clk.advance(time.Minute)
+	if s.ProbeDue() {
+		t.Fatal("a url change must not make a probe due")
+	}
+	// An unusable URL clears the fallback for the next time.
+	s.SetWSURL("ws://insecure.example/mqtt")
+	if s.WSURL() != "" || s.Status().WSURLKnown {
+		t.Fatal("a non-wss url must leave no fallback")
+	}
+}
+
+func TestSelectorURLRemovedWhileFailingStaysOnTCP(t *testing.T) {
+	s, _ := newTestSelector(true)
+	failN(s, 2)
+	s.SetWSURL("")
+	if s.Failure() {
+		t.Fatal("no url: must not switch")
+	}
+}
+
+func TestSelectorResetKeepsURL(t *testing.T) {
+	s, _ := newTestSelector(true)
+	failN(s, 3)
+	s.Reset()
+	if st := s.Status(); st.Transport != TransportTCP || !st.WSURLKnown || st.Switches != 0 || st.Connects != 0 {
 		t.Fatalf("status after reset = %+v", st)
 	}
 }
 
-func TestFactoryShareSelectorAndReset(t *testing.T) {
-	f, err := ProvideFactory(Config{Endpoint: "broker.example", Port: 1883, WSURL: "wss://ws.example/mqtt"})
+func TestFactoryShareSelectorAndURLUpdate(t *testing.T) {
+	f, err := ProvideFactory(Config{Endpoint: "broker.example", Port: 1883, WSURL: testWSURL})
 	if err != nil {
 		t.Fatal(err)
 	}
 	c := f.GetClient("a")
-	if c.opts.WSURL != "wss://ws.example/mqtt" || c.sel != f.sel || c.fallback {
+	if c.opts.WSURL != testWSURL || c.sel != f.sel || c.fallback {
 		t.Fatalf("plain client: %+v", c)
 	}
 	if fc := f.GetFallbackClient("b"); !fc.fallback || fc.sel != f.sel {
 		t.Fatal("fallback client must drive the shared selector")
 	}
-	if !f.Status().WSURLKnown {
-		t.Fatal("ws url must be known")
+	// A URL update reaches the shared state in place: no reset, no restart.
+	f.sel.Up()
+	f.SetWSURL("wss://other.example/mqtt")
+	if f.sel.WSURL() != "wss://other.example/mqtt" {
+		t.Fatal("url not updated")
+	}
+	if st := f.Status(); st.Connects != 1 || st.Transport != TransportTCP || !st.Connected {
+		t.Fatalf("status = %+v", st)
 	}
 	// An invalid URL means no fallback.
 	f.UpdateConfig(Config{Endpoint: "broker.example", Port: 1883, WSURL: "ws://insecure.example/mqtt"})
 	if f.Status().WSURLKnown {
 		t.Fatal("a ws:// URL must not enable the fallback")
 	}
+	// A config update (client restart) starts on TCP.
 	f.UpdateConfig(Config{Endpoint: "broker.example", Port: 1883, WSURL: "wss://other.example/mqtt"})
-	if st := f.Status(); !st.WSURLKnown || st.Transport != TransportTCP {
+	if st := f.Status(); !st.WSURLKnown || st.Transport != TransportTCP || st.Connects != 0 {
 		t.Fatalf("status = %+v", st)
 	}
 }

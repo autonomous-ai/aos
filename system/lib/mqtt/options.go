@@ -9,11 +9,14 @@ import (
 	"time"
 )
 
-// DefaultKeepAlive is the default keepalive in seconds (spec maximum).
-const DefaultKeepAlive = 65535
+// DefaultKeepAlive is the default keepalive in seconds. A short value makes a
+// dead broker link visible within about a minute, so the client reconnects (and
+// can fall back to WSS) instead of sitting on a half-open socket.
+const DefaultKeepAlive = 60
 
-// DefaultConnectTimeout is the default connection timeout.
-const DefaultConnectTimeout = 30 * time.Second
+// DefaultConnectTimeout is the default time one connection attempt may take,
+// from dialling to the broker's CONNACK.
+const DefaultConnectTimeout = 10 * time.Second
 
 // DefaultPort is the default MQTT port when Port is 0.
 const DefaultPort = 1883
@@ -35,8 +38,8 @@ type Options struct {
 	// TLS connects over TLS (scheme ssl) using the system root CAs with hostname
 	// verification. When set, the client never falls back to a plain connection.
 	TLS bool
-	// WSURL is the optional wss:// URL the client falls back to when TCP keeps
-	// failing; empty disables the fallback. See Selector.
+	// WSURL is the optional wss:// URL used for the WSS transport; the client
+	// reads the current value from its Selector, which can change while running.
 	WSURL string
 }
 
