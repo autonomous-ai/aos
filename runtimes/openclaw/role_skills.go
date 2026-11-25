@@ -37,11 +37,12 @@ const (
 
 // pluginsSkillsRoots returns the plugin-skill roots to try, in order: the host
 // that serves this device's OTA metadata first (the release root is the parent
-// of the "/<prefix>/ota/metadata.json" path), then the default root.
+// of the "/<prefix>/ota/metadata.json" path), then the default root. Only an
+// https metadata URL is used; any other leaves just the default root.
 func pluginsSkillsRoots(otaMetadataURL string) []string {
 	roots := []string{}
 	if u, err := url.Parse(strings.TrimSpace(otaMetadataURL)); err == nil &&
-		(u.Scheme == "https" || u.Scheme == "http") && u.Host != "" &&
+		u.Scheme == "https" && u.Host != "" &&
 		strings.HasSuffix(u.Path, otaMetadataSuffix) {
 		prefix := path.Dir(strings.TrimSuffix(u.Path, otaMetadataSuffix))
 		root := u.Scheme + "://" + u.Host + strings.TrimSuffix(prefix, "/") + "/plugins-skills"

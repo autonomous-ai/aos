@@ -73,6 +73,8 @@ func TestPluginsSkillsRoots(t *testing.T) {
 		{strings.TrimSuffix(defaultPluginsSkillsRoot, "/plugins-skills") + "/os/ota/metadata.json", []string{defaultPluginsSkillsRoot}},
 		{"https://example.test/metadata.json", []string{defaultPluginsSkillsRoot}},
 		{"file:///tmp/os/ota/metadata.json", []string{defaultPluginsSkillsRoot}},
+		{"http://cdn.autonomous.ai/os/ota/metadata.json", []string{defaultPluginsSkillsRoot}},
+		{"HTTP://cdn.autonomous.ai/os/ota/metadata.json", []string{defaultPluginsSkillsRoot}},
 	}
 	for _, c := range cases {
 		got := pluginsSkillsRoots(c.in)
