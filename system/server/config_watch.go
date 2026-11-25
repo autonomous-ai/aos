@@ -78,12 +78,17 @@ func (s *Server) handleDeviceIDChange(deviceID string) {
 	})
 }
 
+// mqttConfigSignature identifies the broker-connection settings; a change restarts the client.
+func mqttConfigSignature(c *config.Config) string {
+	return fmt.Sprintf("%s|%d|%s|%s|%s|%t|%s",
+		c.MQTTEndpoint, c.MQTTPort, c.MQTTUsername,
+		c.MQTTPassword, c.FAChannel, c.MQTTTLSEnabled(), c.MQTTWSURL)
+}
+
 // handleMQTTConfigChange restarts the MQTT client when any broker-connection
-// field (endpoint, port, username, password, fa_channel, TLS switch) changes.
+// field (endpoint, port, username, password, fa_channel, TLS switch, WSS fallback URL) changes.
 func (s *Server) handleMQTTConfigChange() {
-	sig := fmt.Sprintf("%s|%d|%s|%s|%s|%t",
-		s.config.MQTTEndpoint, s.config.MQTTPort, s.config.MQTTUsername,
-		s.config.MQTTPassword, s.config.FAChannel, s.config.MQTTTLSEnabled())
+	sig := mqttConfigSignature(s.config)
 	if s.lastMQTTSig == nil {
 		s.lastMQTTSig = &sig
 		return

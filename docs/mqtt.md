@@ -42,6 +42,29 @@ With TLS on, the client:
 
 While the switch is on, the ping body also carries `"mqtt_tls": true`. With the switch off the key is absent and the rest of the ping is unchanged.
 
+### WSS fallback (when the broker port is blocked)
+
+Some networks block the broker's TCP port but allow HTTPS. When the ping reply carries a top-level `mqtt_ws_url` (a `wss://` URL), the device keeps it as `mqtt_ws_url` in `config/config.json` and uses it as a fallback. The `mqtt` block and the credentials are unchanged: the same login, `fa_channel` and `fd_channel` work over WSS.
+
+| Ping reply | What the device does |
+|------------|----------------------|
+| `mqtt_ws_url` absent | keeps the stored value (old backends keep working, nothing changes) |
+| `mqtt_ws_url` is a `wss://` URL | stores it; a new value restarts the MQTT client |
+| `mqtt_ws_url` is `""` | clears it; the fallback is off |
+| any other scheme (`ws://`, `https://`, …) | ignored, so credentials never travel over a plain WebSocket |
+
+Transport rules:
+
+- **TCP stays primary.** The client connects exactly as before (plain, or TLS when `mqtt_tls` is on). Nothing changes while TCP works, or when no `mqtt_ws_url` is known.
+- **TCP to WSS.** After a connection outage of at least 60 s with at least 2 failed attempts and no success, the client moves to the WSS URL, with the same client ID, credentials and subscriptions. Both conditions are needed, so a short broker restart does not move it. Dropped sessions count like failed first connects.
+- **WSS back to TCP.** While on WSS, the client dials the TCP broker port (and does the TLS handshake when TLS is on) every 30 minutes without disturbing the live session. When that works it reconnects over TCP; if TCP then keeps failing it returns to WSS by the same rule.
+- **Bad WSS URL.** If WSS itself is down for 120 s with 2 failed attempts, the client goes back to TCP, so a wrong URL cannot strand the device.
+- WSS always uses TLS 1.2 or newer, verified against the system root CAs and the host name of the WSS URL.
+- A changed broker config (including a new `mqtt_ws_url`) restarts the client on TCP.
+- Short-lived MQTT clients (one-shot publishes) use whichever transport the main client is on.
+
+The log shows the transport: `mqtt connected ... transport=tcp|wss connects=N switches=M` and `mqtt switching transport ... to=wss|tcp`. `connects` counts successful connections (reconnects are `connects-1`), `switches` counts TCP/WSS moves. Credentials are never logged. The ping body is unchanged.
+
 ## Topics
 
 | Topic | Direction | Description |
@@ -1871,8 +1894,9 @@ There is no `ota` case in the os-server MQTT router: the message is logged as `u
 |------|------|
 | `system/lib/mqtt/client.go` | MQTT client (connect, subscribe, publish) |
 | `system/lib/mqtt/config.go` | Config struct |
-| `system/lib/mqtt/options.go` | Connection options |
-| `system/lib/mqtt/factory.go` | Factory to create client with unique ID |
+| `system/lib/mqtt/options.go` | Connection options (TCP and WSS server URLs, TLS settings) |
+| `system/lib/mqtt/transport.go` | TCP/WSS fallback state machine (`Selector`), `mqtt_ws_url` validation |
+| `system/lib/mqtt/factory.go` | Factory to create client with unique ID; shares the transport state between clients |
 | `system/server/device/delivery/mqtt/handler.go` | Command dispatcher |
 | `system/server/device/delivery/mqtt/info_handler.go` | Handle `info` command |
 | `system/server/device/delivery/mqtt/add_channel_hander.go` | Handle `add_channel` command (streams pairing events for WhatsApp) |

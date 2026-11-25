@@ -42,6 +42,29 @@ Khi bật TLS, client:
 
 Khi công tắc bật, body ping có thêm `"mqtt_tls": true`. Khi tắt, key này không có và phần còn lại của ping không đổi.
 
+### Dự phòng WSS (khi cổng broker bị chặn)
+
+Một số mạng chặn cổng TCP của broker nhưng cho phép HTTPS. Khi phản hồi ping có trường cấp cao nhất `mqtt_ws_url` (một URL `wss://`), thiết bị lưu nó thành `mqtt_ws_url` trong `config/config.json` và dùng làm đường dự phòng. Khối `mqtt` và thông tin đăng nhập không đổi: cùng tài khoản, `fa_channel` và `fd_channel` chạy được qua WSS.
+
+| Phản hồi ping | Thiết bị làm gì |
+|---------------|-----------------|
+| không có `mqtt_ws_url` | giữ giá trị đã lưu (backend cũ vẫn chạy, không có gì đổi) |
+| `mqtt_ws_url` là URL `wss://` | lưu lại; giá trị mới làm MQTT client khởi động lại |
+| `mqtt_ws_url` là `""` | xóa; tắt đường dự phòng |
+| scheme khác (`ws://`, `https://`, …) | bỏ qua, để thông tin đăng nhập không bao giờ đi qua WebSocket thường |
+
+Quy tắc chọn transport:
+
+- **TCP vẫn là chính.** Client kết nối như trước (thường, hoặc TLS khi `mqtt_tls` bật). Không có gì đổi khi TCP chạy được, hoặc khi chưa biết `mqtt_ws_url`.
+- **TCP sang WSS.** Sau ít nhất 60 giây mất kết nối với ít nhất 2 lần thử thất bại và không lần nào thành công, client chuyển sang URL WSS, giữ nguyên client ID, thông tin đăng nhập và subscription. Cần cả hai điều kiện, nên broker restart ngắn không làm chuyển. Phiên bị rớt được tính như lần kết nối đầu thất bại.
+- **WSS về TCP.** Khi đang ở WSS, cứ 30 phút client dial thử cổng TCP của broker (kèm bắt tay TLS nếu bật TLS) mà không ảnh hưởng phiên đang chạy. Nếu được thì kết nối lại qua TCP; nếu sau đó TCP vẫn lỗi thì quay lại WSS theo cùng quy tắc.
+- **URL WSS hỏng.** Nếu chính WSS mất 120 giây với 2 lần thử thất bại, client quay về TCP, để URL sai không làm thiết bị mắc kẹt.
+- WSS luôn dùng TLS 1.2 trở lên, kiểm tra theo root CA của hệ thống và tên host của URL WSS.
+- Đổi cấu hình broker (kể cả `mqtt_ws_url` mới) làm client khởi động lại ở TCP.
+- Các MQTT client ngắn hạn (publish một lần) dùng transport mà client chính đang dùng.
+
+Log hiển thị transport: `mqtt connected ... transport=tcp|wss connects=N switches=M` và `mqtt switching transport ... to=wss|tcp`. `connects` đếm số lần kết nối thành công (số lần kết nối lại là `connects-1`), `switches` đếm số lần chuyển TCP/WSS. Không bao giờ log thông tin đăng nhập. Body ping không đổi.
+
 ## Topics
 
 | Topic | Hướng | Mô tả |
@@ -1823,8 +1846,9 @@ Router MQTT của os-server không có case `ota`: message bị log là `unknown
 |------|---------|
 | `system/lib/mqtt/client.go` | MQTT client (connect, subscribe, publish) |
 | `system/lib/mqtt/config.go` | Config struct |
-| `system/lib/mqtt/options.go` | Connection options |
-| `system/lib/mqtt/factory.go` | Factory tạo client với unique ID |
+| `system/lib/mqtt/options.go` | Tùy chọn kết nối (URL server TCP và WSS, cài đặt TLS) |
+| `system/lib/mqtt/transport.go` | State machine dự phòng TCP/WSS (`Selector`), kiểm tra `mqtt_ws_url` |
+| `system/lib/mqtt/factory.go` | Factory tạo client với unique ID; chia sẻ trạng thái transport giữa các client |
 | `system/server/device/delivery/mqtt/handler.go` | Command dispatcher |
 | `system/server/device/delivery/mqtt/info_handler.go` | Handle `info` command |
 | `system/server/device/delivery/mqtt/add_channel_hander.go` | Handle `add_channel` command (stream pairing events cho WhatsApp) |

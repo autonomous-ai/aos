@@ -114,3 +114,38 @@ func TestPingBodyMQTTTLS(t *testing.T) {
 		t.Fatalf("mqtt_tls = %s, want true", body["mqtt_tls"])
 	}
 }
+
+func TestPingParsesMQTTWSURL(t *testing.T) {
+	tests := []struct {
+		name    string
+		body    string
+		wantNil bool
+		want    string
+	}{
+		{"absent", `{"status":"ok","mqtt":{"mqtt_server":"b.example","mqtt_port":"1883"}}`, true, ""},
+		{"set", `{"status":"ok","mqtt_ws_url":"wss://b.example/mqtt","mqtt":{"mqtt_server":"b.example"}}`, false, "wss://b.example/mqtt"},
+		{"present but empty", `{"status":"ok","mqtt_ws_url":""}`, false, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write([]byte(tt.body))
+			}))
+			defer srv.Close()
+			cfg := &config.Config{BackendBaseURL: srv.URL + "/api/v1/ai/v1", BackendAPIKey: "k", MQTTEndpoint: "b.example"}
+			resp, err := New(cfg).Ping(cfg.BackendKey(), PingPayload{})
+			if err != nil || resp == nil {
+				t.Fatalf("ping: %v, %v", resp, err)
+			}
+			if (resp.MQTTWSURL == nil) != tt.wantNil {
+				t.Fatalf("MQTTWSURL = %v, wantNil %t", resp.MQTTWSURL, tt.wantNil)
+			}
+			if resp.MQTTWSURL != nil && *resp.MQTTWSURL != tt.want {
+				t.Fatalf("MQTTWSURL = %q, want %q", *resp.MQTTWSURL, tt.want)
+			}
+			if tt.name == "set" && !resp.HasMQTT() {
+				t.Fatal("the mqtt block must still parse next to mqtt_ws_url")
+			}
+		})
+	}
+}

@@ -274,6 +274,11 @@ type Config struct {
 	// environment variable turns it on as well (see MQTTTLSEnabled).
 	MQTTTLS bool `json:"mqtt_tls,omitempty" yaml:"mqttTLS"`
 
+	// MQTTWSURL is the wss:// URL the device falls back to when the broker is not
+	// reachable over TCP. It comes from the backend ping and uses the same
+	// credentials and channels; empty disables the fallback.
+	MQTTWSURL string `json:"mqtt_ws_url,omitempty" yaml:"mqttWSURL"`
+
 	// LocalIntent enables local keyword matching for common voice commands (default true).
 	// When false, all voice commands go through the agent (OpenClaw).
 	LocalIntent *bool `json:"local_intent,omitempty" yaml:"localIntent"`
@@ -781,6 +786,7 @@ func ProvideMQTTConfig(c *Config) mqtt.Config {
 		Password: c.MQTTPassword,
 		Port:     c.MQTTPort,
 		TLS:      c.MQTTTLSEnabled(),
+		WSURL:    c.MQTTWSURL,
 	}
 }
 

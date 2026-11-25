@@ -35,6 +35,9 @@ type Options struct {
 	// TLS connects over TLS (scheme ssl) using the system root CAs with hostname
 	// verification. When set, the client never falls back to a plain connection.
 	TLS bool
+	// WSURL is the optional wss:// URL the client falls back to when TCP keeps
+	// failing; empty disables the fallback. See Selector.
+	WSURL string
 }
 
 // ServerURL returns mqtt://host:port (ssl://host:port when TLS is set) for Paho.
@@ -56,6 +59,33 @@ func (o *Options) ServerURL() (*url.URL, error) {
 		Host:   fmt.Sprintf("%s:%d", host, port),
 	}
 	return u, nil
+}
+
+// ServerURLFor returns the URL for a transport: the TCP URL for TransportTCP,
+// the configured wss:// URL for TransportWSS.
+func (o *Options) ServerURLFor(t Transport) (*url.URL, error) {
+	if t != TransportWSS {
+		return o.ServerURL()
+	}
+	raw, ok := NormalizeWSURL(o.WSURL)
+	if !ok {
+		return nil, fmt.Errorf("mqtt: no usable wss url")
+	}
+	return url.Parse(raw)
+}
+
+// TLSConfigFor returns the TLS settings for a transport. WSS always uses TLS
+// (system root CAs, TLS 1.2 minimum) and verifies the WSS URL's host name.
+func (o *Options) TLSConfigFor(t Transport) *tls.Config {
+	if t != TransportWSS {
+		return o.TLSConfig()
+	}
+	raw, _ := NormalizeWSURL(o.WSURL)
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil
+	}
+	return &tls.Config{MinVersion: tls.VersionTLS12, ServerName: u.Hostname()}
 }
 
 // TLSConfig returns the TLS settings for a TLS connection, or nil for a plain one.
