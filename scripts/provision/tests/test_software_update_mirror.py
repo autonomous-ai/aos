@@ -346,10 +346,15 @@ class MirrorTests(unittest.TestCase):
                 tar.addfile(info, io.BytesIO(data))
         return buffer.getvalue()
 
-    def wheelhouse_run(self, lock=b"lock", metadata_lock=None):
+    def wheelhouse_run(self, lock=b"lock", metadata_lock=None, prefetch=True, mode="first",
+                       margin_mb=0, wanted=False):
         stage = self.root / "stage"
         stage.mkdir(exist_ok=True)
         (stage / "uv.lock").write_bytes(lock)
+        import zipfile
+        hal_zip = self.root / "hal.zip"
+        with zipfile.ZipFile(hal_zip, "w") as z:
+            z.writestr("uv.lock", lock)
         archive = self.wheelhouse_archive()
         url = f"{STORAGE}/os/ota/hal/wheelhouse/a.tar.gz"
         self.publish(url.replace(STORAGE, CDN), archive)
@@ -358,18 +363,28 @@ class MirrorTests(unittest.TestCase):
             "url": url, "sha256": hashlib.sha256(archive).hexdigest(),
             "lock_sha256": metadata_lock or hashlib.sha256(b"lock").hexdigest()}}}}
         (self.root / "meta.json").write_text(json.dumps(meta))
-        code = functions("progress_download_sample", "ota_url_candidates", "download_from",
-                         "download_verified", "hal_wheelhouse_install")
+        cache = self.root / "opt" / ".hal-wheelhouse"
+        if wanted:
+            cache.mkdir(parents=True, exist_ok=True)
+            (cache / ".wanted").write_text("")
+        code = functions("device_region", "region_is_cn", "hal_wheelhouse_mode", "progress_download_sample",
+                         "ota_url_candidates", "download_from", "download_verified", "hal_wheelhouse_entry",
+                         "hal_wheelhouse_prefetch", "hal_wheelhouse_install")
         code += (f'sleep() {{ :; }}\nMETADATA_PAYLOAD="{self.root}/meta.json"\nHAL_EXTRA=aec\n'
-                 f'HAL_DIR="{self.root}/opt/hal"\nUV_BIN=uv\n'
+                 f'HAL_DIR="{self.root}/opt/hal"\nUV_BIN=uv\nHAL_WHEELHOUSE={mode}\n'
+                 f'HAL_WHEELHOUSE_MARGIN_MB={margin_mb}\n'
+                 'hal_wheelhouse_size() { echo 1024; }\n'
                  'run_uv_with_activity() { event "$*"; [ "$2" != venv ] || mkdir -p .venv; }\n'
-                 f'cd "{stage}"\nhal_wheelhouse_install && hal_wheelhouse_install\n')
+                 + (f'hal_wheelhouse_prefetch "{hal_zip}" || exit 9\nevent stop-hal\n' if prefetch else '')
+                 + f'cd "{stage}"\nhal_wheelhouse_install && hal_wheelhouse_install\n')
         return self.bash(code)
 
-    def test_wheelhouse_installs_offline_and_reuses_download(self):
+    def test_wheelhouse_downloads_before_hal_stops_and_installs_offline(self):
         result, events = self.wheelhouse_run()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(len(self.curled(events)), 1, events)  # second run reuses the unpacked copy
+        self.assertEqual(len(self.curled(events)), 1, events)  # the install steps download nothing
+        stop = events.index("stop-hal")
+        self.assertTrue(all(events.index(e) < stop for e in events if e.startswith("curl ")), events)
         installs = [e for e in events if e.startswith("uv pip install")]
         self.assertEqual(len(installs), 4, events)
         for line in installs:
@@ -378,11 +393,36 @@ class MirrorTests(unittest.TestCase):
         cache = self.root / "opt" / ".hal-wheelhouse"
         self.assertEqual(len(list(cache.iterdir())), 1)
 
+    def test_wheelhouse_install_never_downloads(self):
+        result, events = self.wheelhouse_run(prefetch=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.curled(events), [])
+        self.assertTrue((self.root / "opt" / ".hal-wheelhouse" / ".wanted").exists())
+
     def test_wheelhouse_for_another_lock_is_skipped(self):
         result, events = self.wheelhouse_run(metadata_lock="0" * 64)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.curled(events), [])
         self.assertIn("another uv.lock", result.stderr)
+
+    def test_wheelhouse_skipped_without_free_space(self):
+        result, events = self.wheelhouse_run(margin_mb=1 << 30)  # needs a petabyte
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.curled(events), [])
+        self.assertIn("HAL wheelhouse skipped", result.stderr)
+
+    def test_wheelhouse_fallback_mode_prefetches_only_when_asked(self):
+        result, events = self.wheelhouse_run(mode="fallback")
+        self.assertEqual(self.curled(events), [])
+        result, events = self.wheelhouse_run(mode="fallback", wanted=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.curled(events)), 1)
+        self.assertFalse((self.root / "opt" / ".hal-wheelhouse" / ".wanted").exists())
+
+    def test_wheelhouse_prefetch_runs_before_hal_stops(self):
+        text = SCRIPT.read_text()
+        branch = text[text.index('elif [ "$APP" = "hal" ]; then'):]
+        self.assertLess(branch.index("hal_wheelhouse_prefetch"), branch.index("systemctl stop hal"))
 
     def uv_setup(self, mirror_ok=True, vendor_ok=True, pinned=True):
         triple = {"arm64": "aarch64", "aarch64": "aarch64", "x86_64": "x86_64"}[platform.machine()]

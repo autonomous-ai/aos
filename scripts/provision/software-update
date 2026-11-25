@@ -949,52 +949,106 @@ hal_wheelhouse_mode() {
   if region_is_cn; then printf '%s\n' first; else printf '%s\n' fallback; fi
 }
 
+# hal_wheelhouse_entry: the metadata's wheelhouse for this platform
+# (hal.wheelhouse["linux-<arch>-<extra>"] = {url, sha256, lock_sha256}) into
+# WH_KEY, WH_URL, WH_DIGEST, WH_LOCK, and its cache paths WH_CACHE and WH_DIR.
+hal_wheelhouse_entry() {
+  WH_KEY="linux-$(uname -m)-$HAL_EXTRA"
+  WH_URL=$(jq -r --arg k "$WH_KEY" '.hal.wheelhouse[$k].url // empty' "$METADATA_PAYLOAD" 2>/dev/null || true)
+  WH_DIGEST=$(jq -r --arg k "$WH_KEY" '.hal.wheelhouse[$k].sha256 // empty' "$METADATA_PAYLOAD" 2>/dev/null || true)
+  WH_LOCK=$(jq -r --arg k "$WH_KEY" '.hal.wheelhouse[$k].lock_sha256 // empty' "$METADATA_PAYLOAD" 2>/dev/null || true)
+  WH_CACHE="${HAL_WHEELHOUSE_DIR:-$(dirname "$HAL_DIR")/.hal-wheelhouse}"
+  WH_DIR="$WH_CACHE/$WH_DIGEST"
+  if [ -z "$WH_URL" ] || ! [[ "$WH_DIGEST" =~ ^[a-f0-9]{64}$ ]]; then
+    echo "[software-update] no HAL wheelhouse for $WH_KEY in the metadata" >&2
+    return 1
+  fi
+}
+
+# hal_wheelhouse_size <url>: the archive size in bytes from a HEAD request, or
+# HAL_WHEELHOUSE_EST_BYTES (1 GiB) when the host does not say.
+hal_wheelhouse_size() {
+  local url size=""
+  for url in $(ota_url_candidates "$1"); do
+    size=$(curl -fsSIL --connect-timeout 30 --max-time 60 "$url" 2>/dev/null \
+      | awk 'tolower($1) == "content-length:" { n = $2 } END { gsub(/\r/, "", n); print n }')
+    [[ "$size" =~ ^[0-9]+$ ]] && [ "$size" -gt 0 ] && break
+    size=""
+  done
+  printf '%s\n' "${size:-${HAL_WHEELHOUSE_EST_BYTES:-1073741824}}"
+}
+
+# hal_wheelhouse_prefetch <hal zip>: runs while HAL is still up. Downloads,
+# verifies and unpacks the wheelhouse for the HAL in <hal zip>, so the update
+# itself only installs from disk. Kept per digest (a partial download resumes
+# across runs; only the newest is kept), so a later HAL release with the same
+# lock downloads nothing. Never fails the update: on any problem it logs and
+# the update goes on without the wheelhouse. In fallback mode it runs only after
+# an earlier update asked for it (uv sync failed with no wheelhouse on disk).
+hal_wheelhouse_prefetch() {
+  local zip="$1" mode lock size need free archive
+  mode=$(hal_wheelhouse_mode)
+  [ "$mode" != off ] || return 0
+  hal_wheelhouse_entry 2>/dev/null || return 0
+  [ "$mode" = first ] || [ -f "$WH_CACHE/.wanted" ] || return 0
+  [ ! -f "$WH_DIR/.complete" ] || return 0
+  lock=$(unzip -p "$zip" uv.lock 2>/dev/null | sha256sum | cut -d' ' -f1)
+  if [ "$lock" != "$WH_LOCK" ]; then
+    echo "[software-update] HAL wheelhouse $WH_KEY was built for another uv.lock; skipping it" >&2
+    return 0
+  fi
+  mkdir -p "$WH_CACHE" || return 0
+  # Room for the archive, its unpacked copy, and a margin (HAL_WHEELHOUSE_MARGIN_MB, 512).
+  size=$(hal_wheelhouse_size "$WH_URL")
+  need=$(( size / 1024 * 2 + ${HAL_WHEELHOUSE_MARGIN_MB:-512} * 1024 ))
+  free=$(df -Pk "$WH_CACHE" 2>/dev/null | awk 'NR == 2 { print $4 }')
+  if [ "${free:-0}" -lt "$need" ]; then
+    echo "[software-update] HAL wheelhouse skipped: $(( ${free:-0} / 1024 )) MiB free, $(( need / 1024 )) MiB needed" >&2
+    return 0
+  fi
+  archive="$WH_CACHE/$WH_DIGEST.tar.gz"
+  progress_report downloading 0 0 "Downloading HAL dependencies"
+  if ! DOWNLOAD_KEEP_PARTIAL=keep download_verified "$WH_URL" "$archive" "$WH_DIGEST"; then
+    echo "[software-update] HAL wheelhouse download failed; continuing without it" >&2
+    return 0
+  fi
+  rm -rf "$WH_DIR" "$WH_DIR.new"
+  mkdir -p "$WH_DIR.new" || return 0
+  if ! tar -xzf "$archive" -C "$WH_DIR.new"; then
+    echo "[software-update] HAL wheelhouse archive did not unpack; continuing without it" >&2
+    rm -rf "$WH_DIR.new"
+    return 0
+  fi
+  touch "$WH_DIR.new/.complete" && mv "$WH_DIR.new" "$WH_DIR" || return 0
+  # Keep only the current wheelhouse (also drops the archive and the request marker).
+  find "$WH_CACHE" -mindepth 1 -maxdepth 1 ! -name "$WH_DIGEST" -exec rm -rf {} + 2>/dev/null || true
+}
+
 # hal_wheelhouse_install: install HAL's locked dependencies without PyPI or
-# GitHub, from the prebuilt wheelhouse the metadata lists for this platform
-# (hal.wheelhouse["linux-<arch>-<extra>"] = {url, sha256, lock_sha256}). Runs in
-# the staged HAL directory. The wheelhouse is used only when it was built from
-# this HAL's uv.lock; a downloaded copy is kept per digest so a later HAL release
-# with the same lock does not download it again, and a partial download resumes.
+# GitHub, from the wheelhouse hal_wheelhouse_prefetch unpacked before HAL
+# stopped. Runs in the staged HAL directory and downloads nothing. Used only
+# when the wheelhouse was built from this HAL's uv.lock.
 hal_wheelhouse_install() {
-  local key url digest lock_sha cache dir archive
-  key="linux-$(uname -m)-$HAL_EXTRA"
-  url=$(jq -r --arg k "$key" '.hal.wheelhouse[$k].url // empty' "$METADATA_PAYLOAD" 2>/dev/null || true)
-  digest=$(jq -r --arg k "$key" '.hal.wheelhouse[$k].sha256 // empty' "$METADATA_PAYLOAD" 2>/dev/null || true)
-  lock_sha=$(jq -r --arg k "$key" '.hal.wheelhouse[$k].lock_sha256 // empty' "$METADATA_PAYLOAD" 2>/dev/null || true)
-  if [ -z "$url" ] || ! [[ "$digest" =~ ^[a-f0-9]{64}$ ]]; then
-    echo "[software-update] no HAL wheelhouse for $key in the metadata" >&2
+  hal_wheelhouse_entry || return 1
+  if [ ! -f uv.lock ] || [ "$(sha256sum uv.lock | cut -d' ' -f1)" != "$WH_LOCK" ]; then
+    echo "[software-update] HAL wheelhouse $WH_KEY was built for another uv.lock; skipping it" >&2
     return 1
   fi
-  if [ ! -f uv.lock ] || [ "$(sha256sum uv.lock | cut -d' ' -f1)" != "$lock_sha" ]; then
-    echo "[software-update] HAL wheelhouse $key was built for another uv.lock; skipping it" >&2
+  if [ ! -f "$WH_DIR/.complete" ]; then
+    # The next update downloads it while HAL is still running.
+    echo "[software-update] HAL wheelhouse $WH_KEY is not on disk; the next update fetches it first" >&2
+    mkdir -p "$WH_CACHE" && touch "$WH_CACHE/.wanted"
     return 1
   fi
-  cache="${HAL_WHEELHOUSE_DIR:-$(dirname "$HAL_DIR")/.hal-wheelhouse}"
-  dir="$cache/$digest"
-  mkdir -p "$cache" || return 1
-  if [ ! -f "$dir/.complete" ]; then
-    archive="$cache/$digest.tar.gz"
-    progress_report installing 0 0 "Downloading HAL dependencies"
-    DOWNLOAD_KEEP_PARTIAL=keep download_verified "$url" "$archive" "$digest" || return 1
-    rm -rf "$dir" "$dir.new"
-    mkdir -p "$dir.new" || return 1
-    if ! tar -xzf "$archive" -C "$dir.new"; then
-      rm -rf "$dir.new"
-      return 1
-    fi
-    touch "$dir.new/.complete" && mv "$dir.new" "$dir" || return 1
-    # Keep only the current wheelhouse.
-    find "$cache" -mindepth 1 -maxdepth 1 ! -name "$digest" -exec rm -rf {} + 2>/dev/null || true
-  fi
-  [ -f "$dir/requirements.txt" ] && [ -d "$dir/wheels" ] || { echo "[software-update] HAL wheelhouse $key is incomplete" >&2; return 1; }
-  echo "[software-update] installing HAL dependencies from the wheelhouse ($key)"
+  [ -f "$WH_DIR/requirements.txt" ] && [ -d "$WH_DIR/wheels" ] || { echo "[software-update] HAL wheelhouse $WH_KEY is incomplete" >&2; return 1; }
+  echo "[software-update] installing HAL dependencies from the wheelhouse ($WH_KEY)"
   rm -rf .venv
   UV_PYTHON_DOWNLOADS=never run_uv_with_activity "$UV_BIN" venv --python 3.12 .venv || return 1
   run_uv_with_activity "$UV_BIN" pip install --python .venv/bin/python --offline --no-index \
-    --find-links "$dir/wheels" -r "$dir/requirements.txt" || return 1
+    --find-links "$WH_DIR/wheels" -r "$WH_DIR/requirements.txt" || return 1
   # The project itself, editable, as `uv sync` installs it.
   run_uv_with_activity "$UV_BIN" pip install --python .venv/bin/python --offline --no-index \
-    --find-links "$dir/wheels" --no-deps -e . || return 1
+    --find-links "$WH_DIR/wheels" --no-deps -e . || return 1
 }
 
 # hal_install_dependencies: today's online `uv sync`, with the wheelhouse tried
@@ -2513,6 +2567,8 @@ elif [ "$APP" = "hal" ]; then
   if [ "$HAL_EXTRA" != "reachy" ]; then
     HAL_EXTRA_ARGS+=(--extra pipecat)
   fi
+  # The wheelhouse (when used) is downloaded and checked while HAL still runs.
+  hal_wheelhouse_prefetch "$ZIP_TMP"
   save_hal_service_state
   arm_service_restore restore_hal_service_state
   systemctl stop hal
