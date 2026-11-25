@@ -943,12 +943,13 @@ def _dismiss_mic_muted_led(source: str):
     logger.info("Mic-muted LED indicator dismissed by %s (mic stays muted)", source)
 
 
-# Public resolvers probed over TCP/53, in order; any answer counts. The first is
-# the probe every device has always used; the second answers on networks where
-# the first is blocked and is only tried after the first fails. Same probe set
-# as os-server's internet check.
+# Public resolvers probed over TCP/53; any answer counts. The second answers on
+# networks where the first is blocked. Same probe set as os-server's internet
+# check.
 _INTERNET_PROBE_IPS = ("8.8.8.8", "223.5.5.5")
-_INTERNET_PROBE_TIMEOUT_S = 1.0
+# One bound for all probes at once: a connection that takes 3s across a slow
+# border still counts. Only a check with nothing answering waits this long.
+_INTERNET_PROBE_TIMEOUT_S = 4.0
 
 
 def _tcp_probe(host: str, port: int) -> bool:
@@ -998,13 +999,25 @@ def _cloud_probe_target():
 
 
 def _has_internet() -> bool:
-    """True if a probe answers, tried in order: TCP/53 to each public resolver,
-    then a TLS handshake with the cloud API host. Stops at the first answer, so
-    a network where the first resolver answers costs one probe, as before."""
-    if any(_tcp_probe(ip, 53) for ip in _INTERNET_PROBE_IPS):
-        return True
+    """True if any probe answers: TCP/53 to each public resolver, or a TLS
+    handshake with the cloud API host. The probes run at once and the first
+    answer ends the check, so it takes at most about one probe timeout."""
+    from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+
+    probes = [(_tcp_probe, ip, 53) for ip in _INTERNET_PROBE_IPS]
     cloud = _cloud_probe_target()
-    return bool(cloud) and _tls_probe(*cloud)
+    if cloud:
+        probes.append((_tls_probe, cloud[0], cloud[1]))
+    pool = ThreadPoolExecutor(max_workers=len(probes), thread_name_prefix="net-probe")
+    try:
+        pending = {pool.submit(fn, host, port) for fn, host, port in probes}
+        while pending:
+            done, pending = wait(pending, return_when=FIRST_COMPLETED)
+            if any(f.result() for f in done):
+                return True
+        return False
+    finally:
+        pool.shutdown(wait=False)
 
 
 def _flash_backend_error():

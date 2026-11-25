@@ -26,7 +26,7 @@ const (
 	// Network monitor: forgiving timeouts so brief WiFi hiccups don't flip to no-internet.
 	networkMonitorFailsRequired = 5
 	networkMonitorInterval      = 5 * time.Second
-	networkMonitorPingTimeout   = 3 * time.Second
+	networkMonitorPingTimeout   = 4 * time.Second
 	// setupInternetWait bounds the internet check after connect-wifi.
 	setupInternetWait = 60 * time.Second
 	// wifiClockSyncWait bounds the NTP wait after connect; the customer is still waiting.
@@ -359,7 +359,7 @@ func (s *Service) wifiJoinFailure(joinStart time.Time, ssid string) *SetupError 
 
 // monitorReachesCloud is the monitor's fallback when ICMP fails.
 func (s *Service) monitorReachesCloud() bool {
-	_, err := s.reachableOverTLS()
+	_, err := s.reachableOverTLSWithin(monitorCloudProbeTimeout)
 	return err == nil
 }
 

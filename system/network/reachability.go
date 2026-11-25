@@ -23,8 +23,11 @@ import (
 
 const (
 	// cloudProbeTimeout bounds the TLS fallback so a dead network still fails
-	// fast inside setup's 60s window.
-	cloudProbeTimeout = 3 * time.Second
+	// fast inside setup's 60s window, while a slow first lookup or a far
+	// server still passes.
+	cloudProbeTimeout = 5 * time.Second
+	// monitorCloudProbeTimeout bounds the network monitor's TLS fallback.
+	monitorCloudProbeTimeout = 4 * time.Second
 	// defaultCloudProbeAddr is used before config.json carries an Autonomous
 	// base URL (a fresh device joins WiFi before setup saves it).
 	defaultCloudProbeAddr = "campaign-api.autonomous.ai:443"
@@ -149,6 +152,11 @@ func (s *Service) cloudProbeAddr() string {
 
 // reachableOverTLS is the fallback probe used when ICMP fails.
 func (s *Service) reachableOverTLS() (string, error) {
+	return s.reachableOverTLSWithin(cloudProbeTimeout)
+}
+
+// reachableOverTLSWithin is reachableOverTLS with its own timeout.
+func (s *Service) reachableOverTLSWithin(timeout time.Duration) (string, error) {
 	addr := s.cloudProbeAddr()
-	return addr, tlsReach(addr, cloudProbeTimeout)
+	return addr, tlsReach(addr, timeout)
 }

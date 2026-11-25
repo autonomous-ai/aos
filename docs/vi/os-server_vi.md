@@ -251,9 +251,10 @@ thất bại 5 lần liên tiếp thì bật LED state `Connectivity`, thành c�
 state này. Mỗi lần kiểm tra là ping `8.8.8.8` (và ping `223.5.5.5` chỉ khi
 `8.8.8.8` lỗi hoặc chưa trả lời sau 1s, cho mạng chặn 8.8.8.8), nếu ICMP thất bại
 thì bắt tay TLS với host cloud API của thiết bị, nên mạng chặn ICMP không bị báo
-là offline. Kiểm tra internet riêng của HAL (quyết định có nháy cam khi backend
-lỗi hay không) dùng cùng bộ probe qua TCP/53, rồi bắt tay TLS với host cloud API
-lấy từ `config.json`. Overview của trang monitor dùng cùng
+là offline. Ping và kiểm tra TLS của monitor mỗi cái chờ tối đa 4s; kiểm tra TLS
+lúc setup chờ tối đa 5s. Kiểm tra internet riêng của HAL (quyết định có nháy cam
+khi backend lỗi hay không) chạy cùng lúc bộ probe qua TCP/53 và bắt tay TLS với
+host cloud API lấy từ `config.json`, trong vòng 4s. Overview của trang monitor dùng cùng
 fallback này (`CheckInternetRTT`), không hiện thời gian ping khi chỉ TLS đi qua. Trạng thái Internet độc lập với phục hồi WiFi: nếu còn association
 và IPv4 dùng được ở chế độ STA, thiết bị giữ WiFi ngay cả khi mất Internet.
 Monitor không còn reboot thiết bị.
@@ -275,18 +276,22 @@ Giữ nguyên script và web UI. Kết nối vào hotspot thiết bị rồi m�
 sau khi các client ngắt kết nối hotspot.
 
 **Server thời gian và DNS dự phòng** (`system/lib/netfallback`, chạy lúc boot).
-Mọi thiết bị được thêm `ntp.aliyun.com`, `ntp.tencent.com` và `cn.pool.ntp.org`
-vào cuối danh sách NTP dự phòng của systemd-timesyncd (một drop-in giữ các server
-mặc định của image ở đầu; ghi một lần, dựa trên `timedatectl show-timesync`), hoặc
-thêm làm source của chrony khi chrony đọc `/etc/chrony/sources.d`. Image mới ghi
-cùng drop-in timesyncd này lúc build. Danh sách DNS dự phòng tĩnh đi theo region
-mà cloud trả về trong reply ping (đọc từ `config.json`, kiểm tra mỗi 5 phút): với
-`CN`, `/etc/resolvconf.conf` và `device-sta-mode` đổi từ `1.1.1.1 8.8.8.8` sang
-`223.5.5.5 119.29.29.29 1.1.1.1 8.8.8.8`; với region khác thì đổi lại; chưa có
-region thì không đổi gì. Chỉ đúng các dòng đó được sửa, nên file đã sửa tay được
-giữ nguyên. Thay đổi trong `device-sta-mode` có hiệu lực từ lần join WiFi kế tiếp.
-Image có thể build sẵn với danh sách cho Trung Quốc (`FALLBACK_DNS` trong
-`scripts/imager`).
+Chúng đi theo region mà cloud trả về trong reply ping (đọc từ `config.json` mỗi 5
+phút, sau khi thiết bị đã setup). Khi region là `CN`: một drop-in của
+systemd-timesyncd đặt `FallbackNTP=0.debian.pool.ntp.org 1.debian.pool.ntp.org
+ntp.aliyun.com ntp.tencent.com cn.pool.ntp.org` (chỉ là dự phòng, nên server mà
+mạng cấp vẫn đứng trước), chrony được thêm ba server cuối làm source khi chrony đọc
+`/etc/chrony/sources.d`, `/etc/resolvconf.conf` dùng
+`name_servers_append="223.5.5.5 119.29.29.29 1.1.1.1 8.8.8.8"` (sau DNS của
+router) thay cho dòng `name_servers`, và `device-sta-mode` liệt kê cùng các
+server này sau DNS của DHCP lease. Với region khác, hoặc chưa có region, drop-in
+và file source bị xóa, dòng `name_servers="1.1.1.1 8.8.8.8"` của image và các
+dòng của `device-sta-mode` được đặt lại, nhưng chỉ khi dòng của chúng ta đang ở
+đó. timesyncd chỉ được restart (nếu đang chạy), chrony reload và `resolv.conf`
+tạo lại sau khi có thay đổi; thay đổi trong `device-sta-mode` có hiệu lực từ lần
+join WiFi kế tiếp. Trước khi setup không có gì thay đổi, nên image build với
+`IMAGE_REGION=CN` (`scripts/imager`) giữ các thiết lập này cho tới khi cloud trả
+lời.
 
 **Host tải xuống.** File zip skill theo role và skill connector (`skills.install`,
 connector `figma-api`) được tải trước từ host đang phục vụ OTA metadata của thiết
