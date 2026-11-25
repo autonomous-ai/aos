@@ -16,7 +16,7 @@ ota_metadata_fetch "$metadata" "$tmp/envelope.json"
 ota_metadata_preserve_trust "$tmp/envelope.json"
 ota_metadata_unpack "$tmp/envelope.json" "$tmp/payload.json"
 sha=$(ota_artifact_sha256 "$tmp/package.zip")
-url="https://storage.googleapis.com/${GCS_BUCKET}/${BUCKET_PREFIX}/services/${COMPONENT}/${sha}.zip"
+url=$(ota_public_url "${BUCKET_PREFIX}/services/${COMPONENT}/${sha}.zip")
 python3 - "$tmp/payload.json" "$COMPONENT" "$V" "$tmp/package.zip" "$url" "$sha" "${REPLACES:-}" <<'PY'
 import json, re, stat, sys, zipfile
 from pathlib import PurePosixPath

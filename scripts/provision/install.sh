@@ -1,10 +1,10 @@
 #!/bin/bash
 # Run this on the Pi to download and execute the latest setup from CDN.
-# Usage: curl -fsSL https://storage.googleapis.com/s3-autonomous-upgrade-3/os/install.sh | sudo bash
+# Usage: curl -fsSL https://cdn.autonomous.ai/os/install.sh | sudo bash
 set -euo pipefail
 
 # Per-deployment OTA metadata URL; override by exporting OTA_METADATA_URL.
-OTA_METADATA_URL="${OTA_METADATA_URL:-https://storage.googleapis.com/s3-autonomous-upgrade-3/os/ota/metadata.json}"
+OTA_METADATA_URL="${OTA_METADATA_URL:-https://cdn.autonomous.ai/os/ota/metadata.json}"
 
 # Required device class; set after sudo (sudo drops a leading env): curl … | sudo DEVICE_TYPE=lamp bash
 DEVICE_TYPE="${DEVICE_TYPE:?DEVICE_TYPE must be set (e.g. DEVICE_TYPE=lamp) — no default}"
