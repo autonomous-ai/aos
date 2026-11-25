@@ -248,8 +248,12 @@ Config field: `timezone` trong `config/config.json` (chuỗi IANA zone, omitempt
 **Monitor kết nối** (`system/network/service.go` và `recovery.go`, hoạt động khi
 `SetUpCompleted` là true). Kiểm tra Internet theo nhịp monitor 5s; kiểm tra
 thất bại 5 lần liên tiếp thì bật LED state `Connectivity`, thành công thì xóa
-state này. Mỗi lần kiểm tra là ping `8.8.8.8`, nếu ICMP thất bại thì bắt tay TLS
-với host cloud API của thiết bị, nên mạng chặn ICMP không bị báo là offline. Overview của trang monitor dùng cùng
+state này. Mỗi lần kiểm tra là ping `8.8.8.8` (và ping `223.5.5.5` chỉ khi
+`8.8.8.8` lỗi hoặc chưa trả lời sau 1s, cho mạng chặn 8.8.8.8), nếu ICMP thất bại
+thì bắt tay TLS với host cloud API của thiết bị, nên mạng chặn ICMP không bị báo
+là offline. Kiểm tra internet riêng của HAL (quyết định có nháy cam khi backend
+lỗi hay không) dùng cùng bộ probe qua TCP/53, rồi bắt tay TLS với host cloud API
+lấy từ `config.json`. Overview của trang monitor dùng cùng
 fallback này (`CheckInternetRTT`), không hiện thời gian ping khi chỉ TLS đi qua. Trạng thái Internet độc lập với phục hồi WiFi: nếu còn association
 và IPv4 dùng được ở chế độ STA, thiết bị giữ WiFi ngay cả khi mất Internet.
 Monitor không còn reboot thiết bị.
@@ -269,6 +273,25 @@ Giữ nguyên script và web UI. Kết nối vào hotspot thiết bị rồi m�
 `http://lamp-0c4e.local/wifi` (thay bằng hostname thực tế) để đổi WiFi; dùng
 `http://192.168.100.1/wifi` nếu không phân giải được `.local`. Tự động thử lại
 sau khi các client ngắt kết nối hotspot.
+
+**Server thời gian và DNS dự phòng** (`system/lib/netfallback`, chạy lúc boot).
+Mọi thiết bị được thêm `ntp.aliyun.com`, `ntp.tencent.com` và `cn.pool.ntp.org`
+vào cuối danh sách NTP dự phòng của systemd-timesyncd (một drop-in giữ các server
+mặc định của image ở đầu; ghi một lần, dựa trên `timedatectl show-timesync`), hoặc
+thêm làm source của chrony khi chrony đọc `/etc/chrony/sources.d`. Image mới ghi
+cùng drop-in timesyncd này lúc build. Danh sách DNS dự phòng tĩnh đi theo region
+mà cloud trả về trong reply ping (đọc từ `config.json`, kiểm tra mỗi 5 phút): với
+`CN`, `/etc/resolvconf.conf` và `device-sta-mode` đổi từ `1.1.1.1 8.8.8.8` sang
+`223.5.5.5 119.29.29.29 1.1.1.1 8.8.8.8`; với region khác thì đổi lại; chưa có
+region thì không đổi gì. Chỉ đúng các dòng đó được sửa, nên file đã sửa tay được
+giữ nguyên. Thay đổi trong `device-sta-mode` có hiệu lực từ lần join WiFi kế tiếp.
+Image có thể build sẵn với danh sách cho Trung Quốc (`FALLBACK_DNS` trong
+`scripts/imager`).
+
+**Host tải xuống.** File zip skill theo role và skill connector (`skills.install`,
+connector `figma-api`) được tải trước từ host đang phục vụ OTA metadata của thiết
+bị, rồi mới tới URL storage gốc. Trang monitor tra IP public với timeout 2s và nhớ
+lần tra lỗi trong một phút.
 
 ### Guard Mode (Chế độ canh gác)
 

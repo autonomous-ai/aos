@@ -51,6 +51,10 @@ DEFAULT_AGENT ?=
 # Optional hardware assembly from robots/<device>/overrides/<variant>.
 # Empty or standard preserves legacy defaults.
 VARIANT ?=
+# Static fallback DNS servers baked into the image (resolvconf, device-sta-mode).
+# OPTIONAL — unset keeps 1.1.1.1 8.8.8.8. Images for mainland China use
+# FALLBACK_DNS="223.5.5.5 119.29.29.29 1.1.1.1 8.8.8.8".
+FALLBACK_DNS ?=
 VARIANT_SUFFIX := $(if $(filter-out standard,$(VARIANT)),-$(VARIANT),)
 
 # Pi 5 V1 hardware (case đầu) không có loa/mic. Set PI5_NO_AUDIO=1 để build-pi5.sh
@@ -149,6 +153,7 @@ build: build-preflight
 	-e DEVICE_TYPE=$(DEVICE_TYPE) \
 	-e DEFAULT_AGENT=$(DEFAULT_AGENT) \
 	-e VARIANT=$(VARIANT) \
+	-e FALLBACK_DNS="$(FALLBACK_DNS)" \
 	-e PI5_NO_AUDIO=$(PI5_NO_AUDIO) \
 	-e COMPRESS=$(COMPRESS) \
 	-e BUILD_GIT_SHA=$(shell git -C .. rev-parse HEAD 2>/dev/null || echo unknown) \

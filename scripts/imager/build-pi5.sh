@@ -25,6 +25,18 @@ if [[ -n "$VARIANT" && ! "$VARIANT" =~ ^[a-z][a-z0-9_-]{0,63}$ ]]; then
   exit 1
 fi
 AP_BAND="${AP_BAND:-2.4}"   # 2.4 or 5 (5 GHz needs supported regulatory domain + chip)
+# Static fallback DNS servers (resolvconf, device-sta-mode). Unset keeps the
+# default; an image for mainland China passes
+# FALLBACK_DNS="223.5.5.5 119.29.29.29 1.1.1.1 8.8.8.8" (os-server switches
+# shipped devices between the two lists by region).
+FALLBACK_DNS="${FALLBACK_DNS:-1.1.1.1 8.8.8.8}"
+if [[ ! "$FALLBACK_DNS" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}(\ [0-9]{1,3}(\.[0-9]{1,3}){3})*$ ]]; then
+  echo "Invalid FALLBACK_DNS: expected space-separated IPv4 addresses" >&2
+  exit 1
+fi
+# The same list as device-sta-mode's resolv.conf lines ("nameserver X\n" each).
+STA_FALLBACK_DNS=""
+for ns in $FALLBACK_DNS; do STA_FALLBACK_DNS="${STA_FALLBACK_DNS}nameserver ${ns}\\n"; done
 AP_CHANNEL="${AP_CHANNEL:-}" # default: 6 for 2.4 GHz, 36 for 5 GHz
 COUNTRY_CODE="US"           # Regulatory country code for hostapd
 
@@ -545,6 +557,19 @@ install_binary_from_zip() {
 echo "[stage] NTP + fake-hwclock"
 DEBIAN_FRONTEND=noninteractive apt-get install -y systemd-timesyncd
 systemctl enable systemd-timesyncd
+# Extra fallback NTP servers, after the image's own defaults, for networks
+# where those are unreachable. Defaults come from the installed config (the
+# last FallbackNTP= set, else the compiled-in default shown as a comment).
+NTP_CONF_DUMP=\$(systemd-analyze cat-config systemd/timesyncd.conf 2>/dev/null || true)
+NTP_DEFAULTS=\$(printf '%s\n' "\$NTP_CONF_DUMP" | sed -n 's/^FallbackNTP=//p' | tail -1)
+[ -n "\$NTP_DEFAULTS" ] || NTP_DEFAULTS=\$(printf '%s\n' "\$NTP_CONF_DUMP" | sed -n 's/^#FallbackNTP=//p' | head -1)
+if [ -n "\$NTP_DEFAULTS" ]; then
+  mkdir -p /etc/systemd/timesyncd.conf.d
+  printf '[Time]\nFallbackNTP=%s ntp.aliyun.com ntp.tencent.com cn.pool.ntp.org\n' "\$NTP_DEFAULTS" \
+    > /etc/systemd/timesyncd.conf.d/90-autonomous-fallback-ntp.conf
+else
+  echo "WARN: timesyncd default fallback NTP servers not found; os-server adds the extra ones at first boot"
+fi
 # Seed fake-hwclock with current build timestamp so first boot has a valid clock.
 # fake-hwclock uses a SysV init script (auto-enabled on install) — no systemctl enable needed.
 date -u '+%Y-%m-%d %H:%M:%S' > /etc/fake-hwclock.data
@@ -1050,7 +1075,7 @@ if command -v dhcpcd >/dev/null 2>&1; then
     DNS_LINES="\${DNS_LINES}nameserver \$ns\\n"
   done
 fi
-DNS_LINES="\${DNS_LINES}nameserver 1.1.1.1\\nnameserver 8.8.8.8\\n"
+DNS_LINES="\${DNS_LINES}${STA_FALLBACK_DNS}"
 printf "%b" "\$DNS_LINES" > /etc/resolv.conf
 echo "resolv.conf:"; cat /etc/resolv.conf
 echo "STA MODE ENABLED"
@@ -1098,9 +1123,9 @@ systemctl mask wpa_supplicant.service 2>/dev/null || true
 # build and restored after — touching it here would have no effect.)
 echo "[stage] resolvconf DNS fallback"
 if [ -f /etc/resolvconf.conf ]; then
-  grep -q '^name_servers=' /etc/resolvconf.conf || echo 'name_servers="1.1.1.1 8.8.8.8"' >> /etc/resolvconf.conf
+  grep -q '^name_servers=' /etc/resolvconf.conf || echo 'name_servers="${FALLBACK_DNS}"' >> /etc/resolvconf.conf
 else
-  echo 'name_servers="1.1.1.1 8.8.8.8"' > /etc/resolvconf.conf
+  echo 'name_servers="${FALLBACK_DNS}"' > /etc/resolvconf.conf
 fi
 
 # ── stage: PulseAudio echo cancellation (for HAL mic/speaker) ─────────────

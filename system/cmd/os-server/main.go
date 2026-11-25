@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -15,6 +16,8 @@ import (
 	ocgatewayd "go.autonomous.ai/os/runtimes/opencode/gatewayd"
 	"go.autonomous.ai/os/system/lib/hal"
 	"go.autonomous.ai/os/system/lib/logger"
+	"go.autonomous.ai/os/system/lib/netfallback"
+	"go.autonomous.ai/os/system/lib/safego"
 	"go.autonomous.ai/os/system/lib/syspath"
 	"go.autonomous.ai/os/system/lib/versioncache"
 	"go.autonomous.ai/os/system/server"
@@ -69,6 +72,10 @@ func main() {
 		return err == nil
 	}, time.Minute)
 
+	// Extra fallback NTP servers for every device, and the fallback DNS order
+	// for the region the cloud reports; a no-op once applied.
+	safego.Go("netfallback", func() { netfallback.Run(probeCtx, configRegion) })
+
 	srv, err := server.InitializeServer()
 	if err != nil {
 		log.Fatal("initialize server: ", err)
@@ -76,4 +83,20 @@ func main() {
 	if err := srv.Serve(cancelProbes); err != nil {
 		log.Fatal("http server: ", err)
 	}
+}
+
+// configRegion returns the region the cloud last reported in the ping reply,
+// as saved in config.json, or "" when none is saved yet.
+func configRegion() string {
+	data, err := os.ReadFile(config.Path())
+	if err != nil {
+		return ""
+	}
+	var c struct {
+		Region string `json:"region"`
+	}
+	if json.Unmarshal(data, &c) != nil {
+		return ""
+	}
+	return c.Region
 }

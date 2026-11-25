@@ -14,6 +14,15 @@ OUT_IMG_SIZE="${OUT_IMG_SIZE:-14G}"
 OTA_METADATA_URL="${OTA_METADATA_URL:?OTA_METADATA_URL is required — build via 'make build OTA_METADATA_URL=...'}"
 OTA_SIGNING_PUBLIC_KEY="${OTA_SIGNING_PUBLIC_KEY:-}"
 AP_BAND="${AP_BAND:-2.4}"
+# Static fallback DNS servers (resolvconf, device-sta-mode). Unset keeps the
+# default; an image for mainland China passes
+# FALLBACK_DNS="223.5.5.5 119.29.29.29 1.1.1.1 8.8.8.8" (os-server switches
+# shipped devices between the two lists by region).
+FALLBACK_DNS="${FALLBACK_DNS:-1.1.1.1 8.8.8.8}"
+if [[ ! "$FALLBACK_DNS" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}(\ [0-9]{1,3}(\.[0-9]{1,3}){3})*$ ]]; then
+  echo "Invalid FALLBACK_DNS: expected space-separated IPv4 addresses" >&2
+  exit 1
+fi
 AP_CHANNEL="${AP_CHANNEL:-}"
 COUNTRY_CODE="${COUNTRY_CODE:-US}"
 # Match OTA metadata checked on 2026-09-11.
@@ -269,9 +278,9 @@ SYSCTL
 
 # resolvconf fallback DNS — ensures /etc/resolv.conf is never empty in AP mode.
 if [ -f /etc/resolvconf.conf ]; then
-  grep -q '^name_servers=' /etc/resolvconf.conf || echo 'name_servers="1.1.1.1 8.8.8.8"' >> /etc/resolvconf.conf
+  grep -q '^name_servers=' /etc/resolvconf.conf || echo 'name_servers="${FALLBACK_DNS}"' >> /etc/resolvconf.conf
 else
-  echo 'name_servers="1.1.1.1 8.8.8.8"' > /etc/resolvconf.conf
+  echo 'name_servers="${FALLBACK_DNS}"' > /etc/resolvconf.conf
 fi
 
 # ── Node.js 26 + OpenClaw CLI (npm global) ───────────────────────────────────

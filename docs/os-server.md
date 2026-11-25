@@ -256,9 +256,13 @@ Config field: `timezone` in `config/config.json` (IANA zone string, omitempty) â
 **Connectivity monitor** (`system/network/service.go` and `recovery.go`, active
 when `SetUpCompleted` is true). Internet checks run on a 5s monitor tick; 5
 consecutive failed checks raise the `Connectivity` LED state, and a successful
-one clears it. A check is a ping to `8.8.8.8`, falling back to a TLS handshake
-with the device's cloud API host when ICMP fails, so networks that drop ICMP are
-not reported offline. The monitor page's Overview uses the same fallback
+one clears it. A check is a ping to `8.8.8.8` (and to `223.5.5.5` only when
+`8.8.8.8` fails or has not replied within 1s, for networks where it is blocked),
+falling back to a TLS handshake with the device's cloud API host when ICMP
+fails, so networks that drop ICMP are not reported offline. HAL's own internet
+check (it decides whether a backend error flashes amber) uses the same probe
+set over TCP/53, then a TLS handshake with the cloud API host from
+`config.json`. The monitor page's Overview uses the same fallback
 (`CheckInternetRTT`), showing no ping time when only TLS got through. Internet status is separate from WiFi recovery:
 association and a usable station IPv4 address keep WiFi active even without
 Internet. The monitor no longer reboots the device.
@@ -278,6 +282,25 @@ The scripts and web UI are unchanged. Join the device hotspot, then open
 `http://lamp-0c4e.local/wifi` (using the device's actual hostname) to change WiFi;
 use `http://192.168.100.1/wifi` if `.local` resolution is unavailable. Automatic
 retry resumes after hotspot clients disconnect.
+
+**Fallback time and DNS servers** (`system/lib/netfallback`, started at boot).
+Every device gets `ntp.aliyun.com`, `ntp.tencent.com` and `cn.pool.ntp.org`
+appended to systemd-timesyncd's fallback NTP list (a drop-in that keeps the
+image's defaults first; written once, from `timedatectl show-timesync`), or as
+extra chrony sources when chrony reads `/etc/chrony/sources.d`. New images write
+the same timesyncd drop-in at build time. The static fallback DNS list follows
+the region the cloud reports in the ping reply (read from `config.json`, checked
+every 5 minutes): for `CN`, `/etc/resolvconf.conf` and `device-sta-mode` switch
+from `1.1.1.1 8.8.8.8` to `223.5.5.5 119.29.29.29 1.1.1.1 8.8.8.8`; for any other
+region they switch back; with no region yet nothing changes. Only those exact
+lines are touched, so a hand-edited file is left alone. The `device-sta-mode`
+change applies from the next WiFi join. Images can be built with the China list
+from the start (`FALLBACK_DNS` in `scripts/imager`).
+
+**Download hosts.** Role and connector skill zips (`skills.install`, the
+`figma-api` connector) are fetched from the host that serves the device's OTA
+metadata first, then from the original storage URL. The monitor page looks up
+the public IP with a 2s timeout and remembers a failed lookup for a minute.
 
 ### Guard Mode
 
