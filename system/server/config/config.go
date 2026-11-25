@@ -275,7 +275,7 @@ type Config struct {
 	MQTTTLS bool `json:"mqtt_tls,omitempty" yaml:"mqttTLS"`
 
 	// MQTTWSURL is the wss:// URL the device falls back to when the broker is not
-	// reachable over TCP. It comes from the backend ping and uses the same
+	// reachable over TCP. It comes from the status reply and uses the same
 	// credentials and channels; empty disables the fallback.
 	MQTTWSURL string `json:"mqtt_ws_url,omitempty" yaml:"mqttWSURL"`
 

@@ -163,7 +163,7 @@ func TestFallbackToWSSAndBack(t *testing.T) {
 
 	// TCP still dead: a due probe fails and the client stays on WSS.
 	sel.mu.Lock()
-	sel.policy.ProbeInterval = 0
+	sel.probeEvery = 0
 	sel.mu.Unlock()
 	time.Sleep(200 * time.Millisecond)
 	if sel.Current() != TransportWSS {
@@ -207,5 +207,39 @@ func TestNoFallbackWithoutWSURL(t *testing.T) {
 	}
 	if f.Status().Transport != TransportTCP || f.Status().Switches != 0 {
 		t.Fatalf("status = %+v", f.Status())
+	}
+}
+
+// A one-shot client shares the selector but must not change its state: a
+// publisher connecting must not reset the long-lived client's failure count or
+// mark it connected.
+func TestOneShotClientLeavesSelectorAlone(t *testing.T) {
+	addr := freeAddr(t)
+	host, port, _ := net.SplitHostPort(addr)
+	var portNum int
+	for _, ch := range port {
+		portNum = portNum*10 + int(ch-'0')
+	}
+	_, accepted := startTCPBroker(t, addr)
+	f, _ := ProvideFactory(Config{Endpoint: host, Port: portNum, WSURL: "wss://ws.example/mqtt"})
+	f.sel.Failure()
+	f.sel.Failure() // two failures of the long-lived client so far
+
+	c := f.GetClient("one-shot")
+	t.Cleanup(func() { c.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := c.Connect(ctx); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	if accepted.Load() != 1 {
+		t.Fatalf("broker saw %d sessions", accepted.Load())
+	}
+	if st := f.Status(); st.Connected || st.Connects != 0 {
+		t.Fatalf("one-shot client changed the shared state: %+v", st)
+	}
+	// The third failure still switches: the count was not reset.
+	if !f.sel.Failure() {
+		t.Fatal("the failure count was reset by the one-shot client")
 	}
 }

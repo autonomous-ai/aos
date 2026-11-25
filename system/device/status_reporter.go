@@ -130,7 +130,7 @@ func (s *Service) StartStatusReporter(ctx context.Context) {
 				changed = true
 			}
 			if applyMQTTWSURL(resp, s.config) {
-				slog.Info("received MQTT WSS fallback URL from backend", "component", "status-reporter", "set", s.config.MQTTWSURL != "")
+				slog.Info("received MQTT WSS fallback URL", "component", "status-reporter", "set", s.config.MQTTWSURL != "")
 				changed = true
 			}
 			if changed {

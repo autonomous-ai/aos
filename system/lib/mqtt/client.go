@@ -170,7 +170,9 @@ func (c *MQTT) start(parent context.Context, t Transport, onUp func()) error {
 			if !current() {
 				return
 			}
-			c.sel.Up()
+			if c.fallback { // one-shot clients must not touch the shared state
+				c.sel.Up()
+			}
 			c.mu.Lock()
 			subs := c.copySubscriptions()
 			c.mu.Unlock()

@@ -305,3 +305,72 @@ func TestFactoryShareSelectorAndURLUpdate(t *testing.T) {
 		t.Fatalf("status = %+v", st)
 	}
 }
+
+func TestSelectorProbeIntervalDoublesWhenFlapping(t *testing.T) {
+	s, clk := newTestSelector(true)
+	failN(s, 3) // -> WSS
+	s.Up()
+	want := 10 * time.Minute
+	// Each probe passes, TCP then fails 3 times: the interval doubles up to 1 h.
+	for _, next := range []time.Duration{20 * time.Minute, 40 * time.Minute, time.Hour, time.Hour} {
+		clk.advance(want)
+		if !s.ProbeDue() {
+			t.Fatalf("probe must be due after %v", want)
+		}
+		if !s.ProbeDone(true) {
+			t.Fatal("expected switch back")
+		}
+		if !failN(s, 3) || s.Current() != TransportWSS {
+			t.Fatal("expected WSS again")
+		}
+		s.Up()
+		clk.advance(next - time.Second)
+		if s.ProbeDue() {
+			t.Fatalf("probe due before %v", next)
+		}
+		clk.advance(time.Second)
+		if !s.ProbeDue() {
+			t.Fatalf("probe not due at %v", next)
+		}
+		want = next
+	}
+}
+
+func TestSelectorProbeIntervalResetsWhenTCPReachesConnack(t *testing.T) {
+	s, clk := newTestSelector(true)
+	failN(s, 3)
+	clk.advance(10 * time.Minute)
+	s.ProbeDone(true)
+	failN(s, 3) // flapped: interval is now 20 min
+	clk.advance(20 * time.Minute)
+	s.ProbeDone(true)
+	s.Up() // TCP works for real
+	failN(s, 3)
+	s.Up()
+	clk.advance(10 * time.Minute)
+	if !s.ProbeDue() {
+		t.Fatal("interval must be back to 10 min after TCP reached CONNACK")
+	}
+}
+
+func TestSelectorFailedProbeDoesNotDouble(t *testing.T) {
+	s, clk := newTestSelector(true)
+	failN(s, 3)
+	clk.advance(10 * time.Minute)
+	s.ProbeDone(false)
+	clk.advance(10 * time.Minute)
+	if !s.ProbeDue() {
+		t.Fatal("a failed dial keeps the interval at 10 min")
+	}
+}
+
+func TestSelectorBadWSSDoesNotDoubleProbe(t *testing.T) {
+	s, clk := newTestSelector(true)
+	failN(s, 3) // -> WSS
+	failN(s, 6) // WSS bad -> TCP (no probe involved)
+	failN(s, 3) // TCP fails again -> WSS
+	clk.advance(10 * time.Minute)
+	if !s.ProbeDue() {
+		t.Fatal("only a failed switch-back after a probe doubles the interval")
+	}
+}

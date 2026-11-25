@@ -13,12 +13,12 @@ type Transport string
 const (
 	// TransportTCP is the primary transport: plain MQTT or MQTT over TLS.
 	TransportTCP Transport = "tcp"
-	// TransportWSS is the fallback: MQTT over a secure WebSocket on a URL the
-	// backend hands out, with the same credentials and channels as TCP.
+	// TransportWSS is the fallback: MQTT over a secure WebSocket on the URL
+	// from the status reply, with the same credentials and channels as TCP.
 	TransportWSS Transport = "wss"
 )
 
-// NormalizeWSURL validates the WebSocket URL from the backend. Only wss with a
+// NormalizeWSURL validates the WebSocket URL from the status reply. Only wss with a
 // host is accepted, so credentials are never sent over a plain WebSocket. It
 // returns the trimmed URL and whether it is usable.
 func NormalizeWSURL(raw string) (string, bool) {
@@ -39,6 +39,9 @@ type Policy struct {
 	// ProbeInterval is how often a device on WSS checks whether TCP works again.
 	ProbeInterval time.Duration
 }
+
+// maxProbeInterval caps the TCP re-check interval after repeated flapping.
+const maxProbeInterval = time.Hour
 
 // DefaultPolicy: three failed connects in a row move the client to WSS, and it
 // re-checks TCP every 10 minutes. If WSS itself fails twice as many times in a
@@ -77,6 +80,12 @@ type Selector struct {
 	wssSince  time.Time // when TCP was last given up on or last probed
 	connects  int
 	switches  int
+
+	// probeEvery is the current TCP re-check interval; it doubles (up to
+	// maxProbeInterval) when a probe's switch back to TCP failed again, and
+	// returns to Policy.ProbeInterval once TCP reaches CONNACK.
+	probeEvery time.Duration
+	probedBack bool // the current TCP stint began with a successful probe
 }
 
 // NewSelector starts on TCP. wsURL is the wss fallback URL ("" or invalid: none).
@@ -85,7 +94,7 @@ func NewSelector(p Policy, wsURL string, now func() time.Time) *Selector {
 		now = time.Now
 	}
 	u, _ := NormalizeWSURL(wsURL)
-	return &Selector{now: now, policy: p, wsURL: u, cur: TransportTCP}
+	return &Selector{now: now, policy: p, wsURL: u, cur: TransportTCP, probeEvery: p.ProbeInterval}
 }
 
 // SetWSURL replaces the wss URL in place. It never moves a working connection:
@@ -115,6 +124,8 @@ func (s *Selector) Reset() {
 	s.wssSince = time.Time{}
 	s.connects = 0
 	s.switches = 0
+	s.probeEvery = s.policy.ProbeInterval
+	s.probedBack = false
 }
 
 // Current is the transport the next connection attempt should use.
@@ -138,6 +149,10 @@ func (s *Selector) Up() {
 	s.connected = true
 	s.connects++
 	s.failures = 0
+	if s.cur == TransportTCP { // TCP reached CONNACK: stop treating it as flapping
+		s.probeEvery = s.policy.ProbeInterval
+		s.probedBack = false
+	}
 }
 
 // Down records a lost session. It is not a failed connect: the count of failures
@@ -162,6 +177,12 @@ func (s *Selector) Failure() (switched bool) {
 	switch s.cur {
 	case TransportTCP:
 		if s.wsURL != "" && s.failures >= s.policy.MinFailures {
+			if s.probedBack {
+				// The probe passed but TCP still fails: a middlebox that accepts
+				// the connection and drops MQTT. Probe less often.
+				s.probeEvery = min(2*s.probeEvery, maxProbeInterval)
+				s.probedBack = false
+			}
 			s.moveLocked(TransportWSS, now)
 			return true
 		}
@@ -178,7 +199,7 @@ func (s *Selector) Failure() (switched bool) {
 func (s *Selector) ProbeDue() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.cur == TransportWSS && s.now().Sub(s.wssSince) >= s.policy.ProbeInterval
+	return s.cur == TransportWSS && s.now().Sub(s.wssSince) >= s.probeEvery
 }
 
 // ProbeDone records the result of a TCP probe and reports whether the client
@@ -195,6 +216,7 @@ func (s *Selector) ProbeDone(ok bool) (switched bool) {
 		return false
 	}
 	s.moveLocked(TransportTCP, now)
+	s.probedBack = true
 	return true
 }
 
