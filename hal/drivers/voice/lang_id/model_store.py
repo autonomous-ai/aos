@@ -24,8 +24,9 @@ logger = logging.getLogger("hal.voice.lang_id")
 _CHUNK = 1 << 20
 _CONNECT_TIMEOUT_S = 15.0
 _READ_TIMEOUT_S = 60.0
-# A copy tried before the pinned URL must connect and answer within this, so a
-# missing or unreachable copy costs seconds before the pinned URL is asked.
+# A copy tried before the pinned URL must connect within this, so a missing or
+# unreachable copy costs seconds before the pinned URL is asked. Its body reads
+# then get the normal read timeout, so a short stall mid-transfer is not fatal.
 _QUICK_TIMEOUT_S = 5.0
 
 
@@ -140,7 +141,7 @@ class ModelStore:
         logger.info("Language ID model downloading %s -> %s", url, self.path)
         try:
             if url in self._quick:
-                self._fetch(url, part, self._stop, timeout=(_QUICK_TIMEOUT_S, _QUICK_TIMEOUT_S))
+                self._fetch(url, part, self._stop, timeout=(_QUICK_TIMEOUT_S, _READ_TIMEOUT_S))
             else:
                 self._fetch(url, part, self._stop)
             if self._stop.is_set():

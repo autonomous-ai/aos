@@ -4,6 +4,7 @@ upstream; the internet check accepts any of its probes."""
 import hashlib
 import importlib.util
 import io
+import time
 from pathlib import Path
 
 from hal.drivers.voice.speaker_recognizer.audio_processors import model_store as stoi_store
@@ -212,3 +213,54 @@ def test_cloud_probe_target_only_for_autonomous_hosts(monkeypatch):
     ]:
         monkeypatch.setattr(hal_config, "_os_cfg_get", lambda key, default="", b=base: b)
         assert app_state._cloud_probe_target() == want, base
+
+
+class _StallServer:
+    """HTTP server sending headers at once, then the body after `stall` s."""
+
+    def __init__(self, body: bytes, stall: float):
+        import http.server
+        import threading
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(h):
+                h.send_response(200)
+                h.send_header("Content-Length", str(len(body)))
+                h.end_headers()
+                h.wfile.flush()
+                time.sleep(stall)
+                h.wfile.write(body)
+
+            def log_message(h, *a):
+                pass
+
+        self.srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.url = f"http://127.0.0.1:{self.srv.server_address[1]}/f"
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+
+
+def test_piper_quick_copy_survives_a_stall_longer_than_the_quick_timeout(tmp_path, monkeypatch):
+    body = b"voice bytes"
+    srv = _StallServer(body, stall=0.6)
+    monkeypatch.setattr(piper_dl, "_flush", lambda *a, **k: None)
+    try:
+        dest = str(tmp_path / "v.onnx")
+        piper_dl._download(srv.url, dest, 0, 100, True, 0.2, hashlib.sha256(body).hexdigest())
+        assert Path(dest).read_bytes() == body
+    finally:
+        srv.close()
+
+
+def test_stoi_quick_copy_survives_a_stall_longer_than_the_quick_timeout(tmp_path):
+    body = b"stoi bytes"
+    srv = _StallServer(body, stall=0.6)
+    try:
+        dest = tmp_path / "squimm_stoi.onnx"
+        stoi_store._download_url(srv.url, dest, 0.2, hashlib.sha256(body).hexdigest())
+        assert dest.read_bytes() == body
+    finally:
+        srv.close()

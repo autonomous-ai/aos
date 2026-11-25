@@ -281,7 +281,7 @@ def test_cdn_copy_is_asked_quickly_then_pinned_url(tmp_path):
     ready = threading.Event()
     store.ensure(lambda path: ready.set())
     wait_ready(ready)
-    assert calls == [("https://cdn/m.onnx", (model_store._QUICK_TIMEOUT_S, model_store._QUICK_TIMEOUT_S)),
+    assert calls == [("https://cdn/m.onnx", (model_store._QUICK_TIMEOUT_S, model_store._READ_TIMEOUT_S)),
                      ("https://primary/m.onnx", None)]
 
 

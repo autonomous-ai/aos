@@ -19,7 +19,8 @@ _CDN_BASE: str = os.environ.get(
 _MIRROR_BASE: str = os.environ.get("HAL_SPEAKER_MODEL_MIRROR_BASE", "https://cdn.autonomous.ai/models")
 # Socket timeout for one download, so an unreachable host fails instead of hanging.
 _DOWNLOAD_TIMEOUT_S: float = 30.0
-# Socket timeout for the CDN copy tried first.
+# Connect and response-header timeout for the CDN copy tried first; its body
+# reads then get _DOWNLOAD_TIMEOUT_S.
 _QUICK_TIMEOUT_S: float = 5.0
 
 _CDN_OBJECTS: dict[str, str] = {
@@ -56,9 +57,19 @@ def _sha256_of(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _set_read_timeout(resp, timeout: float) -> None:
+    """Give an open urllib response's socket a new timeout for the body reads.
+    urlopen's own timeout covers connecting and the response headers."""
+    raw = getattr(getattr(resp, "fp", None), "raw", None)
+    sock = getattr(raw, "_sock", None)
+    if sock is not None:
+        sock.settimeout(timeout)
+
+
 def _download_url(url: str, dest: Path, timeout: float = _DOWNLOAD_TIMEOUT_S,
                   sha256: str = "") -> None:
-    """Atomic download from a direct URL.
+    """Atomic download from a direct URL. ``timeout`` bounds connecting and the
+    response headers; the body reads use _DOWNLOAD_TIMEOUT_S.
 
     Downloads to a per-PID temp file then atomically renames into place, so a crash/kill
     mid-download never leaves a truncated file a later run would mistake for a complete
@@ -70,6 +81,7 @@ def _download_url(url: str, dest: Path, timeout: float = _DOWNLOAD_TIMEOUT_S,
     try:
         with urllib.request.urlopen(url, timeout=timeout) as response, \
                 open(tmp, "wb") as out_file:
+            _set_read_timeout(response, _DOWNLOAD_TIMEOUT_S)
             shutil.copyfileobj(response, out_file)
         if sha256 and _sha256_of(tmp) != sha256:
             raise ValueError("sha256 mismatch")

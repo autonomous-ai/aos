@@ -49,20 +49,34 @@ def _flush(force: bool = False, **over) -> None:
         pass
 
 
-# Socket timeout for an upstream URL, and for a mirror copy tried before it.
+# Socket timeout for reading a download. A mirror copy tried before the
+# upstream URL must connect and send its response headers within
+# QUICK_TIMEOUT_S; its body reads then get DOWNLOAD_TIMEOUT_S too.
 DOWNLOAD_TIMEOUT_S = 60
 QUICK_TIMEOUT_S = 5
+
+
+def _set_read_timeout(resp, timeout: float) -> None:
+    """Give an open urllib response's socket a new timeout for the body reads.
+    urlopen's own timeout covers connecting and the response headers."""
+    raw = getattr(getattr(resp, "fp", None), "raw", None)
+    sock = getattr(raw, "_sock", None)
+    if sock is not None:
+        sock.settimeout(timeout)
 
 
 def _download(url: str, dest: str, w_from: int, w_to: int, track: bool,
               timeout: float = DOWNLOAD_TIMEOUT_S, sha256: str = "") -> None:
     """Fetch url to dest via a .part file, mapping progress onto a slice of the
-    whole job. The file is kept only when its SHA-256 equals `sha256`."""
+    whole job. `timeout` bounds connecting and the response headers; the body
+    reads use DOWNLOAD_TIMEOUT_S. The file is kept only when its SHA-256
+    equals `sha256`."""
     if len(sha256) != 64:
         raise ValueError(f"no pinned sha256 for {url}")
     tmp = dest + ".part"
     digest = hashlib.sha256()
     with urllib.request.urlopen(url, timeout=timeout) as resp, open(tmp, "wb") as out:
+        _set_read_timeout(resp, DOWNLOAD_TIMEOUT_S)
         total = int(resp.headers.get("Content-Length") or 0)
         if track:
             _flush(force=True, bytes_total=total, bytes_done=0)
