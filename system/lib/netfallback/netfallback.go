@@ -70,6 +70,15 @@ var (
 	resolvconfConf      = "/etc/resolvconf.conf"
 	staModeScript       = "/usr/local/bin/device-sta-mode"
 
+	// timesyncdUnitPaths are where systemd-timesyncd's unit file lives when
+	// it is installed (images running chrony have none).
+	timesyncdUnitPaths = []string{
+		"/etc/systemd/system/systemd-timesyncd.service",
+		"/run/systemd/system/systemd-timesyncd.service",
+		"/usr/lib/systemd/system/systemd-timesyncd.service",
+		"/lib/systemd/system/systemd-timesyncd.service",
+	}
+
 	regionCheckInterval = 5 * time.Minute
 
 	// enabled is false off Linux (simulator), where nothing is touched.
@@ -159,12 +168,20 @@ func apply(ctx context.Context, china, refresh bool) error {
 	return errors.Join(errs...)
 }
 
-// refreshCmd runs a refresh command; a missing command is not an error.
+// systemctlUnitNotFound is systemctl's exit status for a unit that does not exist.
+const systemctlUnitNotFound = 5
+
+// refreshCmd runs a refresh command. A missing command, or a unit systemctl
+// does not know, is not an error: there is nothing to refresh.
 func refreshCmd(ctx context.Context, name string, args ...string) error {
 	cctx, cancel := context.WithTimeout(ctx, commandTimeout)
 	defer cancel()
 	out, err := runCmd(cctx, name, args...)
 	if err == nil || errors.Is(err, exec.ErrNotFound) {
+		return nil
+	}
+	var exit interface{ ExitCode() int }
+	if name == "systemctl" && errors.As(err, &exit) && exit.ExitCode() == systemctlUnitNotFound {
 		return nil
 	}
 	return fmt.Errorf("%s %s: %w (%s)", name, strings.Join(args, " "), err, strings.TrimSpace(string(out)))
@@ -180,9 +197,23 @@ func logStep(name string, changed bool, err error) {
 	}
 }
 
+// timesyncdInstalled reports whether a systemd-timesyncd unit file exists.
+func timesyncdInstalled() bool {
+	for _, p := range timesyncdUnitPaths {
+		if _, err := os.Stat(p); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
 // ensureTimesyncd writes the drop-in in China and removes it elsewhere, then
-// restarts a running timesyncd after a change.
+// restarts a running timesyncd after a change. Without timesyncd it only
+// removes a drop-in left from before.
 func ensureTimesyncd(ctx context.Context, china, refresh bool) (bool, error) {
+	if !timesyncdInstalled() {
+		return putOrRemove(timesyncdDropInPath, timesyncdDropIn, false)
+	}
 	changed, err := putOrRemove(timesyncdDropInPath, timesyncdDropIn, china)
 	if err != nil || !(changed || refresh) {
 		return changed, err
@@ -192,25 +223,34 @@ func ensureTimesyncd(ctx context.Context, china, refresh bool) (bool, error) {
 }
 
 // ensureChrony writes the extra sources in China when chrony reads a sources
-// directory, and removes them elsewhere, then reloads chrony's sources.
+// directory, and removes them elsewhere, then reloads chrony's sources after a
+// change (a retry reloads again only where chrony reads the directory).
 func ensureChrony(ctx context.Context, china, refresh bool) (bool, error) {
-	if china {
-		conf, err := os.ReadFile(chronyConf)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				return false, nil
-			}
-			return false, err
-		}
-		if !strings.Contains(string(conf), "sourcedir "+chronySourcesDir) {
-			return false, nil
-		}
+	used, err := chronyReadsSourcesDir()
+	if err != nil {
+		return false, err
+	}
+	if china && !used {
+		return false, nil
 	}
 	changed, err := putOrRemove(filepath.Join(chronySourcesDir, chronySourcesName), chronySources, china)
-	if err != nil || !(changed || refresh) {
+	if err != nil || !(changed || (refresh && used)) {
 		return changed, err
 	}
 	return changed, refreshCmd(ctx, "chronyc", "reload", "sources")
+}
+
+// chronyReadsSourcesDir reports whether chrony is configured to read
+// chronySourcesDir; a missing chrony.conf means it is not.
+func chronyReadsSourcesDir() (bool, error) {
+	conf, err := os.ReadFile(chronyConf)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return strings.Contains(string(conf), "sourcedir "+chronySourcesDir), nil
 }
 
 // putOrRemove writes content to path when want is true (unless it already

@@ -300,7 +300,9 @@ removed and the image's `name_servers="1.1.1.1 8.8.8.8"` line and
 `device-sta-mode` lines are put back, but only where ours are in place.
 timesyncd is restarted (if running), chrony reloaded and `resolv.conf`
 regenerated only after a change, or again on the next check when a step
-failed (a failed step is retried every 5 minutes until all succeed); the `device-sta-mode` change applies from the
+failed (a failed step is retried every 5 minutes until all succeed; an image without
+systemd-timesyncd gets no drop-in, and a missing timesyncd unit or `chronyc`
+is not a failure); the `device-sta-mode` change applies from the
 next WiFi join. Before setup nothing changes, so an image built with
 `IMAGE_REGION=CN` (`scripts/imager`) keeps these settings until the cloud has
 answered.

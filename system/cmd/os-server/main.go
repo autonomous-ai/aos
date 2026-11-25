@@ -87,6 +87,8 @@ func main() {
 
 // configRegion returns the region the cloud last reported in the ping reply,
 // as saved in config.json ("" for none), and whether the device is set up.
+// It is a plain read of the file, with no config.Load: it runs every few
+// minutes and must never trigger config migrations or a save.
 func configRegion() (string, bool) {
 	data, err := os.ReadFile(config.Path())
 	if err != nil {

@@ -290,7 +290,9 @@ và file source bị xóa, dòng `name_servers="1.1.1.1 8.8.8.8"` của image v�
 dòng của `device-sta-mode` được đặt lại, nhưng chỉ khi dòng của chúng ta đang ở
 đó. timesyncd chỉ được restart (nếu đang chạy), chrony reload và `resolv.conf`
 tạo lại sau khi có thay đổi, hoặc lại ở lần kiểm tra kế tiếp khi một bước lỗi (bước
-lỗi được thử lại mỗi 5 phút tới khi tất cả thành công); thay đổi trong `device-sta-mode` có hiệu lực từ lần
+lỗi được thử lại mỗi 5 phút tới khi tất cả thành công; image không có
+systemd-timesyncd thì không ghi drop-in, và thiếu unit timesyncd hay `chronyc`
+không bị tính là lỗi); thay đổi trong `device-sta-mode` có hiệu lực từ lần
 join WiFi kế tiếp. Trước khi setup không có gì thay đổi, nên image build với
 `IMAGE_REGION=CN` (`scripts/imager`) giữ các thiết lập này cho tới khi cloud trả
 lời.

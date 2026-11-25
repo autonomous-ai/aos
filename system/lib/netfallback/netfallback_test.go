@@ -3,7 +3,9 @@ package netfallback
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -24,11 +26,16 @@ func setup(t *testing.T) (string, *fakeCmds) {
 	t.Helper()
 	dir := t.TempDir()
 	saved := []string{timesyncdDropInPath, chronyConf, chronySourcesDir, resolvconfConf, staModeScript}
-	savedRun, savedEnabled := runCmd, enabled
+	savedRun, savedEnabled, savedUnits := runCmd, enabled, timesyncdUnitPaths
 	t.Cleanup(func() {
 		timesyncdDropInPath, chronyConf, chronySourcesDir, resolvconfConf, staModeScript = saved[0], saved[1], saved[2], saved[3], saved[4]
-		runCmd, enabled = savedRun, savedEnabled
+		runCmd, enabled, timesyncdUnitPaths = savedRun, savedEnabled, savedUnits
 	})
+	// timesyncd is installed unless a test removes this unit file.
+	timesyncdUnitPaths = []string{filepath.Join(dir, "systemd-timesyncd.service")}
+	if err := os.WriteFile(timesyncdUnitPaths[0], nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
 	timesyncdDropInPath = filepath.Join(dir, "timesyncd.conf.d", "90-autonomous-fallback-ntp.conf")
 	chronyConf = filepath.Join(dir, "chrony.conf")
 	chronySourcesDir = filepath.Join(dir, "sources.d")
@@ -271,5 +278,62 @@ func TestApplierRetriesAfterAFailedStep(t *testing.T) {
 	a.Apply(context.Background())
 	if len(f.calls) != 0 {
 		t.Fatalf("applied state reran commands: %v", f.calls)
+	}
+}
+
+type exitErr int
+
+func (e exitErr) Error() string { return fmt.Sprintf("exit status %d", int(e)) }
+func (e exitErr) ExitCode() int { return int(e) }
+
+func TestApplierWithoutTimesyncdOrChronyIsApplied(t *testing.T) {
+	_, f := setup(t)
+	if err := os.Remove(timesyncdUnitPaths[0]); err != nil {
+		t.Fatal(err)
+	}
+	// chronyc absent; a systemctl call would report the unit missing.
+	f.fail = map[string]error{
+		"chronyc reload sources":                  exec.ErrNotFound,
+		"systemctl try-restart systemd-timesyncd": exitErr(5),
+	}
+	region := "CN"
+	a := NewApplier(func() (string, bool) { return region, true })
+
+	a.Apply(context.Background())
+	if a.applied == nil || !*a.applied || a.retry {
+		t.Fatalf("CN not applied: applied=%v retry=%v", a.applied, a.retry)
+	}
+	if _, err := os.Stat(timesyncdDropInPath); !os.IsNotExist(err) {
+		t.Fatalf("drop-in written without timesyncd: %v", err)
+	}
+	for _, c := range f.calls {
+		if strings.HasPrefix(c, "systemctl") || strings.HasPrefix(c, "chronyc") {
+			t.Fatalf("unexpected refresh %q", c)
+		}
+	}
+
+	region = ""
+	a.Apply(context.Background())
+	if a.applied == nil || *a.applied || a.retry {
+		t.Fatalf("leaving CN not applied: applied=%v retry=%v", a.applied, a.retry)
+	}
+}
+
+func TestRefreshToleratesMissingUnitOrCommand(t *testing.T) {
+	_, f := setup(t)
+	f.fail = map[string]error{
+		"systemctl try-restart systemd-timesyncd": exitErr(5),
+		"chronyc reload sources":                  exec.ErrNotFound,
+		"resolvconf -u":                           exitErr(5),
+	}
+	ctx := context.Background()
+	if err := refreshCmd(ctx, "systemctl", "try-restart", "systemd-timesyncd"); err != nil {
+		t.Fatalf("missing unit: %v", err)
+	}
+	if err := refreshCmd(ctx, "chronyc", "reload", "sources"); err != nil {
+		t.Fatalf("missing chronyc: %v", err)
+	}
+	if err := refreshCmd(ctx, "resolvconf", "-u"); err == nil {
+		t.Fatal("a failing resolvconf must stay an error")
 	}
 }
