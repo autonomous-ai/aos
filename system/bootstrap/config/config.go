@@ -2,11 +2,13 @@ package config
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"go.autonomous.ai/os/system/lib/otamirror"
 )
@@ -53,7 +55,8 @@ func Default() Config {
 // LoadOrDefault overlays bootstrap.json onto Default(); missing/corrupt file yields defaults.
 // OTA_METADATA_URL, when set, replaces metadata_url in memory. Otherwise a
 // metadata_url in the OTA bucket is moved to the CDN that serves the same
-// bucket, and the new value is written back once so every reader follows.
+// bucket, and the new value is written back once so every reader follows
+// (skipped while an update holds the config lock; the next start retries).
 func LoadOrDefault() *Config {
 	cfg := Default()
 	data, err := os.ReadFile(configPath)
@@ -80,29 +83,80 @@ func LoadOrDefault() *Config {
 	return &cfg
 }
 
+// LockPath is the lock software-update holds while it edits bootstrap.json
+// (rollback_versions). Writers here take it too, so neither loses the other's keys.
+var LockPath = "/var/lock/software-update.lock"
+
 // rewriteMetadataURL replaces only metadata_url in bootstrap.json, keeping every
-// other key (including ones this binary does not know), via an atomic rename.
+// other key (including ones this binary does not know).
 func rewriteMetadataURL(metadataURL string) error {
-	data, err := os.ReadFile(configPath)
-	if err != nil {
-		return fmt.Errorf("read config: %w", err)
-	}
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return fmt.Errorf("decode config: %w", err)
-	}
 	value, err := json.Marshal(metadataURL)
 	if err != nil {
 		return fmt.Errorf("encode metadata_url: %w", err)
 	}
-	raw["metadata_url"] = value
+	return updateFile(false, func(raw map[string]json.RawMessage) error {
+		raw["metadata_url"] = value
+		return nil
+	})
+}
+
+// Save writes the config's fields into /root/config/bootstrap.json. Keys this
+// binary does not know, and keys another writer added, are kept.
+func (c *Config) Save() error {
+	data, err := json.Marshal(c)
+	if err != nil {
+		return fmt.Errorf("marshal config: %w", err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return fmt.Errorf("marshal config: %w", err)
+	}
+	return updateFile(true, func(raw map[string]json.RawMessage) error {
+		for k, v := range fields {
+			raw[k] = v
+		}
+		return nil
+	})
+}
+
+// updateFile applies update to bootstrap.json as a JSON object while holding
+// LockPath, and installs the result with an atomic rename that keeps the file
+// mode. A missing file starts empty when create is set; a file that is not a
+// JSON object is left alone.
+func updateFile(create bool, update func(map[string]json.RawMessage) error) error {
+	unlock, err := lockConfig()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	raw := map[string]json.RawMessage{}
+	mode := os.FileMode(0o600)
+	data, err := os.ReadFile(configPath)
+	switch {
+	case err == nil:
+		if err := json.Unmarshal(data, &raw); err != nil {
+			return fmt.Errorf("decode config: %w", err)
+		}
+		if raw == nil {
+			raw = map[string]json.RawMessage{}
+		}
+		if info, err := os.Stat(configPath); err == nil {
+			mode = info.Mode().Perm()
+		}
+	case errors.Is(err, os.ErrNotExist) && create:
+		if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
+			return fmt.Errorf("create config dir: %w", err)
+		}
+	default:
+		return fmt.Errorf("read config: %w", err)
+	}
+	if err := update(raw); err != nil {
+		return err
+	}
 	out, err := json.MarshalIndent(raw, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode config: %w", err)
-	}
-	mode := os.FileMode(0o600)
-	if info, err := os.Stat(configPath); err == nil {
-		mode = info.Mode().Perm()
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(configPath), ".bootstrap.json.new-*")
 	if err != nil {
@@ -126,23 +180,24 @@ func rewriteMetadataURL(metadataURL string) error {
 		return fmt.Errorf("close temp: %w", err)
 	}
 	if err := os.Rename(tmpName, configPath); err != nil {
-		return fmt.Errorf("install config: %w", err)
+		return fmt.Errorf("install config %s: %w", configPath, err)
 	}
 	return nil
 }
 
-// Save writes the config to /root/config/bootstrap.json.
-func (c *Config) Save() error {
-	data, err := json.MarshalIndent(c, "", "  ")
+// lockConfig takes LockPath without waiting: while an update holds it, the
+// write is skipped (the metadata_url rewrite retries on the next start).
+func lockConfig() (func(), error) {
+	file, err := os.OpenFile(LockPath, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
-		return fmt.Errorf("marshal config: %w", err)
+		return nil, fmt.Errorf("open config lock: %w", err)
 	}
-	dir := filepath.Dir(configPath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("create config dir: %w", err)
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = file.Close()
+		return nil, fmt.Errorf("config is being updated (%s held): %w", LockPath, err)
 	}
-	if err := os.WriteFile(configPath, data, 0600); err != nil {
-		return fmt.Errorf("write config %s: %w", configPath, err)
-	}
-	return nil
+	return func() {
+		_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+		_ = file.Close()
+	}, nil
 }
