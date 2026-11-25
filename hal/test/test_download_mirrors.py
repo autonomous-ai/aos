@@ -264,3 +264,67 @@ def test_stoi_quick_copy_survives_a_stall_longer_than_the_quick_timeout(tmp_path
         assert dest.read_bytes() == body
     finally:
         srv.close()
+
+
+def _recording_probes(monkeypatch, tcp, tls=lambda host, port: False):
+    from hal import app_state
+
+    calls = []
+
+    def tcp_probe(host, port):
+        calls.append(host)
+        return tcp(host, port)
+
+    def tls_probe(host, port):
+        calls.append(host)
+        return tls(host, port)
+
+    monkeypatch.setattr(app_state, "_cloud_probe_target", lambda: ("cloud.test", 443))
+    monkeypatch.setattr(app_state, "_tcp_probe", tcp_probe)
+    monkeypatch.setattr(app_state, "_tls_probe", tls_probe)
+    monkeypatch.setattr(app_state, "_INTERNET_PROBE_HEDGE_S", 0.2)
+    monkeypatch.setattr(app_state, "_INTERNET_PROBE_TIMEOUT_S", 1.0)
+    return app_state, calls
+
+
+def test_has_internet_asks_only_the_first_resolver_when_it_answers(monkeypatch):
+    app_state, calls = _recording_probes(monkeypatch, lambda host, port: host == "8.8.8.8")
+    assert app_state._has_internet() is True
+    time.sleep(0.3)
+    assert calls == ["8.8.8.8"]
+
+
+def test_has_internet_starts_the_others_when_the_first_is_slow(monkeypatch):
+    def tcp(host, port):
+        if host == "8.8.8.8":
+            time.sleep(0.8)
+            return False
+        return True
+
+    app_state, calls = _recording_probes(monkeypatch, tcp)
+    started = time.monotonic()
+    assert app_state._has_internet() is True
+    took = time.monotonic() - started
+    assert 0.15 <= took < 0.6, took
+    time.sleep(0.1)
+    assert calls[0] == "8.8.8.8" and set(calls[1:]) == {"223.5.5.5", "cloud.test"}
+
+
+def test_has_internet_starts_the_others_at_once_when_the_first_fails(monkeypatch):
+    app_state, calls = _recording_probes(monkeypatch, lambda host, port: False,
+                                         tls=lambda host, port: True)
+    started = time.monotonic()
+    assert app_state._has_internet() is True
+    assert time.monotonic() - started < 0.15
+    assert calls[0] == "8.8.8.8" and "cloud.test" in calls
+
+
+def test_has_internet_gives_up_at_the_overall_bound(monkeypatch):
+    def hang(host, port):
+        time.sleep(3)
+        return True
+
+    app_state, _ = _recording_probes(monkeypatch, hang, tls=hang)
+    started = time.monotonic()
+    assert app_state._has_internet() is False
+    assert time.monotonic() - started < 1.3

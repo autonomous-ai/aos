@@ -943,13 +943,17 @@ def _dismiss_mic_muted_led(source: str):
     logger.info("Mic-muted LED indicator dismissed by %s (mic stays muted)", source)
 
 
-# Public resolvers probed over TCP/53; any answer counts. The second answers on
-# networks where the first is blocked. Same probe set as os-server's internet
-# check.
+# Public resolvers probed over TCP/53; any answer counts. The first is asked
+# alone; the second answers on networks where the first is blocked. Same probe
+# set as os-server's internet check.
 _INTERNET_PROBE_IPS = ("8.8.8.8", "223.5.5.5")
-# One bound for all probes at once: a connection that takes 3s across a slow
-# border still counts. Only a check with nothing answering waits this long.
+# Bound for one probe and for the whole check: a connection that takes 3s
+# across a slow border still counts. Only a check with nothing answering waits
+# this long.
 _INTERNET_PROBE_TIMEOUT_S = 4.0
+# How long the first resolver gets on its own before the other probes start
+# too, as os-server does. A network where it answers sees only that probe.
+_INTERNET_PROBE_HEDGE_S = 1.0
 
 
 def _tcp_probe(host: str, port: int) -> bool:
@@ -1000,21 +1004,35 @@ def _cloud_probe_target():
 
 def _has_internet() -> bool:
     """True if any probe answers: TCP/53 to each public resolver, or a TLS
-    handshake with the cloud API host. The probes run at once and the first
-    answer ends the check, so it takes at most about one probe timeout."""
+    handshake with the cloud API host. The first resolver is asked alone; the
+    others start when it fails or has not answered within
+    _INTERNET_PROBE_HEDGE_S. The first answer ends the check, which takes at
+    most _INTERNET_PROBE_TIMEOUT_S."""
     from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
-    probes = [(_tcp_probe, ip, 53) for ip in _INTERNET_PROBE_IPS]
-    cloud = _cloud_probe_target()
-    if cloud:
-        probes.append((_tls_probe, cloud[0], cloud[1]))
-    pool = ThreadPoolExecutor(max_workers=len(probes), thread_name_prefix="net-probe")
+    first, *others = _INTERNET_PROBE_IPS
+    start = time.monotonic()
+    hedge_at = start + _INTERNET_PROBE_HEDGE_S
+    deadline = start + _INTERNET_PROBE_TIMEOUT_S
+    pool = ThreadPoolExecutor(max_workers=len(_INTERNET_PROBE_IPS) + 1, thread_name_prefix="net-probe")
     try:
-        pending = {pool.submit(fn, host, port) for fn, host, port in probes}
-        while pending:
-            done, pending = wait(pending, return_when=FIRST_COMPLETED)
+        pending = {pool.submit(_tcp_probe, first, 53)}
+        hedged = False
+        while pending or not hedged:
+            now = time.monotonic()
+            if now >= deadline:
+                return False
+            until = deadline if hedged else min(hedge_at, deadline)
+            done, pending = wait(pending, timeout=until - now, return_when=FIRST_COMPLETED)
             if any(f.result() for f in done):
                 return True
+            if not hedged and (not pending or time.monotonic() >= hedge_at):
+                hedged = True
+                for ip in others:
+                    pending.add(pool.submit(_tcp_probe, ip, 53))
+                cloud = _cloud_probe_target()
+                if cloud:
+                    pending.add(pool.submit(_tls_probe, cloud[0], cloud[1]))
         return False
     finally:
         pool.shutdown(wait=False)
