@@ -986,7 +986,8 @@ máy cũ có thể mang uv cũ hơn:
 Cả hai trường hợp sync đều lỗi và máy vẫn ở HAL cũ. Khi uv tìm được bị thiếu
 hoặc cũ hơn mức tối thiểu, updater dùng `/usr/local/lib/autonomous/uv/uv` nếu
 bản đó đủ mới. Nếu không, nó cài uv ghim sẵn (`HAL_UV_PIN`, 0.12.23) vào đó:
-trước hết là file release từ mirror trên CDN, kiểm theo `.sha256`, sau đó là bộ
+trước hết là file release từ mirror trên CDN hoặc từ vendor, phải khớp sha256
+ghim trong `MIRROR_PINS`, sau đó là bộ
 cài của astral cho đúng bản này, với `UV_UNMANAGED_INSTALL`: không ghi receipt
 và không sửa PATH. uv có sẵn của máy giữ nguyên. Nếu cài lỗi, cập nhật
 dừng trước khi HAL bị dừng.
@@ -1457,13 +1458,23 @@ trước) chép nguyên file của vendor vào `<prefix>/mirror/` trong kho OTA,
 tại `https://cdn.autonomous.ai/os/mirror/`. `OS_MIRROR_BASE` override base trên
 thiết bị.
 
-| Công cụ | Đường dẫn mirror | Thứ tự trên thiết bị |
+Mọi file trên mirror đều có sha256 ghim trong repo: `MIRROR_PINS` trong
+`scripts/provision/software-update`, và cùng các dòng đó trong
+`runtimes/*/install.sh` nào tải file. Thiết bị chỉ lấy file từ mirror khi phiên
+bản đó có pin, và cả bản trên mirror lẫn bản của vendor phải khớp pin trước khi
+được giải nén, chạy hay cài. Phiên bản không có pin tải từ vendor y như trước.
+`upload-mirror.sh` từ chối file tải về khác pin đang có và in ra các dòng pin
+(`--digests` chỉ in, không upload), nên lần nâng phiên bản và pin đi cùng một
+thay đổi; `scripts/release/tests/test_mirror_pins.py` lỗi khi một phiên bản
+đã ghim không có digest.
+
+| Công cụ | Đường dẫn mirror | Thứ tự trên thiết bị (khi có pin) |
 |---|---|---|
-| uv `HAL_UV_PIN` | `uv/<ver>/uv-<triple>.tar.gz` + `.sha256` | mirror, rồi bộ cài astral |
-| Node (`NODE_MIRROR_DEB`) | `node/<deb>` + `.sha256` | CN: mirror, rồi apt setup của vendor; vùng khác: ngược lại |
+| uv `HAL_UV_PIN` | `uv/<ver>/uv-<triple>.tar.gz` | mirror, rồi file release, rồi bộ cài astral |
+| Node (`NODE_MIRROR_DEB`) | `node/<deb>` | CN: mirror hoặc file .deb của vendor, rồi apt setup của vendor; vùng khác: ngược lại |
 | Codex | `codex/<ver>/codex-<triple>.tar.gz` | mirror, rồi GitHub releases |
 | PicoClaw | `picoclaw/<tag>/picoclaw-linux-arm64` | mirror, rồi GitHub releases |
-| OpenCode | `opencode/<ver>/opencode-linux-<arch>.tar.gz` | mirror, rồi bộ cài của vendor |
+| OpenCode | `opencode/<ver>/opencode-linux-<arch>.tar.gz` | mirror, rồi GitHub releases (không pin: bộ cài của vendor) |
 | yq | `yq/v4.46.1/yq_linux_<arch>` | mirror, rồi GitHub releases |
 | Bộ cài Hermes ghim commit | `hermes/<commit>/install.sh` | mirror, rồi GitHub |
 

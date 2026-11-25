@@ -17,6 +17,26 @@ CODEX_VERSION="${CODEX_VERSION:-rust-v0.142.5}"
 CODEX_REPO="${CODEX_REPO:-openai/codex}"
 # Third-party downloads try the CDN mirror first, then the vendor.
 OS_MIRROR_BASE="${OS_MIRROR_BASE:-https://cdn.autonomous.ai/os/mirror}"
+# sha256 of the files this installer may take from the mirror ("<path> <sha256>"),
+# the same values as MIRROR_PINS in software-update. A file without a pin comes
+# from its vendor as before; a pinned file must match from the mirror or the vendor.
+MIRROR_PINS='
+codex/0.142.5/codex-aarch64-unknown-linux-musl.tar.gz b18c75c49645918fae23beba0ab41c05f07941601510a2451ba97fe519573c38
+codex/0.142.5/codex-x86_64-unknown-linux-musl.tar.gz cb933ec3cb61bf4b5fc88eecf5e6149829faa6172535b6ef0afb0154beb4aab8
+'
+mirror_pin() { printf '%s\n' "$MIRROR_PINS" | awk -v k="$1" '$1 == k { print $2; exit }'; }
+# fetch_pinned <dest> <sha256> <url>...: the first URL whose download matches the digest.
+fetch_pinned() {
+  local dest="$1" digest="$2" url
+  shift 2
+  for url in "$@"; do
+    if curl -fsSL "$url" -o "$dest" && echo "$digest  $dest" | sha256sum -c - >/dev/null 2>&1; then
+      return 0
+    fi
+    rm -f "$dest"
+  done
+  return 1
+}
 
 echo "[install-codex] prerequisites (jq, curl)"
 apt-get update || true
@@ -36,8 +56,12 @@ else
   CODEX_URL="https://github.com/${CODEX_REPO}/releases/download/${CODEX_VERSION}/${CODEX_ASSET}"
   CODEX_TMP="$(mktemp -d)"
   echo "[install-codex] downloading ${CODEX_URL}"
-  curl -fsSL "${OS_MIRROR_BASE}/codex/${WANT_VERSION}/${CODEX_ASSET}" -o "$CODEX_TMP/$CODEX_ASSET" \
-    || curl -fsSL "$CODEX_URL" -o "$CODEX_TMP/$CODEX_ASSET"
+  CODEX_SHA256="$(mirror_pin "codex/${WANT_VERSION}/${CODEX_ASSET}")"
+  if [ -n "$CODEX_SHA256" ]; then
+    fetch_pinned "$CODEX_TMP/$CODEX_ASSET" "$CODEX_SHA256" "${OS_MIRROR_BASE}/codex/${WANT_VERSION}/${CODEX_ASSET}" "$CODEX_URL"
+  else
+    curl -fsSL "$CODEX_URL" -o "$CODEX_TMP/$CODEX_ASSET"
+  fi
   tar -xzf "$CODEX_TMP/$CODEX_ASSET" -C "$CODEX_TMP"
   install -m 0755 "$CODEX_TMP/${CODEX_ASSET%.tar.gz}" "$CODEX_BIN"
   rm -rf "$CODEX_TMP"

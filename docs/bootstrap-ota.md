@@ -1019,8 +1019,8 @@ Older images can ship an older uv:
 Either way the sync fails, and the device stays on its old HAL. When the found
 uv is missing or older than the floor, the updater uses `/usr/local/lib/autonomous/uv/uv`
 if that one is new enough. Otherwise it installs the pinned uv (`HAL_UV_PIN`,
-0.12.23) there: first the release archive from the CDN mirror, checked against
-its `.sha256`, then astral's installer for that version with
+0.12.23) there: first the release archive from the CDN mirror or the vendor,
+which must match the sha256 pinned in `MIRROR_PINS`, then astral's installer for that version with
 `UV_UNMANAGED_INSTALL`, which writes no receipt and changes no PATH. The device's
 own uv is left as it is. A failed install stops the update before HAL is stopped.
 
@@ -1500,13 +1500,24 @@ preview) copies vendor files unchanged to `<prefix>/mirror/` in the OTA storage,
 served at `https://cdn.autonomous.ai/os/mirror/`. `OS_MIRROR_BASE` overrides the
 base on the device.
 
-| Tool | Mirror path | Device order |
+Every mirrored file has its sha256 pinned in the repo: `MIRROR_PINS` in
+`scripts/provision/software-update`, and the same lines in the
+`runtimes/*/install.sh` that download it. The device takes a file from the
+mirror only when its version has a pin, and the mirror copy and the vendor copy
+must both match that pin before the file is unpacked, run or installed. A
+version without a pin downloads from its vendor exactly as before.
+`upload-mirror.sh` refuses a download that differs from an existing pin and
+prints the pin lines (`--digests` prints them without uploading), so a version
+bump and its pins go in the same change; `scripts/release/tests/test_mirror_pins.py`
+fails when a pinned version has no digest.
+
+| Tool | Mirror path | Device order (with a pin) |
 |---|---|---|
-| uv `HAL_UV_PIN` | `uv/<ver>/uv-<triple>.tar.gz` + `.sha256` | mirror, then astral's installer |
-| Node (`NODE_MIRROR_DEB`) | `node/<deb>` + `.sha256` | CN: mirror, then the vendor apt setup; other: the reverse |
+| uv `HAL_UV_PIN` | `uv/<ver>/uv-<triple>.tar.gz` | mirror, then the release archive, then astral's installer |
+| Node (`NODE_MIRROR_DEB`) | `node/<deb>` | CN: mirror or the vendor's .deb, then the vendor apt setup; other: the reverse |
 | Codex | `codex/<ver>/codex-<triple>.tar.gz` | mirror, then GitHub releases |
 | PicoClaw | `picoclaw/<tag>/picoclaw-linux-arm64` | mirror, then GitHub releases |
-| OpenCode | `opencode/<ver>/opencode-linux-<arch>.tar.gz` | mirror, then the vendor installer |
+| OpenCode | `opencode/<ver>/opencode-linux-<arch>.tar.gz` | mirror, then GitHub releases (no pin: the vendor installer) |
 | yq | `yq/v4.46.1/yq_linux_<arch>` | mirror, then GitHub releases |
 | Hermes pinned installer | `hermes/<commit>/install.sh` | mirror, then GitHub |
 

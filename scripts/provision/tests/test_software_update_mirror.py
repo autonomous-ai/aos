@@ -81,6 +81,7 @@ class MirrorTests(unittest.TestCase):
         self.events.unlink(missing_ok=True)
         prelude = (f'OTA_STORAGE_PREFIX="{STORAGE}"\nOTA_CDN_BASE="{CDN}"\n'
                    f'OS_MIRROR_BASE="{CDN}/os/mirror"\n'
+                   'MIRROR_PINS="${TEST_PINS:-}"\n'
                    'curl() { python3 "$FAKE_CURL" "$@"; }\nprogress_report() { :; }\n'
                    'event() { printf "%s\\n" "$*" >> "$EVENTS"; }\n')
         result = subprocess.run(["/bin/bash", "-c", prelude + code], capture_output=True, text=True,
@@ -305,7 +306,7 @@ class MirrorTests(unittest.TestCase):
         self.assertEqual(self.curled(events), [])
         self.assertIn("another uv.lock", result.stderr)
 
-    def test_uv_from_mirror(self):
+    def uv_setup(self, mirror_ok=True, vendor_ok=True, pinned=True):
         triple = {"arm64": "aarch64", "aarch64": "aarch64", "x86_64": "x86_64"}[platform.machine()]
         triple += "-unknown-linux-gnu"
         buffer = io.BytesIO()
@@ -318,22 +319,42 @@ class MirrorTests(unittest.TestCase):
                 tar.addfile(info, io.BytesIO(data))
         asset = f"uv-{triple}.tar.gz"
         archive = buffer.getvalue()
-        base = f"{CDN}/os/mirror/uv/0.12.23"
-        self.publish(f"{base}/{asset}", archive)
-        self.publish(f"{base}/{asset}.sha256", f"{hashlib.sha256(archive).hexdigest()}  {asset}\n".encode())
+        self.publish(f"{CDN}/os/mirror/uv/0.12.23/{asset}", archive if mirror_ok else b"other bytes")
+        self.publish(f"https://github.com/astral-sh/uv/releases/download/0.12.23/{asset}",
+                     archive if vendor_ok else b"other bytes")
+        pins = f"uv/0.12.23/{asset} {hashlib.sha256(archive).hexdigest()}" if pinned else ""
         home = self.root / "uvhome"
-        code = functions("fetch_first", "install_uv_from_mirror") + \
+        code = functions("mirror_pin", "fetch_pinned", "install_uv_from_mirror") + \
             f'HAL_UV_PIN=0.12.23\nHAL_UV_HOME="{home}"\ninstall_uv_from_mirror\n'
-        result, _ = self.bash(code)
+        result, events = self.bash(code, TEST_PINS=pins)
+        return result, events, home
+
+    def test_uv_pinned_from_mirror(self):
+        result, events, home = self.uv_setup()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((home / "uv").exists() and (home / "uvx").exists())
+        self.assertEqual(len(self.curled(events)), 1)
 
-    def test_uv_mirror_missing_falls_through(self):
-        code = functions("fetch_first", "install_uv_from_mirror") + \
-            f'HAL_UV_PIN=0.12.23\nHAL_UV_HOME="{self.root}/uvhome"\ninstall_uv_from_mirror\n'
-        result, _ = self.bash(code)
+    def test_uv_mirror_mismatch_uses_pinned_vendor_file(self):
+        result, events, home = self.uv_setup(mirror_ok=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.curled(events)[-1].startswith("https://github.com/astral-sh/uv/"))
+        self.assertTrue((home / "uv").exists())
+
+    def test_uv_both_mismatch_installs_nothing(self):
+        result, _, home = self.uv_setup(mirror_ok=False, vendor_ok=False)
         self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((home / "uv").exists())
 
+    def test_uv_without_pin_skips_mirror(self):
+        result, events, home = self.uv_setup(pinned=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.curled(events), [])
+
+    def test_mirror_pin_lookup(self):
+        code = functions("mirror_pin") + 'mirror_pin codex/1/a.tar.gz; echo -; mirror_pin codex/2/a.tar.gz\n'
+        result, _ = self.bash(code, TEST_PINS="\ncodex/1/a.tar.gz " + "a" * 64 + "\n")
+        self.assertEqual(result.stdout, "a" * 64 + "\n-\n")
 
 if __name__ == "__main__":
     unittest.main()

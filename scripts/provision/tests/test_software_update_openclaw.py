@@ -86,10 +86,9 @@ class OpenClawUpdateTests(unittest.TestCase):
                    component="openclaw"):
         functions = "\n".join(
             shell_function(name)
-            for name in ("progress_report", "device_region", "region_is_cn", "fetch_first",
+            for name in ("progress_report", "device_region", "region_is_cn", "mirror_pin", "fetch_pinned",
                          "install_node_from_vendor", "install_node_from_mirror",
-                         "ensure_node_engine", "openclaw_npm_registry", "ensure_openclaw_node",
-                         "update_openclaw", "update_hermes_package")
+                         "ensure_node_engine", "openclaw_npm_registry", "ensure_openclaw_node", "update_openclaw", "update_hermes_package")
         )
         command = ('update_openclaw "2026.9.3"' if component == "openclaw"
                    else "update_hermes_package")

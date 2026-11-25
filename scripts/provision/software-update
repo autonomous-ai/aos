@@ -19,7 +19,9 @@ DEVICE_HAL_MIN="${DEVICE_HAL_MIN:-0.1.2}"
 # Download sources. The CDN serves the OTA storage byte for byte and is reachable
 # where the storage host is not, so OTA files are fetched from the CDN first and
 # from the storage URL if that fails. Third-party tools (uv, Node, agent CLIs)
-# are tried from the CDN mirror first, then from their vendor.
+# come from the CDN mirror only when their sha256 is pinned in MIRROR_PINS below;
+# then the mirror and the vendor URL must both match that digest. A version
+# without a pin downloads from its vendor exactly as before.
 OTA_STORAGE_PREFIX="${OTA_STORAGE_PREFIX:-https://storage.googleapis.com/s3-autonomous-upgrade-3}"
 OTA_CDN_BASE="${OTA_CDN_BASE:-https://cdn.autonomous.ai}"
 OS_MIRROR_BASE="${OS_MIRROR_BASE:-$OTA_CDN_BASE/os/mirror}"
@@ -30,6 +32,46 @@ NODE_MIRROR_DEB="${NODE_MIRROR_DEB:-nodejs_24.22.3-1nodesource1_arm64.deb}"
 # Each download attempt is bounded; an interrupted transfer resumes while it makes progress.
 OTA_DOWNLOAD_MAX_TIME="${OTA_DOWNLOAD_MAX_TIME:-600}"
 OTA_DOWNLOAD_ATTEMPTS="${OTA_DOWNLOAD_ATTEMPTS:-30}"
+
+# sha256 of every mirrored file, "<path under the mirror> <sha256>". Printed by
+# scripts/release/upload-mirror.sh; update together with a version bump.
+MIRROR_PINS='
+uv/0.12.23/uv-aarch64-unknown-linux-gnu.tar.gz 6524bd338177ed50d035d39354e12545e993bbeba2ecbddf0480c5b3a81d313f
+uv/0.12.23/uv-x86_64-unknown-linux-gnu.tar.gz 9167d72b3319674b6303c4cbe071854bba13ebdf3d76b1a7cbdc175471fb66d6
+node/nodejs_24.22.3-1nodesource1_arm64.deb bdf8027e9ac30d467a7ec47e9cfa3f162c65a696a9e31a42876cd52512d61646
+yq/v4.46.1/yq_linux_arm64 4ab0b301059348d671fc1833e99903c1fecc7ca287ac131f72dca0eb9a6ba87a
+yq/v4.46.1/yq_linux_amd64 c0eb42f6fbf928f0413422967983dcdf9806cc4dedc9394edc60c0dfb4a98529
+codex/0.142.5/codex-aarch64-unknown-linux-musl.tar.gz b18c75c49645918fae23beba0ab41c05f07941601510a2451ba97fe519573c38
+codex/0.142.5/codex-x86_64-unknown-linux-musl.tar.gz cb933ec3cb61bf4b5fc88eecf5e6149829faa6172535b6ef0afb0154beb4aab8
+codex/0.150.1/codex-aarch64-unknown-linux-musl.tar.gz 5bb1f75e1a1588845b4a31f2c98fb2b394be5c2a8d90a24a8ab0ebbae1169264
+codex/0.150.1/codex-x86_64-unknown-linux-musl.tar.gz ab308870bc7fc048c23dc49d03f6b8af9ce7fc99b9da882d6688be7a90155c7a
+picoclaw/v0.3.1-fixvision/picoclaw-linux-arm64 4bd0159fd02ca108b5c21bf08f6a044c8678f24c6d4a38ace2cadfb3ac9cffde
+opencode/1.18.4/opencode-linux-arm64.tar.gz eba87efba3976d533a24cca0316f8ef375b5f8e797c0a95c25ee919700b7ba35
+opencode/1.18.4/opencode-linux-x64.tar.gz bab463c3fb3224d388bb7cfad63f38703df9cf0be2cfd2ce8cb49d886b53a174
+hermes/f97608f178d1ffeca59860195ab7da295f7c8e5f/install.sh 2017ddf0cc7bc6cfb70d40dc9fba1d916f47dbcccf5fe73bdee2cf93a11262af
+'
+
+# mirror_pin <path>: the pinned sha256 for a mirrored file, or nothing.
+mirror_pin() {
+  printf '%s\n' "${MIRROR_PINS:-}" | awk -v k="$1" '$1 == k { print $2; exit }'
+}
+
+# fetch_pinned <dest> <sha256> <url>...: the first URL whose download matches the digest.
+fetch_pinned() {
+  local destination="$1" digest="$2" url
+  shift 2
+  [[ "$digest" =~ ^[a-f0-9]{64}$ ]] || return 1
+  for url in "$@"; do
+    [ -n "$url" ] || continue
+    if curl -fsSL --connect-timeout 30 --max-time "${OTA_DOWNLOAD_MAX_TIME:-600}" -o "$destination" "$url" \
+        && echo "$digest  $destination" | sha256sum -c - >/dev/null 2>&1; then
+      return 0
+    fi
+    echo "[software-update] download failed or did not match the pinned digest: $url" >&2
+    rm -f "$destination"
+  done
+  return 1
+}
 
 # ota_url_candidates <url>: print the URLs to try, one per line: the CDN copy
 # first, then the storage URL. Other URLs print unchanged.
@@ -64,20 +106,6 @@ device_region() {
 
 region_is_cn() {
   [ "$(device_region | tr '[:lower:]' '[:upper:]' | tr -d '[:space:]')" = CN ]
-}
-
-# fetch_first <dest> <url>...: download the first URL that answers, no progress.
-fetch_first() {
-  local destination="$1" url
-  shift
-  for url in "$@"; do
-    [ -n "$url" ] || continue
-    if curl -fsSL --connect-timeout 30 --max-time "${OTA_DOWNLOAD_MAX_TIME:-600}" -o "$destination" "$url"; then
-      return 0
-    fi
-    echo "[software-update] download failed: $url" >&2
-  done
-  return 1
 }
 
 # The helper stays embedded so updater refresh remains a single-file operation.
@@ -1013,29 +1041,31 @@ uv_at_least_min() {
   [ "$(printf '%s\n%s\n' "$HAL_UV_MIN" "$version" | sort -V | head -n 1)" = "$HAL_UV_MIN" ]
 }
 
-# install_uv_from_mirror: the pinned uv release archive from the CDN mirror,
-# checked against the vendor's published .sha256, unpacked into HAL_UV_HOME.
+# install_uv_from_mirror: the uv release archive, from the CDN mirror or the
+# vendor's release, checked against MIRROR_PINS, unpacked into HAL_UV_HOME.
+# Without a pin for HAL_UV_PIN it does nothing (the vendor installer runs).
 install_uv_from_mirror() {
-  local triple asset dir status=1
+  local triple asset dir digest status=1
   case "$(uname -m)" in
     aarch64|arm64) triple=aarch64-unknown-linux-gnu ;;
     x86_64) triple=x86_64-unknown-linux-gnu ;;
     *) return 1 ;;
   esac
   asset="uv-$triple.tar.gz"
+  digest=$(mirror_pin "uv/$HAL_UV_PIN/$asset")
+  [ -n "$digest" ] || return 1
   dir=$(mktemp -d) || return 1
-  if fetch_first "$dir/$asset" "$OS_MIRROR_BASE/uv/$HAL_UV_PIN/$asset" \
-      && fetch_first "$dir/$asset.sha256" "$OS_MIRROR_BASE/uv/$HAL_UV_PIN/$asset.sha256" \
-      && (cd "$dir" && sha256sum -c "$asset.sha256" >/dev/null) \
+  if fetch_pinned "$dir/$asset" "$digest" "$OS_MIRROR_BASE/uv/$HAL_UV_PIN/$asset" \
+        "https://github.com/astral-sh/uv/releases/download/$HAL_UV_PIN/$asset" \
       && tar -xzf "$dir/$asset" -C "$dir" \
       && [ -f "$dir/uv-$triple/uv" ] \
       && mkdir -p "$HAL_UV_HOME" \
       && install -m 0755 "$dir/uv-$triple/uv" "$HAL_UV_HOME/uv"; then
     [ ! -f "$dir/uv-$triple/uvx" ] || install -m 0755 "$dir/uv-$triple/uvx" "$HAL_UV_HOME/uvx" || true
-    echo "[software-update] installed uv $HAL_UV_PIN from the CDN mirror" >&2
+    echo "[software-update] installed uv $HAL_UV_PIN (pinned archive)" >&2
     status=0
   else
-    echo "[software-update] uv $HAL_UV_PIN not available from the CDN mirror; using the vendor installer" >&2
+    echo "[software-update] pinned uv $HAL_UV_PIN archive unavailable; using the vendor installer" >&2
   fi
   rm -rf "$dir"
   return "$status"
@@ -1119,14 +1149,16 @@ install_node_from_vendor() {
   apt-get install -y nodejs || return 1
 }
 
-# install_node_from_mirror: the vendor's nodejs .deb, mirrored on the CDN with a .sha256.
+# install_node_from_mirror: the vendor's nodejs .deb, from the CDN mirror or the
+# vendor's package pool, checked against MIRROR_PINS. No pin: does nothing.
 install_node_from_mirror() {
-  local dir status=1
+  local dir digest status=1
   [ "$(dpkg --print-architecture 2>/dev/null)" = arm64 ] || return 1
+  digest=$(mirror_pin "node/$NODE_MIRROR_DEB")
+  [ -n "$digest" ] || return 1
   dir=$(mktemp -d) || return 1
-  if fetch_first "$dir/$NODE_MIRROR_DEB" "$OS_MIRROR_BASE/node/$NODE_MIRROR_DEB" \
-      && fetch_first "$dir/$NODE_MIRROR_DEB.sha256" "$OS_MIRROR_BASE/node/$NODE_MIRROR_DEB.sha256" \
-      && (cd "$dir" && sha256sum -c "$NODE_MIRROR_DEB.sha256" >/dev/null) \
+  if fetch_pinned "$dir/$NODE_MIRROR_DEB" "$digest" "$OS_MIRROR_BASE/node/$NODE_MIRROR_DEB" \
+        "https://deb.nodesource.com/node_24.x/pool/main/n/nodejs/$NODE_MIRROR_DEB" \
       && apt-get install -y "$dir/$NODE_MIRROR_DEB"; then
     status=0
   fi
@@ -1198,9 +1230,14 @@ update_hermes_pinned() {
   local commit="$1" installer stage
   ensure_node_engine '>=22.22.0 <23 || >=24.11.0 <25 || >=26.0.0' hermes || return 1
   installer=$(mktemp)
-  fetch_first "$installer" "$OS_MIRROR_BASE/hermes/${commit}/install.sh" \
-    "https://raw.githubusercontent.com/NousResearch/hermes-agent/${commit}/scripts/install.sh" \
-    || { echo "[software-update] failed to fetch hermes installer @ $commit"; rm -f "$installer"; return 1; }
+  local vendor_url="https://raw.githubusercontent.com/NousResearch/hermes-agent/${commit}/scripts/install.sh" digest
+  digest=$(mirror_pin "hermes/${commit}/install.sh")
+  if [ -n "$digest" ]; then
+    fetch_pinned "$installer" "$digest" "$OS_MIRROR_BASE/hermes/${commit}/install.sh" "$vendor_url" \
+      || { echo "[software-update] failed to fetch hermes installer @ $commit"; rm -f "$installer"; return 1; }
+  else
+    curl -fsSL "$vendor_url" -o "$installer" || { echo "[software-update] failed to fetch hermes installer @ $commit"; rm -f "$installer"; return 1; }
+  fi
   for stage in repository venv python-deps path; do
     echo "[software-update] hermes installer stage: $stage (commit $commit)"
     bash "$installer" --stage "$stage" --non-interactive --commit "$commit" --force-commit || { echo "[software-update] hermes installer stage $stage failed"; rm -f "$installer"; return 1; }
@@ -2206,10 +2243,15 @@ elif [ "$APP" = "codex" ]; then
   esac
   CODEX_URL="https://github.com/openai/codex/releases/download/rust-v${VERSION}/${CODEX_ASSET}"
   DIR_TMP=$(mktemp -d)
-  echo "[software-update] downloading codex $VERSION (CDN mirror first, then $CODEX_URL)"
+  echo "[software-update] downloading codex $VERSION"
   # No sha256 (upstream artifact); tar extraction is the integrity check.
-  download_verified "$OS_MIRROR_BASE/codex/${VERSION}/${CODEX_ASSET}" "$DIR_TMP/$CODEX_ASSET" "" "$CODEX_URL" \
-    || { echo "Failed to download codex $VERSION"; exit 1; }
+  CODEX_SHA256=$(mirror_pin "codex/${VERSION}/${CODEX_ASSET}")
+  if [ -n "$CODEX_SHA256" ]; then
+    download_verified "$OS_MIRROR_BASE/codex/${VERSION}/${CODEX_ASSET}" "$DIR_TMP/$CODEX_ASSET" "$CODEX_SHA256" "$CODEX_URL" \
+      || { echo "Failed to download codex $VERSION"; exit 1; }
+  else
+    download_verified "$CODEX_URL" "$DIR_TMP/$CODEX_ASSET" "" || { echo "Failed to download codex $VERSION"; exit 1; }
+  fi
   tar -xzf "$DIR_TMP/$CODEX_ASSET" -C "$DIR_TMP" || { echo "Corrupt codex tarball for $VERSION"; exit 1; }
   CODEX_SRC="$DIR_TMP/${CODEX_ASSET%.tar.gz}"
   [ -f "$CODEX_SRC" ] || { echo "No codex binary in tarball"; exit 1; }
@@ -2244,22 +2286,24 @@ elif [ "$APP" = "opencode" ]; then
   [ -x /usr/local/bin/opencode ] || { echo "opencode is not installed on this device — switch the runtime to opencode first"; exit 1; }
   export HOME=/root
   install -D -m 0755 /usr/local/bin/opencode /root/bootstrap/rollback/opencode.previous
-  # The CDN mirror holds the vendor's release archive; the vendor installer stays the fallback.
+  # A pinned release archive comes from the CDN mirror or the vendor's release and
+  # must match MIRROR_PINS before it is unpacked; without a pin the vendor installer runs as before.
   case "$(uname -m)" in
     aarch64|arm64) OC_ASSET="opencode-linux-arm64.tar.gz" ;;
     x86_64)        OC_ASSET="opencode-linux-x64.tar.gz" ;;
     *)             OC_ASSET="" ;;
   esac
-  DIR_TMP=$(mktemp -d)
-  OC_FROM_MIRROR=0
-  if [ -n "$OC_ASSET" ] && fetch_first "$DIR_TMP/$OC_ASSET" "$OS_MIRROR_BASE/opencode/${VERSION}/${OC_ASSET}" \
-      && tar -xzf "$DIR_TMP/$OC_ASSET" -C "$DIR_TMP"; then
-    OC_NEW=$(find "$DIR_TMP" -type f -name opencode 2>/dev/null | head -1)
-    if [ -n "$OC_NEW" ] && chmod 0755 "$OC_NEW" && "$OC_NEW" --version 2>/dev/null | grep -qw "$VERSION"; then
-      install -m 0755 "$OC_NEW" /usr/local/bin/opencode && OC_FROM_MIRROR=1
-    fi
-  fi
-  if [ "$OC_FROM_MIRROR" != 1 ]; then
+  OC_SHA256=""
+  [ -z "$OC_ASSET" ] || OC_SHA256=$(mirror_pin "opencode/${VERSION}/${OC_ASSET}")
+  if [ -n "$OC_SHA256" ]; then
+    DIR_TMP=$(mktemp -d)
+    download_verified "$OS_MIRROR_BASE/opencode/${VERSION}/${OC_ASSET}" "$DIR_TMP/$OC_ASSET" "$OC_SHA256" \
+        "https://github.com/anomalyco/opencode/releases/download/v${VERSION}/${OC_ASSET}" \
+      || { echo "Failed to download opencode $VERSION"; exit 1; }
+    tar -xzf "$DIR_TMP/$OC_ASSET" -C "$DIR_TMP" || { echo "Corrupt opencode archive for $VERSION"; exit 1; }
+    [ -f "$DIR_TMP/opencode" ] || { echo "No opencode binary in archive"; exit 1; }
+    install -m 0755 "$DIR_TMP/opencode" /usr/local/bin/opencode
+  else
     curl -fsSL https://opencode.ai/install | OPENCODE_INSTALL_DIR=/usr/local/bin bash -s -- --version "$VERSION" \
       || { echo "opencode installer failed for $VERSION"; exit 1; }
   fi
@@ -2323,9 +2367,14 @@ elif [ "$APP" = "picoclaw" ]; then
   esac
   PICO_URL="https://github.com/autonomous-ai/picoclaw/releases/download/${VERSION}/${PICO_ASSET}"
   DIR_TMP=$(mktemp -d)
-  echo "[software-update] downloading picoclaw $VERSION (CDN mirror first, then $PICO_URL)"
-  download_verified "$OS_MIRROR_BASE/picoclaw/${VERSION}/${PICO_ASSET}" "$DIR_TMP/$PICO_ASSET" "" "$PICO_URL" \
-    || { echo "Failed to download picoclaw $VERSION"; exit 1; }
+  echo "[software-update] downloading picoclaw $VERSION"
+  PICO_SHA256=$(mirror_pin "picoclaw/${VERSION}/${PICO_ASSET}")
+  if [ -n "$PICO_SHA256" ]; then
+    download_verified "$OS_MIRROR_BASE/picoclaw/${VERSION}/${PICO_ASSET}" "$DIR_TMP/$PICO_ASSET" "$PICO_SHA256" "$PICO_URL" \
+      || { echo "Failed to download picoclaw $VERSION"; exit 1; }
+  else
+    download_verified "$PICO_URL" "$DIR_TMP/$PICO_ASSET" "" || { echo "Failed to download picoclaw $VERSION"; exit 1; }
+  fi
   # No sha256: run the new binary from the temp dir before replacing the installed one.
   chmod 0755 "$DIR_TMP/$PICO_ASSET"
   "$DIR_TMP/$PICO_ASSET" --no-color version >/dev/null 2>&1 || { echo "Downloaded picoclaw $VERSION is not runnable — keeping the current binary"; exit 1; }

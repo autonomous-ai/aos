@@ -8,15 +8,27 @@
 # hermes) and from the pins in software-update (uv, Node), so the mirror always
 # matches what devices will ask for. Run again after publishing a new version.
 #
-# Usage: scripts/release/upload-mirror.sh [--dry-run]
+# Devices use a mirrored file only when its sha256 is pinned in the repo
+# (MIRROR_PINS in scripts/provision/software-update, and the pins in
+# runtimes/*/install.sh). This script checks every download against an existing
+# pin and prints the pin lines for new versions, so a version bump and its pins
+# land in the same change.
+#
+# Usage: scripts/release/upload-mirror.sh [--dry-run | --digests]
 #   --dry-run  print every source URL and destination; download and upload nothing.
+#   --digests  download and print the pin lines; upload nothing.
 set -euo pipefail
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ota-config.sh"
 source "${RELEASE_DIR}/ota-metadata.sh"
 
-DRY_RUN=0
-[[ "${1:-}" != --dry-run ]] || DRY_RUN=1
+MODE=upload
+case "${1:-}" in
+  --dry-run) MODE=dry-run ;;
+  --digests) MODE=digests ;;
+  "") ;;
+  *) echo "Usage: $0 [--dry-run | --digests]" >&2; exit 1 ;;
+esac
 
 UPDATER="${ROOT_DIR}/scripts/provision/software-update"
 pin() { sed -n "s/^$1=\"\${$1:-\(.*\)}\"\$/\1/p" "$UPDATER" | head -1; }
@@ -43,7 +55,6 @@ add() { ENTRIES+=("$1|$2"); }  # <vendor url>|<object path under the mirror>
 
 for triple in aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu; do
   add "https://github.com/astral-sh/uv/releases/download/${UV_PIN}/uv-${triple}.tar.gz" "uv/${UV_PIN}/uv-${triple}.tar.gz"
-  add "https://github.com/astral-sh/uv/releases/download/${UV_PIN}/uv-${triple}.tar.gz.sha256" "uv/${UV_PIN}/uv-${triple}.tar.gz.sha256"
 done
 add "https://deb.nodesource.com/node_24.x/pool/main/n/nodejs/${NODE_DEB}" "node/${NODE_DEB}"
 add "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_arm64" "yq/${YQ_VERSION}/yq_linux_arm64"
@@ -68,22 +79,36 @@ if [[ -n "$HERMES_COMMIT" ]]; then
   add "https://raw.githubusercontent.com/NousResearch/hermes-agent/${HERMES_COMMIT}/scripts/install.sh" "hermes/${HERMES_COMMIT}/install.sh"
 fi
 
+# repo_pin <key>: the sha256 pinned in software-update for <key>, or nothing.
+repo_pin() { awk -v k="$1" '$1 == k { print $2; exit }' "$UPDATER"; }
+
+PINS=()
 for entry in "${ENTRIES[@]}"; do
   source_url="${entry%%|*}"
-  object="${MIRROR}/${entry#*|}"
-  if [[ "$DRY_RUN" == 1 ]]; then
-    printf '%s\n  -> gs://%s/%s\n  served at %s\n' "$source_url" "$GCS_BUCKET" "$object" "$(ota_public_url "$object")"
+  key="${entry#*|}"
+  object="${MIRROR}/${key}"
+  if [[ "$MODE" == dry-run ]]; then
+    printf '%s\n  -> gs://%s/%s\n  served at %s\n  pinned: %s\n' "$source_url" "$GCS_BUCKET" "$object" \
+      "$(ota_public_url "$object")" "$(repo_pin "$key" || true)"
     continue
   fi
   file="$WORK/$(basename "$object")"
-  echo "========== ${source_url} =========="
+  echo "========== ${source_url} ==========" >&2
   curl -fsSL --retry 3 -o "$file" "$source_url"
-  # The device checks the Node package against this digest; uv ships its own .sha256.
-  if [[ "$object" == */node/* ]]; then
-    printf '%s  %s\n' "$(ota_artifact_sha256 "$file")" "$(basename "$object")" > "$file.sha256"
-    gsutil -h "Cache-Control:public, max-age=31536000, immutable" cp "$file.sha256" "gs://${GCS_BUCKET}/${object}.sha256"
+  digest=$(ota_artifact_sha256 "$file")
+  pinned=$(repo_pin "$key" || true)
+  if [[ -n "$pinned" && "$pinned" != "$digest" ]]; then
+    echo "ERROR: ${source_url} has sha256 ${digest}, the repo pins ${pinned}; refusing to mirror it" >&2
+    exit 1
   fi
-  gsutil -h "Cache-Control:public, max-age=31536000, immutable" cp "$file" "gs://${GCS_BUCKET}/${object}"
-  rm -f "$file" "$file.sha256"
+  PINS+=("${key} ${digest}")
+  if [[ "$MODE" == upload ]]; then
+    gsutil -h "Cache-Control:public, max-age=31536000, immutable" cp "$file" "gs://${GCS_BUCKET}/${object}"
+  fi
+  rm -f "$file"
 done
-[[ "$DRY_RUN" == 1 ]] || echo "Done: ${#ENTRIES[@]} files under $(ota_public_url "$MIRROR")/"
+if [[ "$MODE" != dry-run ]]; then
+  echo "# Pin lines (MIRROR_PINS in scripts/provision/software-update; runtimes/*/install.sh for first installs):"
+  printf '%s\n' "${PINS[@]}"
+fi
+[[ "$MODE" != upload ]] || echo "Done: ${#ENTRIES[@]} files under $(ota_public_url "$MIRROR")/" >&2
