@@ -34,7 +34,10 @@ def wait_ready(store_ready, timeout=5.0):
 def test_manifest_requires_https_and_sha(tmp_path):
     good = tmp_path / "m.json"
     good.write_text(json.dumps({"url": "https://x/y.onnx", "sha256": SHA, "size": 5}))
-    assert read_manifest(good) == {"url": "https://x/y.onnx", "sha256": SHA, "size": 5}
+    assert read_manifest(good) == {"url": "https://x/y.onnx", "mirrors": [], "sha256": SHA, "size": 5}
+    good.write_text(json.dumps({"url": "https://x/y.onnx", "sha256": SHA,
+                                "mirrors": ["https://m/y.onnx", "http://insecure/y.onnx", 7]}))
+    assert read_manifest(good)["mirrors"] == ["https://m/y.onnx"]
     bad = tmp_path / "bad.json"
     bad.write_text(json.dumps({"url": "http://x/y.onnx", "sha256": SHA}))
     assert read_manifest(bad) is None
@@ -207,3 +210,58 @@ def test_build_gate_off_without_model_or_pin(tmp_path, monkeypatch):
     monkeypatch.setattr(voice_cfg, "LANG_ID_MODEL_PATH", tmp_path / "missing.onnx")
     monkeypatch.setattr(voice_cfg, "LANG_ID_MODEL_MANIFEST", tmp_path / "missing.json")
     assert build_gate("en") is None
+
+
+def test_download_falls_back_to_mirror(tmp_path):
+    tried = []
+
+    def fetch(url, dest, stop):
+        tried.append(url)
+        if url == "https://primary/m.onnx":
+            raise OSError("unreachable")
+        dest.write_bytes(MODEL)
+
+    store = ModelStore(tmp_path, "ambernet.onnx", "https://primary/m.onnx", SHA,
+                       mirrors=["https://mirror/m.onnx"], fetch=fetch)
+    ready = threading.Event()
+    store.ensure(lambda path: ready.set())
+    wait_ready(ready)
+    assert tried == ["https://primary/m.onnx", "https://mirror/m.onnx"]
+    assert store.path.read_bytes() == MODEL
+
+
+def test_mirror_with_wrong_hash_is_rejected(tmp_path):
+    def fetch(url, dest, stop):
+        if url == "https://primary/m.onnx":
+            raise OSError("unreachable")
+        dest.write_bytes(b"not the model")
+
+    store = ModelStore(tmp_path, "ambernet.onnx", "https://primary/m.onnx", SHA,
+                       mirrors=["https://mirror/m.onnx"], retry_s=60, fetch=fetch)
+    try:
+        store._download()
+    except ValueError as e:
+        assert "sha256 mismatch" in str(e)
+    else:
+        raise AssertionError("a mirror with the wrong hash must not be accepted")
+    assert not store.path.exists()
+
+
+def test_build_gate_tries_mirror_override_last(tmp_path, monkeypatch):
+    manifest = tmp_path / "ambernet.model.json"
+    manifest.write_text(json.dumps({"url": "https://x/ambernet.onnx", "sha256": SHA,
+                                    "mirrors": ["https://m/ambernet.onnx"]}))
+    monkeypatch.setattr(voice_cfg, "LANG_GATE_MODE", "enforce")
+    monkeypatch.setattr(voice_cfg, "LANG_ID_MODEL_PATH", tmp_path / "missing" / "ambernet.onnx")
+    monkeypatch.setattr(voice_cfg, "LANG_ID_MODEL_MANIFEST", manifest)
+    monkeypatch.setattr(voice_cfg, "LANG_ID_CACHE_DIR", tmp_path / "cache")
+    monkeypatch.setattr(voice_cfg, "LANG_ID_MODEL_MIRROR_URL", "https://override/ambernet.onnx")
+    release = threading.Event()
+    monkeypatch.setattr(model_store, "_http_fetch", lambda url, dest, stop: release.wait(5))
+    gate = build_gate("en")
+    try:
+        assert gate.store.urls == ["https://x/ambernet.onnx", "https://m/ambernet.onnx",
+                                   "https://override/ambernet.onnx"]
+    finally:
+        gate.store.stop()
+        release.set()

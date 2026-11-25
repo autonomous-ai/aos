@@ -156,9 +156,15 @@ def build_gate(selected: Optional[str]) -> Optional[LanguageGate]:
             target=gate.attach, args=(identifier_for(local),), daemon=True, name="lang-gate-load",
         ).start()
     else:
+        urls = [manifest["url"], *manifest.get("mirrors", [])]
+        mirror = voice_cfg.LANG_ID_MODEL_MIRROR_URL
+        if mirror.startswith("https://"):
+            urls.append(mirror)
+        elif mirror:
+            logger.warning("Language ID: ignoring HAL_LANG_ID_MODEL_MIRROR_URL (needs https)")
         gate.store = ModelStore(
-            voice_cfg.LANG_ID_CACHE_DIR, local.name, manifest["url"], manifest["sha256"],
-            size=manifest["size"],
+            voice_cfg.LANG_ID_CACHE_DIR, local.name, urls[0], manifest["sha256"],
+            mirrors=urls[1:], size=manifest["size"],
         )
         gate.store.ensure(lambda path: gate.attach(identifier_for(path)))
     return gate

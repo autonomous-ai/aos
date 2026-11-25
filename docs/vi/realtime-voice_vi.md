@@ -3641,6 +3641,9 @@ một release asset) và giữ model trong `HAL_LANG_ID_CACHE_DIR` (mặc địn
 về `<file>.part`, kiểm tra SHA-256 rồi rename vào đúng chỗ, nên đường dẫn cuối cùng
 chỉ chứa model đã được xác minh; một lần tải lỗi bị xóa và thử lại sau 30 s, gấp
 đôi dần tới 600 s. Cả HAL khi khởi động lẫn voice loop đều không chờ việc tải này.
+Mỗi lần thử tải từ `url` đã pin, rồi tới các `mirrors` https trong file pin, rồi
+tới `HAL_LANG_ID_MODEL_MIRROR_URL` nếu có đặt (mặc định rỗng); mọi nguồn đều được
+kiểm tra cùng SHA-256.
 
 Cổng chỉ **active** khi model đã load xong (`Language gate active`). Trước đó (đang
 tải, đang load lúc boot), hoặc khi model load lỗi, mọi capture ghi log

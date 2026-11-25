@@ -1,11 +1,19 @@
 """Curated Piper voice catalogue — the list the device offers for download."""
 
+import os
+
 VOICES_BASE = "https://huggingface.co/rhasspy/piper-voices/resolve/main"
 
 BINARY_URL = (
     "https://github.com/rhasspy/piper/releases/download/2023.11.14-2/"
     "piper_linux_aarch64.tar.gz"
 )
+
+# Optional mirror of the same files, tried after the upstream URL fails (for
+# networks where the upstream hosts are unreachable). Layout below it:
+# <version>/piper_linux_aarch64.tar.gz and voices/<path>/<name>.onnx(.json).
+# Empty (the default) adds none.
+MIRROR_BASE = os.environ.get("HAL_PIPER_MIRROR_BASE", "").strip().rstrip("/")
 
 CATALOG = {
     "en_US-ljspeech-medium": {
@@ -85,4 +93,21 @@ def voice_urls(name: str):
     if not meta:
         return None
     base = f"{VOICES_BASE}/{meta['path']}/{name}"
+    return f"{base}.onnx", f"{base}.onnx.json"
+
+
+def binary_urls() -> list:
+    """Engine archive URLs in try order: upstream first, then the mirror."""
+    urls = [BINARY_URL]
+    if MIRROR_BASE:
+        urls.append(f"{MIRROR_BASE}/{BINARY_URL.split('/download/', 1)[1]}")
+    return urls
+
+
+def voice_mirror_urls(name: str):
+    """(onnx_url, json_url) on the mirror for a catalogue entry, or None."""
+    meta = CATALOG.get(name)
+    if not meta or not MIRROR_BASE:
+        return None
+    base = f"{MIRROR_BASE}/voices/{meta['path']}/{name}"
     return f"{base}.onnx", f"{base}.onnx.json"

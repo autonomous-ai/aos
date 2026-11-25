@@ -69,6 +69,24 @@ def _download(url: str, dest: str, w_from: int, w_to: int, track: bool) -> None:
     os.replace(tmp, dest)
 
 
+def _download_any(urls, dest: str, w_from: int, w_to: int, track: bool) -> None:
+    """Try each URL in order (upstream first, then mirrors); raise the last error."""
+    last = None
+    for url in urls:
+        try:
+            _download(url, dest, w_from, w_to, track)
+            return
+        except Exception as exc:  # noqa: BLE001 — any failure moves to the next URL
+            last = exc
+            _discard([dest + ".part"])
+    raise last if last else RuntimeError("no download URL")
+
+
+def _urls(spec: dict) -> list:
+    """The primary URL plus any mirrors a spec carries (older specs have none)."""
+    return [spec["url"], *[u for u in spec.get("mirrors") or [] if u]]
+
+
 def _discard(paths) -> None:
     for path in paths:
         try:
@@ -82,8 +100,8 @@ def _run_voice(spec: dict) -> None:
     os.makedirs(os.path.dirname(steps[0]["dest"]), exist_ok=True)
     try:
         for step in steps:
-            _download(step["url"], step["dest"], step["from"], step["to"],
-                      step.get("track", False))
+            _download_any(_urls(step), step["dest"], step["from"], step["to"],
+                          step.get("track", False))
     except Exception:
         # A half-installed voice is worse than none: discard every step's files.
         _discard([p for s in steps for p in (s["dest"], s["dest"] + ".part")])
@@ -135,7 +153,7 @@ def _run_engine(spec: dict) -> None:
     os.makedirs(piper_dir, exist_ok=True)
     with tempfile.TemporaryDirectory() as td:
         tar_path = os.path.join(td, "piper.tar.gz")
-        _download(spec["url"], tar_path, 0, 85, True)
+        _download_any(_urls(spec), tar_path, 0, 85, True)
         _flush(force=True, percent=88)
         src = _extract_engine(tar_path, os.path.join(td, "extracted"))
         for entry in os.listdir(src):
