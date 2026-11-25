@@ -1,9 +1,11 @@
 package openclaw
 
 import (
+	"bytes"
 	"context"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -16,6 +18,7 @@ import (
 
 	"go.autonomous.ai/os/system/device"
 	"go.autonomous.ai/os/system/domain"
+	"go.autonomous.ai/os/system/lib/otamirror"
 	"go.autonomous.ai/os/system/skills"
 )
 
@@ -747,34 +750,73 @@ func dropAutoResponsePrefix(configData map[string]interface{}) bool {
 	return changed
 }
 
-// downloadFile fetches url and writes it to dst.
+// downloadFile fetches url and writes it to dst. An OTA storage URL is tried on
+// the CDN first, then on the storage host; a reply that is not the file (an
+// HTML page, an empty body) moves on to the next host. dst is replaced
+// atomically and only when the content changed.
 func downloadFile(url, dst string) (bool, error) {
+	var errs []error
+	for _, u := range otamirror.Candidates(url) {
+		data, err := fetchHookFile(u)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		existing, err := os.ReadFile(dst)
+		if err == nil && bytes.Equal(existing, data) {
+			return false, nil
+		}
+		tmp := dst + ".new"
+		if err := os.WriteFile(tmp, data, 0644); err != nil {
+			return false, err
+		}
+		if err := os.Rename(tmp, dst); err != nil {
+			_ = os.Remove(tmp)
+			return false, err
+		}
+		return true, nil
+	}
+	if len(errs) == 0 {
+		return false, fmt.Errorf("empty url")
+	}
+	return false, errors.Join(errs...)
+}
+
+// fetchHookFile downloads one hook file (HOOK.md or handler.ts), capped at 1 MiB.
+func fetchHookFile(url string) ([]byte, error) {
+	const maxHookBytes = 1 << 20
 	client := &http.Client{Timeout: 30 * time.Second}
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 	req.Header.Set("Cache-Control", "no-cache")
 	resp, err := client.Do(req)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return false, fmt.Errorf("HTTP %d", resp.StatusCode)
+		return nil, fmt.Errorf("%s: HTTP %d", url, resp.StatusCode)
 	}
-	newData, err := io.ReadAll(resp.Body)
+	if ct := strings.ToLower(resp.Header.Get("Content-Type")); strings.HasPrefix(ct, "text/html") {
+		return nil, fmt.Errorf("%s: got an HTML page (%s)", url, ct)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxHookBytes+1))
 	if err != nil {
-		return false, err
+		return nil, fmt.Errorf("%s: %w", url, err)
 	}
-	existing, err := os.ReadFile(dst)
-	if err == nil && string(existing) == string(newData) {
-		return false, nil
+	if len(data) > maxHookBytes {
+		return nil, fmt.Errorf("%s: larger than %d bytes", url, maxHookBytes)
 	}
-	if err := os.WriteFile(dst, newData, 0644); err != nil {
-		return false, err
+	head := strings.ToLower(strings.TrimSpace(string(data[:min(len(data), 512)])))
+	switch {
+	case len(head) == 0:
+		return nil, fmt.Errorf("%s: empty body", url)
+	case strings.HasPrefix(head, "<!doctype html"), strings.HasPrefix(head, "<html"):
+		return nil, fmt.Errorf("%s: got an HTML page", url)
 	}
-	return true, nil
+	return data, nil
 }
 
 // seedFileIfAbsent writes the embedded file to dst only if dst does not already exist.
