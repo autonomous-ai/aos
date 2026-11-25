@@ -72,9 +72,9 @@ func main() {
 		return err == nil
 	}, time.Minute)
 
-	// Extra fallback NTP servers for every device, and the fallback DNS order
-	// for the region the cloud reports; a no-op once applied.
-	safego.Go("netfallback", func() { netfallback.Run(probeCtx, configRegion) })
+	// Fallback time and DNS servers for the region the cloud reports; a no-op
+	// once applied.
+	safego.Go("netfallback", func() { netfallback.NewApplier(configRegion).Run(probeCtx) })
 
 	srv, err := server.InitializeServer()
 	if err != nil {
@@ -86,17 +86,18 @@ func main() {
 }
 
 // configRegion returns the region the cloud last reported in the ping reply,
-// as saved in config.json, or "" when none is saved yet.
-func configRegion() string {
+// as saved in config.json ("" for none), and whether the device is set up.
+func configRegion() (string, bool) {
 	data, err := os.ReadFile(config.Path())
 	if err != nil {
-		return ""
+		return "", false
 	}
 	var c struct {
-		Region string `json:"region"`
+		Region         string `json:"region"`
+		SetUpCompleted bool   `json:"set_up_completed"`
 	}
 	if json.Unmarshal(data, &c) != nil {
-		return ""
+		return "", false
 	}
-	return c.Region
+	return c.Region, c.SetUpCompleted
 }

@@ -1,52 +1,60 @@
-// Package netfallback keeps the device's time and name lookups working on
-// networks where the usual public NTP and DNS servers are unreachable.
+// Package netfallback sets the device's fallback time and DNS servers for the
+// region the cloud places it in, so time sync and name lookups keep working in
+// mainland China while every other device keeps the image's settings.
 //
-//   - NTP, every device: extra fallback NTP servers are added after the ones the
-//     time service already uses, so they are only asked when those fail.
-//   - DNS, by region: while the cloud places the device in mainland China, the
-//     static fallback DNS servers list the resolvers that answer there first;
-//     in any other region the image's default list is kept (or put back).
+// While the region is CN:
+//   - systemd-timesyncd gets a drop-in whose FallbackNTP lists Debian's pool,
+//     then servers that answer in China (FallbackNTP, never NTP=, so a server
+//     the network hands out still comes first); chrony gets the same servers
+//     as extra sources when it reads a sources directory.
+//   - openresolv appends resolvers that answer in China after the router's
+//     (name_servers_append, never name_servers=, which goes before the
+//     router's), and device-sta-mode lists them after the DHCP lease's.
 //
-// Every step is idempotent and best-effort. A file that is missing, or whose
-// line was changed by hand, is left alone.
+// In any other region, or with no region, the drop-in and the sources file
+// are removed and the image's DNS lines are put back, but only where ours are
+// the ones in place. Nothing changes before the device is set up, so an image
+// built for China keeps its settings until the cloud has answered.
+//
+// Every step is idempotent and best-effort; outside China a line changed by
+// hand is left alone.
 package netfallback
 
 import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 )
 
-// ExtraNTPServers are added after the time service's existing fallback servers.
-var ExtraNTPServers = []string{"ntp.aliyun.com", "ntp.tencent.com", "cn.pool.ntp.org"}
+// RegionCN is the region code the cloud reports for mainland China.
+const RegionCN = "CN"
 
 const (
-	// RegionCN is the region code the cloud reports for mainland China.
-	RegionCN = "CN"
+	// timesyncdDropIn is written while in China only.
+	timesyncdDropIn = "# Fallback time servers that answer in mainland China, after the Debian pool.\n" +
+		"[Time]\nFallbackNTP=0.debian.pool.ntp.org 1.debian.pool.ntp.org ntp.aliyun.com ntp.tencent.com cn.pool.ntp.org\n"
+	// chronySources is written while in China only.
+	chronySources = "# Time servers that answer in mainland China.\n" +
+		"server ntp.aliyun.com iburst\nserver ntp.tencent.com iburst\npool cn.pool.ntp.org iburst\n"
 
-	// defaultResolvconfLine / chinaResolvconfLine are the static fallback DNS
-	// servers openresolv adds to resolv.conf. The default line is the one the
-	// images have always written; the China line puts resolvers that answer
-	// there ahead of it.
+	// defaultResolvconfLine is the image's static fallback; chinaResolvconfLine
+	// takes its place in China, after the router's servers.
 	defaultResolvconfLine = `name_servers="1.1.1.1 8.8.8.8"`
-	chinaResolvconfLine   = `name_servers="223.5.5.5 119.29.29.29 1.1.1.1 8.8.8.8"`
+	chinaResolvconfLine   = `name_servers_append="223.5.5.5 119.29.29.29 1.1.1.1 8.8.8.8"`
 
 	// defaultStaDNS / chinaStaDNS are the fallback lines device-sta-mode writes
-	// after the DHCP lease's DNS servers when it rebuilds resolv.conf.
-	// The whole assignment is matched so neither is a substring of the other.
+	// after the DHCP lease's DNS servers when it rebuilds resolv.conf. The
+	// whole assignment is matched so neither is a substring of the other.
 	defaultStaDNS = `DNS_LINES="${DNS_LINES}nameserver 1.1.1.1\nnameserver 8.8.8.8\n"`
 	chinaStaDNS   = `DNS_LINES="${DNS_LINES}nameserver 223.5.5.5\nnameserver 119.29.29.29\nnameserver 1.1.1.1\nnameserver 8.8.8.8\n"`
-
-	timesyncdDropInName = "90-autonomous-fallback-ntp.conf"
-	chronySourcesName   = "autonomous-fallback.sources"
 
 	commandTimeout = 10 * time.Second
 )
@@ -54,38 +62,64 @@ const (
 // Paths, the command runner and the region poll interval, as variables so
 // tests can redirect them.
 var (
-	timesyncdDropInDir = "/etc/systemd/timesyncd.conf.d"
-	timesyncdBinaries  = []string{"/lib/systemd/systemd-timesyncd", "/usr/lib/systemd/systemd-timesyncd"}
-	chronyConf         = "/etc/chrony/chrony.conf"
-	chronySourcesDir   = "/etc/chrony/sources.d"
-	resolvconfConf     = "/etc/resolvconf.conf"
-	staModeScript      = "/usr/local/bin/device-sta-mode"
+	timesyncdDropInPath = "/etc/systemd/timesyncd.conf.d/90-autonomous-fallback-ntp.conf"
+	chronyConf          = "/etc/chrony/chrony.conf"
+	chronySourcesDir    = "/etc/chrony/sources.d"
+	chronySourcesName   = "autonomous-fallback.sources"
+	resolvconfConf      = "/etc/resolvconf.conf"
+	staModeScript       = "/usr/local/bin/device-sta-mode"
 
 	regionCheckInterval = 5 * time.Minute
+
+	// enabled is false off Linux (simulator), where nothing is touched.
+	enabled = runtime.GOOS == "linux"
 
 	runCmd = func(ctx context.Context, name string, args ...string) ([]byte, error) {
 		return exec.CommandContext(ctx, name, args...).CombinedOutput()
 	}
 )
 
-// Run adds the NTP fallback once, then keeps the DNS fallback in line with the
-// region until ctx ends. region returns the region the cloud last reported, or
-// "" while none is known; DNS is left alone until one is. Does nothing off
-// Linux (simulator).
-func Run(ctx context.Context, region func() string) {
-	if runtime.GOOS != "linux" {
+// State reports the region the cloud last reported ("" for none) and whether
+// the device is set up. Before setup the region is not known yet.
+type State func() (region string, setUp bool)
+
+// Applier applies the settings for the current state, doing work only when
+// the China/not-China decision changed since the last call.
+type Applier struct {
+	state   State
+	applied *bool
+	mu      sync.Mutex
+}
+
+// NewApplier returns an Applier reading state.
+func NewApplier(state State) *Applier { return &Applier{state: state} }
+
+// Apply reads the state and applies it. Safe to call from any goroutine, e.g.
+// right after the region changes.
+func (a *Applier) Apply(ctx context.Context) {
+	if !enabled {
 		return
 	}
-	changed, err := ensureTimesyncd(ctx)
-	logStep("timesyncd", changed, err)
-	changed, err = ensureChrony(ctx)
-	logStep("chrony", changed, err)
+	region, setUp := a.state()
+	if !setUp {
+		return
+	}
+	china := strings.EqualFold(strings.TrimSpace(region), RegionCN)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.applied != nil && *a.applied == china {
+		return
+	}
+	apply(ctx, china)
+	a.applied = &china
+}
 
+// Run applies the state now and every regionCheckInterval until ctx ends.
+func (a *Applier) Run(ctx context.Context) {
 	ticker := time.NewTicker(regionCheckInterval)
 	defer ticker.Stop()
-	applied := ""
 	for {
-		applied = applyRegion(ctx, region(), applied)
+		a.Apply(ctx)
 		select {
 		case <-ctx.Done():
 			return
@@ -94,19 +128,15 @@ func Run(ctx context.Context, region func() string) {
 	}
 }
 
-// applyRegion sets the DNS fallback for region when it is known and differs
-// from the one applied last, and returns the region now applied.
-func applyRegion(ctx context.Context, region, applied string) string {
-	r := strings.ToUpper(strings.TrimSpace(region))
-	if r == "" || r == applied {
-		return applied
-	}
-	china := r == RegionCN
-	changed, err := ensureResolvconf(ctx, china)
+func apply(ctx context.Context, china bool) {
+	changed, err := ensureTimesyncd(ctx, china)
+	logStep("timesyncd", changed, err)
+	changed, err = ensureChrony(ctx, china)
+	logStep("chrony", changed, err)
+	changed, err = ensureResolvconf(ctx, china)
 	logStep("resolvconf", changed, err)
 	changed, err = ensureStaModeScript(china)
 	logStep("device-sta-mode", changed, err)
-	return r
 }
 
 func logStep(name string, changed bool, err error) {
@@ -119,33 +149,15 @@ func logStep(name string, changed bool, err error) {
 	}
 }
 
-// ensureTimesyncd adds ExtraNTPServers to systemd-timesyncd's fallback list,
-// keeping the servers it already uses first.
-func ensureTimesyncd(ctx context.Context) (bool, error) {
-	if !anyExists(timesyncdBinaries) {
-		return false, nil
+// ensureTimesyncd writes the drop-in in China and removes it elsewhere, then
+// restarts a running timesyncd after a change.
+func ensureTimesyncd(ctx context.Context, china bool) (bool, error) {
+	changed, err := putOrRemove(timesyncdDropInPath, timesyncdDropIn, china)
+	if err != nil || !changed {
+		return changed, err
 	}
 	cctx, cancel := context.WithTimeout(ctx, commandTimeout)
 	defer cancel()
-	out, err := runCmd(cctx, "timedatectl", "show-timesync", "-p", "FallbackNTPServers", "--value")
-	if err != nil {
-		// Without the current list we would replace defaults we cannot see.
-		return false, fmt.Errorf("read fallback NTP servers: %w", err)
-	}
-	current := strings.Fields(string(out))
-	if len(current) == 0 {
-		return false, errors.New("timesyncd reports no fallback NTP servers")
-	}
-	merged, changed := appendMissing(current, ExtraNTPServers)
-	if !changed {
-		return false, nil
-	}
-	content := "# Extra fallback NTP servers for networks where the default ones are\n" +
-		"# unreachable. The defaults stay first.\n" +
-		"[Time]\nFallbackNTP=" + strings.Join(merged, " ") + "\n"
-	if err := writeFileAtomic(filepath.Join(timesyncdDropInDir, timesyncdDropInName), []byte(content), 0o644); err != nil {
-		return false, err
-	}
 	// try-restart leaves a stopped timesyncd (e.g. on chrony images) stopped.
 	if out, err := runCmd(cctx, "systemctl", "try-restart", "systemd-timesyncd"); err != nil {
 		slog.Warn("systemd-timesyncd restart failed", "component", "netfallback", "error", err, "output", strings.TrimSpace(string(out)))
@@ -153,34 +165,24 @@ func ensureTimesyncd(ctx context.Context) (bool, error) {
 	return true, nil
 }
 
-// ensureChrony adds ExtraNTPServers as extra chrony sources when chrony reads
-// a sources directory.
-func ensureChrony(ctx context.Context) (bool, error) {
-	conf, err := os.ReadFile(chronyConf)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
+// ensureChrony writes the extra sources in China when chrony reads a sources
+// directory, and removes them elsewhere, then reloads chrony's sources.
+func ensureChrony(ctx context.Context, china bool) (bool, error) {
+	if china {
+		conf, err := os.ReadFile(chronyConf)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return false, nil
+			}
+			return false, err
+		}
+		if !strings.Contains(string(conf), "sourcedir "+chronySourcesDir) {
 			return false, nil
 		}
-		return false, err
 	}
-	if !strings.Contains(string(conf), "sourcedir "+chronySourcesDir) {
-		return false, nil
-	}
-	var b strings.Builder
-	b.WriteString("# Extra NTP sources for networks where the default ones are unreachable.\n")
-	for _, s := range ExtraNTPServers {
-		kind := "server"
-		if strings.Contains(s, "pool.") {
-			kind = "pool"
-		}
-		fmt.Fprintf(&b, "%s %s iburst\n", kind, s)
-	}
-	path := filepath.Join(chronySourcesDir, chronySourcesName)
-	if existing, err := os.ReadFile(path); err == nil && string(existing) == b.String() {
-		return false, nil
-	}
-	if err := writeFileAtomic(path, []byte(b.String()), 0o644); err != nil {
-		return false, err
+	changed, err := putOrRemove(filepath.Join(chronySourcesDir, chronySourcesName), chronySources, china)
+	if err != nil || !changed {
+		return changed, err
 	}
 	cctx, cancel := context.WithTimeout(ctx, commandTimeout)
 	defer cancel()
@@ -190,15 +192,44 @@ func ensureChrony(ctx context.Context) (bool, error) {
 	return true, nil
 }
 
-// ensureResolvconf switches openresolv's static fallback between the default
-// and the China line, then regenerates resolv.conf.
-func ensureResolvconf(ctx context.Context, china bool) (bool, error) {
-	from, to := chinaResolvconfLine, defaultResolvconfLine
-	if china {
-		from, to = to, from
+// putOrRemove writes content to path when want is true (unless it already
+// holds it) and removes path otherwise; it reports whether anything changed.
+func putOrRemove(path, content string, want bool) (bool, error) {
+	if !want {
+		err := os.Remove(path)
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return err == nil, err
 	}
-	changed, err := replaceLine(resolvconfConf, from, to)
-	if err != nil || !changed {
+	if existing, err := os.ReadFile(path); err == nil && string(existing) == content {
+		return false, nil
+	}
+	return true, writeFileAtomic(path, []byte(content), 0o644)
+}
+
+// ensureResolvconf puts chinaResolvconfLine in place of openresolv's
+// name_servers lines in China. Elsewhere it puts the image's line back, but
+// only where chinaResolvconfLine is the one in place. resolv.conf is
+// regenerated after a change.
+func ensureResolvconf(ctx context.Context, china bool) (bool, error) {
+	data, err := os.ReadFile(resolvconfConf)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return false, err
+	}
+	now := string(data)
+	line := chinaResolvconfLine
+	if !china {
+		if !hasLine(now, chinaResolvconfLine) {
+			return false, nil
+		}
+		line = defaultResolvconfLine
+	}
+	fixed := resolvconfFixed(now, line)
+	if fixed == now {
+		return false, nil
+	}
+	if err := writeFileAtomic(resolvconfConf, []byte(fixed), 0o644); err != nil {
 		return false, err
 	}
 	cctx, cancel := context.WithTimeout(ctx, commandTimeout)
@@ -207,6 +238,43 @@ func ensureResolvconf(ctx context.Context, china bool) (bool, error) {
 		slog.Warn("resolvconf -u failed", "component", "netfallback", "error", err, "output", strings.TrimSpace(string(out)))
 	}
 	return true, nil
+}
+
+// resolvconfFixed returns now with line in place of the first name_servers*
+// line and any other one dropped, or line last when there is none; every
+// other line is kept.
+func resolvconfFixed(now, line string) string {
+	var b strings.Builder
+	placed := false
+	for _, kept := range strings.SplitAfter(now, "\n") {
+		if kept == "" {
+			continue
+		}
+		if strings.HasPrefix(strings.TrimSpace(kept), "name_servers") {
+			if !placed {
+				b.WriteString(line + "\n")
+				placed = true
+			}
+			continue
+		}
+		b.WriteString(kept)
+		if !strings.HasSuffix(kept, "\n") {
+			b.WriteString("\n")
+		}
+	}
+	if !placed {
+		b.WriteString(line + "\n")
+	}
+	return b.String()
+}
+
+func hasLine(text, line string) bool {
+	for _, l := range strings.Split(text, "\n") {
+		if strings.TrimSpace(l) == line {
+			return true
+		}
+	}
+	return false
 }
 
 // ensureStaModeScript switches the fallback DNS lines device-sta-mode writes
@@ -232,65 +300,6 @@ func ensureStaModeScript(china bool) (bool, error) {
 	}
 	updated := bytes.Replace(data, from, to, 1)
 	return true, writeFileAtomic(staModeScript, updated, info.Mode().Perm())
-}
-
-// replaceLine swaps the one whole line equal to old for repl. Files without
-// that exact line (missing, already switched, or edited by hand) are left alone.
-func replaceLine(path, old, repl string) (bool, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return false, nil
-		}
-		return false, err
-	}
-	lines := strings.Split(string(data), "\n")
-	at := -1
-	for i, line := range lines {
-		switch strings.TrimSpace(line) {
-		case repl:
-			return false, nil
-		case old:
-			if at >= 0 {
-				return false, nil
-			}
-			at = i
-		}
-	}
-	if at < 0 {
-		return false, nil
-	}
-	lines[at] = repl
-	info, err := os.Stat(path)
-	if err != nil {
-		return false, err
-	}
-	return true, writeFileAtomic(path, []byte(strings.Join(lines, "\n")), info.Mode().Perm())
-}
-
-// appendMissing returns list plus every extra not already in it.
-func appendMissing(list, extra []string) ([]string, bool) {
-	seen := make(map[string]bool, len(list))
-	for _, s := range list {
-		seen[s] = true
-	}
-	out := append([]string(nil), list...)
-	for _, s := range extra {
-		if !seen[s] {
-			out = append(out, s)
-			seen[s] = true
-		}
-	}
-	return out, len(out) != len(list)
-}
-
-func anyExists(paths []string) bool {
-	for _, p := range paths {
-		if _, err := os.Stat(p); err == nil {
-			return true
-		}
-	}
-	return false
 }
 
 // writeFileAtomic writes data to a temp file beside path and renames it in.

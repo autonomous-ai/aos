@@ -2,7 +2,6 @@ package netfallback
 
 import (
 	"context"
-	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,163 +9,156 @@ import (
 )
 
 type fakeCmds struct {
-	output map[string]string
-	errs   map[string]error
-	calls  []string
+	calls []string
 }
 
 func (f *fakeCmds) run(_ context.Context, name string, args ...string) ([]byte, error) {
-	key := strings.Join(append([]string{name}, args...), " ")
-	f.calls = append(f.calls, key)
-	return []byte(f.output[key]), f.errs[key]
+	f.calls = append(f.calls, strings.Join(append([]string{name}, args...), " "))
+	return nil, nil
 }
 
 func setup(t *testing.T) (string, *fakeCmds) {
 	t.Helper()
 	dir := t.TempDir()
-	saved := []string{timesyncdDropInDir, chronyConf, chronySourcesDir, resolvconfConf, staModeScript}
-	savedBins, savedRun := timesyncdBinaries, runCmd
+	saved := []string{timesyncdDropInPath, chronyConf, chronySourcesDir, resolvconfConf, staModeScript}
+	savedRun, savedEnabled := runCmd, enabled
 	t.Cleanup(func() {
-		timesyncdDropInDir, chronyConf, chronySourcesDir, resolvconfConf, staModeScript = saved[0], saved[1], saved[2], saved[3], saved[4]
-		timesyncdBinaries, runCmd = savedBins, savedRun
+		timesyncdDropInPath, chronyConf, chronySourcesDir, resolvconfConf, staModeScript = saved[0], saved[1], saved[2], saved[3], saved[4]
+		runCmd, enabled = savedRun, savedEnabled
 	})
-	timesyncdDropInDir = filepath.Join(dir, "timesyncd.conf.d")
-	timesyncdBinaries = []string{filepath.Join(dir, "systemd-timesyncd")}
+	timesyncdDropInPath = filepath.Join(dir, "timesyncd.conf.d", "90-autonomous-fallback-ntp.conf")
 	chronyConf = filepath.Join(dir, "chrony.conf")
 	chronySourcesDir = filepath.Join(dir, "sources.d")
 	resolvconfConf = filepath.Join(dir, "resolvconf.conf")
 	staModeScript = filepath.Join(dir, "device-sta-mode")
-	f := &fakeCmds{output: map[string]string{}, errs: map[string]error{}}
+	f := &fakeCmds{}
 	runCmd = f.run
+	enabled = true
 	return dir, f
 }
 
-const showTimesync = "timedatectl show-timesync -p FallbackNTPServers --value"
-
-func TestTimesyncdKeepsDefaultsFirstAndIsIdempotent(t *testing.T) {
-	dir, f := setup(t)
-	if err := os.WriteFile(filepath.Join(dir, "systemd-timesyncd"), nil, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	f.output[showTimesync] = "0.debian.pool.ntp.org 1.debian.pool.ntp.org\n"
-	changed, err := ensureTimesyncd(context.Background())
-	if err != nil || !changed {
-		t.Fatalf("first run: changed=%v err=%v", changed, err)
-	}
-	got, err := os.ReadFile(filepath.Join(timesyncdDropInDir, timesyncdDropInName))
+func read(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "FallbackNTP=0.debian.pool.ntp.org 1.debian.pool.ntp.org ntp.aliyun.com ntp.tencent.com cn.pool.ntp.org\n"
-	if !strings.HasSuffix(string(got), "[Time]\n"+want) {
+	return string(data)
+}
+
+func TestTimesyncdDropInOnlyInChina(t *testing.T) {
+	_, f := setup(t)
+	if changed, err := ensureTimesyncd(context.Background(), false); changed || err != nil || len(f.calls) != 0 {
+		t.Fatalf("non-CN, nothing there: changed=%v err=%v calls=%v", changed, err, f.calls)
+	}
+	if changed, err := ensureTimesyncd(context.Background(), true); !changed || err != nil {
+		t.Fatalf("CN: changed=%v err=%v", changed, err)
+	}
+	if got := read(t, timesyncdDropInPath); !strings.HasSuffix(got,
+		"[Time]\nFallbackNTP=0.debian.pool.ntp.org 1.debian.pool.ntp.org ntp.aliyun.com ntp.tencent.com cn.pool.ntp.org\n") {
 		t.Fatalf("drop-in = %q", got)
 	}
-	if f.calls[len(f.calls)-1] != "systemctl try-restart systemd-timesyncd" {
+	if len(f.calls) != 1 || f.calls[0] != "systemctl try-restart systemd-timesyncd" {
 		t.Fatalf("calls = %v", f.calls)
 	}
-
-	// Once applied, timesyncd reports the merged list: nothing more to do.
-	f.output[showTimesync] = strings.TrimPrefix(want, "FallbackNTP=")
-	f.calls = nil
-	changed, err = ensureTimesyncd(context.Background())
-	if err != nil || changed {
-		t.Fatalf("second run: changed=%v err=%v", changed, err)
+	if changed, _ := ensureTimesyncd(context.Background(), true); changed || len(f.calls) != 1 {
+		t.Fatalf("CN again must not rewrite or restart: calls=%v", f.calls)
 	}
-	if len(f.calls) != 1 {
-		t.Fatalf("second run must not restart timesyncd: %v", f.calls)
+	if changed, err := ensureTimesyncd(context.Background(), false); !changed || err != nil {
+		t.Fatalf("leaving CN: changed=%v err=%v", changed, err)
 	}
-}
-
-func TestTimesyncdSkippedWhenAbsentOrUnreadable(t *testing.T) {
-	dir, f := setup(t)
-	if changed, err := ensureTimesyncd(context.Background()); changed || err != nil || len(f.calls) != 0 {
-		t.Fatalf("no timesyncd: changed=%v err=%v calls=%v", changed, err, f.calls)
+	if _, err := os.Stat(timesyncdDropInPath); !os.IsNotExist(err) {
+		t.Fatalf("drop-in still there: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "systemd-timesyncd"), nil, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	f.errs[showTimesync] = errors.New("not running")
-	if changed, err := ensureTimesyncd(context.Background()); changed || err == nil {
-		t.Fatalf("unreadable defaults must not write: changed=%v err=%v", changed, err)
-	}
-	if _, err := os.Stat(filepath.Join(timesyncdDropInDir, timesyncdDropInName)); !os.IsNotExist(err) {
-		t.Fatalf("drop-in written without known defaults: %v", err)
+	if len(f.calls) != 2 {
+		t.Fatalf("leaving CN must restart timesyncd: %v", f.calls)
 	}
 }
 
-func TestChronyAddsSourcesOnce(t *testing.T) {
+func TestChronySourcesOnlyInChina(t *testing.T) {
 	_, f := setup(t)
-	if changed, err := ensureChrony(context.Background()); changed || err != nil {
+	if changed, err := ensureChrony(context.Background(), true); changed || err != nil {
 		t.Fatalf("no chrony: changed=%v err=%v", changed, err)
 	}
 	if err := os.WriteFile(chronyConf, []byte("pool 2.debian.pool.ntp.org iburst\nsourcedir "+chronySourcesDir+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	changed, err := ensureChrony(context.Background())
-	if err != nil || !changed {
-		t.Fatalf("changed=%v err=%v", changed, err)
+	if changed, err := ensureChrony(context.Background(), true); !changed || err != nil {
+		t.Fatalf("CN: changed=%v err=%v", changed, err)
 	}
-	got, _ := os.ReadFile(filepath.Join(chronySourcesDir, chronySourcesName))
+	got := read(t, filepath.Join(chronySourcesDir, chronySourcesName))
 	for _, want := range []string{"server ntp.aliyun.com iburst", "server ntp.tencent.com iburst", "pool cn.pool.ntp.org iburst"} {
-		if !strings.Contains(string(got), want) {
+		if !strings.Contains(got, want) {
 			t.Fatalf("sources missing %q:\n%s", want, got)
 		}
 	}
-	if f.calls[len(f.calls)-1] != "chronyc reload sources" {
-		t.Fatalf("calls = %v", f.calls)
+	if changed, _ := ensureChrony(context.Background(), true); changed {
+		t.Fatal("CN again must be a no-op")
 	}
-	if changed, err := ensureChrony(context.Background()); changed || err != nil {
-		t.Fatalf("second run: changed=%v err=%v", changed, err)
+	if changed, err := ensureChrony(context.Background(), false); !changed || err != nil {
+		t.Fatalf("leaving CN: changed=%v err=%v", changed, err)
+	}
+	if _, err := os.Stat(filepath.Join(chronySourcesDir, chronySourcesName)); !os.IsNotExist(err) {
+		t.Fatalf("sources still there: %v", err)
+	}
+	if strings.Join(f.calls, ";") != "chronyc reload sources;chronyc reload sources" {
+		t.Fatalf("calls = %v", f.calls)
 	}
 }
 
-func TestResolvconfFollowsRegion(t *testing.T) {
+func TestResolvconfAppendsInChinaAndRestoresImageLine(t *testing.T) {
 	_, f := setup(t)
-	if err := os.WriteFile(resolvconfConf, []byte("# comment\n"+defaultResolvconfLine+"\n"), 0o644); err != nil {
+	image := "# comment\n" + defaultResolvconfLine + "\n"
+	if err := os.WriteFile(resolvconfConf, []byte(image), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// Outside China the default line stays as it is.
 	if changed, err := ensureResolvconf(context.Background(), false); changed || err != nil || len(f.calls) != 0 {
-		t.Fatalf("non-CN: changed=%v err=%v calls=%v", changed, err, f.calls)
+		t.Fatalf("non-CN on the image's line: changed=%v err=%v calls=%v", changed, err, f.calls)
 	}
-	changed, err := ensureResolvconf(context.Background(), true)
-	if err != nil || !changed {
+	if changed, err := ensureResolvconf(context.Background(), true); !changed || err != nil {
 		t.Fatalf("CN: changed=%v err=%v", changed, err)
 	}
-	got, _ := os.ReadFile(resolvconfConf)
-	if string(got) != "# comment\n"+chinaResolvconfLine+"\n" {
+	if got := read(t, resolvconfConf); got != "# comment\n"+chinaResolvconfLine+"\n" {
 		t.Fatalf("resolvconf.conf = %q", got)
 	}
-	if len(f.calls) != 1 || f.calls[0] != "resolvconf -u" {
-		t.Fatalf("calls = %v", f.calls)
+	if changed, _ := ensureResolvconf(context.Background(), true); changed {
+		t.Fatal("CN again must be a no-op")
 	}
-	if changed, err := ensureResolvconf(context.Background(), true); changed || err != nil {
-		t.Fatalf("CN again: changed=%v err=%v", changed, err)
-	}
-	// Leaving China puts the default line back.
 	if changed, err := ensureResolvconf(context.Background(), false); !changed || err != nil {
-		t.Fatalf("back to non-CN: changed=%v err=%v", changed, err)
+		t.Fatalf("leaving CN: changed=%v err=%v", changed, err)
 	}
-	got, _ = os.ReadFile(resolvconfConf)
-	if string(got) != "# comment\n"+defaultResolvconfLine+"\n" {
-		t.Fatalf("resolvconf.conf = %q", got)
+	if got := read(t, resolvconfConf); got != image {
+		t.Fatalf("image line not restored: %q", got)
+	}
+	if strings.Join(f.calls, ";") != "resolvconf -u;resolvconf -u" {
+		t.Fatalf("calls = %v", f.calls)
 	}
 }
 
-func TestResolvconfLeavesCustomSettingsAlone(t *testing.T) {
+func TestResolvconfOutsideChinaLeavesOtherLinesAlone(t *testing.T) {
 	setup(t)
 	custom := "name_servers=\"9.9.9.9\"\n"
 	if err := os.WriteFile(resolvconfConf, []byte(custom), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	for _, china := range []bool{true, false} {
-		if changed, err := ensureResolvconf(context.Background(), china); changed || err != nil {
-			t.Fatalf("china=%v: changed=%v err=%v", china, changed, err)
-		}
+	if changed, err := ensureResolvconf(context.Background(), false); changed || err != nil {
+		t.Fatalf("changed=%v err=%v", changed, err)
 	}
-	got, _ := os.ReadFile(resolvconfConf)
-	if string(got) != custom {
+	if got := read(t, resolvconfConf); got != custom {
 		t.Fatalf("custom setting changed: %q", got)
+	}
+}
+
+func TestResolvconfFixed(t *testing.T) {
+	cases := []struct{ now, want string }{
+		{"", chinaResolvconfLine + "\n"},
+		{"a=1\n", "a=1\n" + chinaResolvconfLine + "\n"},
+		{"a=1\nname_servers=\"x\"\nname_servers_append=\"y\"\nb=2", "a=1\n" + chinaResolvconfLine + "\nb=2\n"},
+	}
+	for _, c := range cases {
+		if got := resolvconfFixed(c.now, chinaResolvconfLine); got != c.want {
+			t.Errorf("resolvconfFixed(%q) = %q, want %q", c.now, got, c.want)
+		}
 	}
 }
 
@@ -179,47 +171,70 @@ func TestStaModeScriptFollowsRegion(t *testing.T) {
 	if changed, err := ensureStaModeScript(false); changed || err != nil {
 		t.Fatalf("non-CN: changed=%v err=%v", changed, err)
 	}
-	changed, err := ensureStaModeScript(true)
-	if err != nil || !changed {
+	if changed, err := ensureStaModeScript(true); !changed || err != nil {
 		t.Fatalf("CN: changed=%v err=%v", changed, err)
 	}
-	got, _ := os.ReadFile(staModeScript)
-	if !strings.Contains(string(got), `DNS_LINES="${DNS_LINES}nameserver 223.5.5.5\nnameserver 119.29.29.29\nnameserver 1.1.1.1\nnameserver 8.8.8.8\n"`) {
+	if got := read(t, staModeScript); !strings.Contains(got, chinaStaDNS) {
 		t.Fatalf("script = %s", got)
 	}
-	info, _ := os.Stat(staModeScript)
-	if info.Mode().Perm() != 0o755 {
+	if info, _ := os.Stat(staModeScript); info.Mode().Perm() != 0o755 {
 		t.Fatalf("mode = %v, want 0755", info.Mode().Perm())
 	}
-	if changed, err := ensureStaModeScript(true); changed || err != nil {
-		t.Fatalf("CN again: changed=%v err=%v", changed, err)
+	if changed, _ := ensureStaModeScript(true); changed {
+		t.Fatal("CN again must be a no-op")
 	}
 	if changed, err := ensureStaModeScript(false); !changed || err != nil {
-		t.Fatalf("back to non-CN: changed=%v err=%v", changed, err)
+		t.Fatalf("leaving CN: changed=%v err=%v", changed, err)
 	}
-	got, _ = os.ReadFile(staModeScript)
-	if string(got) != script {
+	if got := read(t, staModeScript); got != script {
 		t.Fatalf("script not restored: %s", got)
 	}
 }
 
-func TestApplyRegionWaitsForKnownRegion(t *testing.T) {
+func TestApplierFollowsRegionAfterSetup(t *testing.T) {
 	_, f := setup(t)
 	if err := os.WriteFile(resolvconfConf, []byte(defaultResolvconfLine+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if got := applyRegion(context.Background(), "", ""); got != "" || len(f.calls) != 0 {
-		t.Fatalf("unknown region: applied=%q calls=%v", got, f.calls)
+	region, setUp := "CN", false
+	a := NewApplier(func() (string, bool) { return region, setUp })
+
+	// Before setup nothing changes, so an image built for China keeps its settings.
+	a.Apply(context.Background())
+	if len(f.calls) != 0 {
+		t.Fatalf("before setup: calls=%v", f.calls)
 	}
-	if got := applyRegion(context.Background(), " cn ", ""); got != "CN" {
-		t.Fatalf("applied = %q, want CN", got)
+
+	setUp = true
+	a.Apply(context.Background())
+	if got := read(t, resolvconfConf); got != chinaResolvconfLine+"\n" {
+		t.Fatalf("CN: resolvconf.conf = %q", got)
 	}
-	data, _ := os.ReadFile(resolvconfConf)
-	if string(data) != chinaResolvconfLine+"\n" {
-		t.Fatalf("resolvconf.conf = %q", data)
+	if _, err := os.Stat(timesyncdDropInPath); err != nil {
+		t.Fatalf("CN: drop-in missing: %v", err)
 	}
-	// A reply without a region keeps what was applied.
-	if got := applyRegion(context.Background(), "", "CN"); got != "CN" {
-		t.Fatalf("applied = %q, want CN kept", got)
+
+	// Same decision again: no work.
+	n := len(f.calls)
+	a.Apply(context.Background())
+	if len(f.calls) != n {
+		t.Fatalf("repeat apply ran commands: %v", f.calls[n:])
+	}
+
+	// An empty region means not in China: everything goes back.
+	region = ""
+	a.Apply(context.Background())
+	if got := read(t, resolvconfConf); got != defaultResolvconfLine+"\n" {
+		t.Fatalf("no region: resolvconf.conf = %q", got)
+	}
+	if _, err := os.Stat(timesyncdDropInPath); !os.IsNotExist(err) {
+		t.Fatalf("no region: drop-in still there: %v", err)
+	}
+
+	// " cn " counts as China.
+	region = " cn "
+	a.Apply(context.Background())
+	if got := read(t, resolvconfConf); got != chinaResolvconfLine+"\n" {
+		t.Fatalf("cn: resolvconf.conf = %q", got)
 	}
 }

@@ -25,18 +25,20 @@ if [[ -n "$VARIANT" && ! "$VARIANT" =~ ^[a-z][a-z0-9_-]{0,63}$ ]]; then
   exit 1
 fi
 AP_BAND="${AP_BAND:-2.4}"   # 2.4 or 5 (5 GHz needs supported regulatory domain + chip)
-# Static fallback DNS servers (resolvconf, device-sta-mode). Unset keeps the
-# default; an image for mainland China passes
-# FALLBACK_DNS="223.5.5.5 119.29.29.29 1.1.1.1 8.8.8.8" (os-server switches
-# shipped devices between the two lists by region).
-FALLBACK_DNS="${FALLBACK_DNS:-1.1.1.1 8.8.8.8}"
-if [[ ! "$FALLBACK_DNS" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}(\ [0-9]{1,3}(\.[0-9]{1,3}){3})*$ ]]; then
-  echo "Invalid FALLBACK_DNS: expected space-separated IPv4 addresses" >&2
-  exit 1
+# Region the image is built for. Unset keeps the default settings; CN adds
+# fallback time and DNS servers that answer in mainland China. Once a device
+# is set up, os-server keeps them in line with the region the cloud reports.
+IMAGE_REGION="${IMAGE_REGION:-}"
+case "$IMAGE_REGION" in
+  ""|CN) ;;
+  *) echo "Invalid IMAGE_REGION: expected empty or CN" >&2; exit 1 ;;
+esac
+# device-sta-mode's fallback DNS lines, after the DHCP lease's servers.
+if [ "$IMAGE_REGION" = "CN" ]; then
+  STA_FALLBACK_DNS='nameserver 223.5.5.5\nnameserver 119.29.29.29\nnameserver 1.1.1.1\nnameserver 8.8.8.8\n'
+else
+  STA_FALLBACK_DNS='nameserver 1.1.1.1\nnameserver 8.8.8.8\n'
 fi
-# The same list as device-sta-mode's resolv.conf lines ("nameserver X\n" each).
-STA_FALLBACK_DNS=""
-for ns in $FALLBACK_DNS; do STA_FALLBACK_DNS="${STA_FALLBACK_DNS}nameserver ${ns}\\n"; done
 AP_CHANNEL="${AP_CHANNEL:-}" # default: 6 for 2.4 GHz, 36 for 5 GHz
 COUNTRY_CODE="US"           # Regulatory country code for hostapd
 
@@ -557,18 +559,12 @@ install_binary_from_zip() {
 echo "[stage] NTP + fake-hwclock"
 DEBIAN_FRONTEND=noninteractive apt-get install -y systemd-timesyncd
 systemctl enable systemd-timesyncd
-# Extra fallback NTP servers, after the image's own defaults, for networks
-# where those are unreachable. Defaults come from the installed config (the
-# last FallbackNTP= set, else the compiled-in default shown as a comment).
-NTP_CONF_DUMP=\$(systemd-analyze cat-config systemd/timesyncd.conf 2>/dev/null || true)
-NTP_DEFAULTS=\$(printf '%s\n' "\$NTP_CONF_DUMP" | sed -n 's/^FallbackNTP=//p' | tail -1)
-[ -n "\$NTP_DEFAULTS" ] || NTP_DEFAULTS=\$(printf '%s\n' "\$NTP_CONF_DUMP" | sed -n 's/^#FallbackNTP=//p' | head -1)
-if [ -n "\$NTP_DEFAULTS" ]; then
+if [ "${IMAGE_REGION}" = "CN" ]; then
+  # Time servers that answer in mainland China, after the Debian pool.
   mkdir -p /etc/systemd/timesyncd.conf.d
-  printf '[Time]\nFallbackNTP=%s ntp.aliyun.com ntp.tencent.com cn.pool.ntp.org\n' "\$NTP_DEFAULTS" \
+  printf '%s\n' "# Fallback time servers that answer in mainland China, after the Debian pool." "[Time]" \
+    "FallbackNTP=0.debian.pool.ntp.org 1.debian.pool.ntp.org ntp.aliyun.com ntp.tencent.com cn.pool.ntp.org" \
     > /etc/systemd/timesyncd.conf.d/90-autonomous-fallback-ntp.conf
-else
-  echo "WARN: timesyncd default fallback NTP servers not found; os-server adds the extra ones at first boot"
 fi
 # Seed fake-hwclock with current build timestamp so first boot has a valid clock.
 # fake-hwclock uses a SysV init script (auto-enabled on install) — no systemctl enable needed.
@@ -1123,9 +1119,14 @@ systemctl mask wpa_supplicant.service 2>/dev/null || true
 # build and restored after — touching it here would have no effect.)
 echo "[stage] resolvconf DNS fallback"
 if [ -f /etc/resolvconf.conf ]; then
-  grep -q '^name_servers=' /etc/resolvconf.conf || echo 'name_servers="${FALLBACK_DNS}"' >> /etc/resolvconf.conf
+  grep -q '^name_servers=' /etc/resolvconf.conf || echo 'name_servers="1.1.1.1 8.8.8.8"' >> /etc/resolvconf.conf
 else
-  echo 'name_servers="${FALLBACK_DNS}"' > /etc/resolvconf.conf
+  echo 'name_servers="1.1.1.1 8.8.8.8"' > /etc/resolvconf.conf
+fi
+if [ "${IMAGE_REGION}" = "CN" ]; then
+  # Resolvers that answer in mainland China, after the router's.
+  sed -i '/^[[:space:]]*name_servers/d' /etc/resolvconf.conf
+  echo 'name_servers_append="223.5.5.5 119.29.29.29 1.1.1.1 8.8.8.8"' >> /etc/resolvconf.conf
 fi
 
 # ── stage: PulseAudio echo cancellation (for HAL mic/speaker) ─────────────

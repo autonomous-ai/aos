@@ -14,15 +14,14 @@ OUT_IMG_SIZE="${OUT_IMG_SIZE:-14G}"
 OTA_METADATA_URL="${OTA_METADATA_URL:?OTA_METADATA_URL is required — build via 'make build OTA_METADATA_URL=...'}"
 OTA_SIGNING_PUBLIC_KEY="${OTA_SIGNING_PUBLIC_KEY:-}"
 AP_BAND="${AP_BAND:-2.4}"
-# Static fallback DNS servers (resolvconf, device-sta-mode). Unset keeps the
-# default; an image for mainland China passes
-# FALLBACK_DNS="223.5.5.5 119.29.29.29 1.1.1.1 8.8.8.8" (os-server switches
-# shipped devices between the two lists by region).
-FALLBACK_DNS="${FALLBACK_DNS:-1.1.1.1 8.8.8.8}"
-if [[ ! "$FALLBACK_DNS" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}(\ [0-9]{1,3}(\.[0-9]{1,3}){3})*$ ]]; then
-  echo "Invalid FALLBACK_DNS: expected space-separated IPv4 addresses" >&2
-  exit 1
-fi
+# Region the image is built for. Unset keeps the default settings; CN adds
+# fallback time and DNS servers that answer in mainland China. Once a device
+# is set up, os-server keeps them in line with the region the cloud reports.
+IMAGE_REGION="${IMAGE_REGION:-}"
+case "$IMAGE_REGION" in
+  ""|CN) ;;
+  *) echo "Invalid IMAGE_REGION: expected empty or CN" >&2; exit 1 ;;
+esac
 AP_CHANNEL="${AP_CHANNEL:-}"
 COUNTRY_CODE="${COUNTRY_CODE:-US}"
 # Match OTA metadata checked on 2026-09-11.
@@ -278,9 +277,21 @@ SYSCTL
 
 # resolvconf fallback DNS — ensures /etc/resolv.conf is never empty in AP mode.
 if [ -f /etc/resolvconf.conf ]; then
-  grep -q '^name_servers=' /etc/resolvconf.conf || echo 'name_servers="${FALLBACK_DNS}"' >> /etc/resolvconf.conf
+  grep -q '^name_servers=' /etc/resolvconf.conf || echo 'name_servers="1.1.1.1 8.8.8.8"' >> /etc/resolvconf.conf
 else
-  echo 'name_servers="${FALLBACK_DNS}"' > /etc/resolvconf.conf
+  echo 'name_servers="1.1.1.1 8.8.8.8"' > /etc/resolvconf.conf
+fi
+if [ "${IMAGE_REGION}" = "CN" ]; then
+  # Resolvers that answer in mainland China, after the router's.
+  sed -i '/^[[:space:]]*name_servers/d' /etc/resolvconf.conf
+  echo 'name_servers_append="223.5.5.5 119.29.29.29 1.1.1.1 8.8.8.8"' >> /etc/resolvconf.conf
+fi
+if [ "${IMAGE_REGION}" = "CN" ]; then
+  # Time servers that answer in mainland China, after the Debian pool.
+  mkdir -p /etc/systemd/timesyncd.conf.d
+  printf '%s\n' "# Fallback time servers that answer in mainland China, after the Debian pool." "[Time]" \
+    "FallbackNTP=0.debian.pool.ntp.org 1.debian.pool.ntp.org ntp.aliyun.com ntp.tencent.com cn.pool.ntp.org" \
+    > /etc/systemd/timesyncd.conf.d/90-autonomous-fallback-ntp.conf
 fi
 
 # ── Node.js 26 + OpenClaw CLI (npm global) ───────────────────────────────────
