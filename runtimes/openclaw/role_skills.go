@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -16,16 +18,59 @@ import (
 )
 
 const (
-	// roleSkillsBaseURL is the GCS prefix holding one skills.zip per role.
-	roleSkillsBaseURL = "https://storage.googleapis.com/s3-autonomous-upgrade-3/plugins-skills/openclaw-roles"
+	// defaultPluginsSkillsRoot is used when the OTA metadata URL gives no
+	// usable host, and as the fallback when that host fails.
+	defaultPluginsSkillsRoot = "https://storage.googleapis.com/s3-autonomous-upgrade-3/plugins-skills"
+
+	// roleSkillsDir holds one <role>/skills.zip per role under the root.
+	roleSkillsDir = "openclaw-roles"
 
 	roleSkillsZipPrefix  = "skills/"
 	roleSkillsMaxRetries = 3
 	roleSkillsRetryDelay = 2 * time.Second
 
-	// mcpSkillsBaseURL is the GCS prefix holding one <name>.zip per MCP connector skill.
-	mcpSkillsBaseURL = "https://storage.googleapis.com/s3-autonomous-upgrade-3/plugins-skills/skills_for_MCP"
+	// mcpSkillsDir holds one <name>.zip per MCP connector skill under the root.
+	mcpSkillsDir = "skills_for_MCP"
+
+	otaMetadataSuffix = "/ota/metadata.json"
 )
+
+// pluginsSkillsRoots returns the plugin-skill roots to try, in order: the host
+// that serves this device's OTA metadata first (the release root is the parent
+// of the "/<prefix>/ota/metadata.json" path), then the default root.
+func pluginsSkillsRoots(otaMetadataURL string) []string {
+	roots := []string{}
+	if u, err := url.Parse(strings.TrimSpace(otaMetadataURL)); err == nil &&
+		(u.Scheme == "https" || u.Scheme == "http") && u.Host != "" &&
+		strings.HasSuffix(u.Path, otaMetadataSuffix) {
+		prefix := path.Dir(strings.TrimSuffix(u.Path, otaMetadataSuffix))
+		root := u.Scheme + "://" + u.Host + strings.TrimSuffix(prefix, "/") + "/plugins-skills"
+		if root != defaultPluginsSkillsRoot {
+			roots = append(roots, root)
+		}
+	}
+	return append(roots, defaultPluginsSkillsRoot)
+}
+
+// downloadFirst downloads the first URL that answers, retrying the whole list
+// up to roleSkillsMaxRetries times, and returns the temp file path.
+func downloadFirst(urls []string, pattern, logPrefix, name string) (string, error) {
+	var lastErr error
+	for attempt := 1; attempt <= roleSkillsMaxRetries; attempt++ {
+		for _, u := range urls {
+			p, err := skills.DownloadToTempFile(u, pattern)
+			if err == nil {
+				return p, nil
+			}
+			lastErr = err
+			slog.Warn(logPrefix+" zip download failed", "component", "openclaw", "name", name, "url", u, "attempt", attempt, "error", err)
+		}
+		if attempt < roleSkillsMaxRetries {
+			time.Sleep(roleSkillsRetryDelay)
+		}
+	}
+	return "", lastErr
+}
 
 // ErrInvalidRole is returned when the role slug has an unsafe shape (empty or containing path-escaping characters).
 var ErrInvalidRole = errors.New("invalid role")
@@ -33,32 +78,21 @@ var ErrInvalidRole = errors.New("invalid role")
 // roleNamePattern allows only lowercase letters, digits, dash and underscore.
 var roleNamePattern = regexp.MustCompile(`^[a-z0-9_-]+$`)
 
-// InstallRoleSkills downloads <role>/skills.zip from GCS and extracts its `skills/` tree into {configDir}/workspace/skills, returning the number of files written.
-func InstallRoleSkills(configDir, role string) (int, error) {
+// InstallRoleSkills downloads <role>/skills.zip from the release host (see
+// pluginsSkillsRoots) and extracts its `skills/` tree into
+// {configDir}/workspace/skills, returning the number of files written.
+func InstallRoleSkills(configDir, otaMetadataURL, role string) (int, error) {
 	if !roleNamePattern.MatchString(role) {
 		return 0, fmt.Errorf("%w: %q", ErrInvalidRole, role)
 	}
 
-	url := fmt.Sprintf("%s/%s/skills.zip", roleSkillsBaseURL, role)
-
-	var tmpZip string
-	var lastErr error
-	for attempt := 1; attempt <= roleSkillsMaxRetries; attempt++ {
-		p, err := skills.DownloadToTempFile(url, "role-skills-*.zip")
-		if err != nil {
-			lastErr = err
-			slog.Warn("[role-skills] zip download failed", "component", "openclaw", "role", role, "attempt", attempt, "error", err)
-			if attempt < roleSkillsMaxRetries {
-				time.Sleep(roleSkillsRetryDelay)
-			}
-			continue
-		}
-		tmpZip = p
-		lastErr = nil
-		break
+	var urls []string
+	for _, root := range pluginsSkillsRoots(otaMetadataURL) {
+		urls = append(urls, fmt.Sprintf("%s/%s/%s/skills.zip", root, roleSkillsDir, role))
 	}
-	if lastErr != nil {
-		return 0, fmt.Errorf("download %s skills zip after %d retries: %w", role, roleSkillsMaxRetries, lastErr)
+	tmpZip, err := downloadFirst(urls, "role-skills-*.zip", "[role-skills]", role)
+	if err != nil {
+		return 0, fmt.Errorf("download %s skills zip after %d retries: %w", role, roleSkillsMaxRetries, err)
 	}
 	defer os.Remove(tmpZip)
 
@@ -72,7 +106,7 @@ func InstallRoleSkills(configDir, role string) (int, error) {
 }
 
 // EnsureMCPSkill makes sure the MCP connector skill <name> is present under {configDir}/workspace/skills/<name>.
-func EnsureMCPSkill(configDir, name string) error {
+func EnsureMCPSkill(configDir, otaMetadataURL, name string) error {
 	if !roleNamePattern.MatchString(name) {
 		return fmt.Errorf("%w: %q", ErrInvalidRole, name)
 	}
@@ -82,26 +116,13 @@ func EnsureMCPSkill(configDir, name string) error {
 		return nil
 	}
 
-	url := fmt.Sprintf("%s/%s.zip", mcpSkillsBaseURL, name)
-
-	var tmpZip string
-	var lastErr error
-	for attempt := 1; attempt <= roleSkillsMaxRetries; attempt++ {
-		p, err := skills.DownloadToTempFile(url, "mcp-skill-*.zip")
-		if err != nil {
-			lastErr = err
-			slog.Warn("[mcp-skill] zip download failed", "component", "openclaw", "name", name, "attempt", attempt, "error", err)
-			if attempt < roleSkillsMaxRetries {
-				time.Sleep(roleSkillsRetryDelay)
-			}
-			continue
-		}
-		tmpZip = p
-		lastErr = nil
-		break
+	var urls []string
+	for _, root := range pluginsSkillsRoots(otaMetadataURL) {
+		urls = append(urls, fmt.Sprintf("%s/%s/%s.zip", root, mcpSkillsDir, name))
 	}
-	if lastErr != nil {
-		return fmt.Errorf("download %s mcp skill after %d retries: %w", name, roleSkillsMaxRetries, lastErr)
+	tmpZip, err := downloadFirst(urls, "mcp-skill-*.zip", "[mcp-skill]", name)
+	if err != nil {
+		return fmt.Errorf("download %s mcp skill after %d retries: %w", name, roleSkillsMaxRetries, err)
 	}
 	defer os.Remove(tmpZip)
 

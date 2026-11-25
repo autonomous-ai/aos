@@ -48,7 +48,7 @@ func (h *DeviceMQTTHandler) handleSkillsInstall(env domain.MQTTDataCommand) erro
 func (h *DeviceMQTTHandler) runSkillsInstall(kind, role string) {
 	slog.Info("skills.install: start", "component", "mqtt", "role", role)
 
-	count, err := openclaw.InstallRoleSkills(h.config.OpenclawConfigDir, role)
+	count, err := openclaw.InstallRoleSkills(h.config.OpenclawConfigDir, h.config.OTAMetadataURL, role)
 	if err != nil {
 		step := "install"
 		if errors.Is(err, openclaw.ErrInvalidRole) {
