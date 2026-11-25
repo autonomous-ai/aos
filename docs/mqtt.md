@@ -42,6 +42,32 @@ With TLS on, the client:
 
 While the switch is on, the ping body also carries `"mqtt_tls": true`. With the switch off the key is absent and the rest of the ping is unchanged.
 
+### WSS fallback (when the broker port is blocked)
+
+Some networks block the broker's TCP port but allow HTTPS. When the ping reply carries a top-level `mqtt_ws_url` (a `wss://` URL), the device keeps it as `mqtt_ws_url` in `config/config.json` and uses it as a fallback. The `mqtt` block and the credentials are unchanged: the same login, `fa_channel` and `fd_channel` work over WSS.
+
+| Ping reply | What the device does |
+|------------|----------------------|
+| `mqtt_ws_url` absent | keeps the stored value (replies without the field keep working, nothing changes) |
+| `mqtt_ws_url` is a `wss://` URL | stores it; a new value is used the next time a fallback happens and does not restart the client |
+| `mqtt_ws_url` is `""` | clears it; the fallback is off |
+| any other scheme (`ws://`, `https://`, …) | ignored, so credentials never travel over a plain WebSocket |
+
+Transport rules:
+
+- **TCP stays primary.** The client connects as before (plain, or TLS when `mqtt_tls` is on). Nothing changes while TCP works, or when no `mqtt_ws_url` is known.
+- **TCP to WSS.** After 3 failed connection attempts in a row, none of them reaching the broker's CONNACK, the client moves to the WSS URL, with the same client ID, credentials and subscriptions. There is no minimum outage time. A session that connected and then dropped does not count as a failure, and a broker that answers CONNACK with a refusal does not either (it is reachable, another transport would not help).
+- **WSS back to TCP.** While on WSS, the client dials the TCP broker port (and does the TLS handshake when TLS is on) every 10 minutes without disturbing the live session. When that works it reconnects over TCP; if TCP then fails 3 times in a row it returns to WSS, and the next re-check interval doubles (20 min, 40 min, up to 1 h) so a network that accepts the TCP connection but drops MQTT does not cost the device repeated failed attempts. The interval returns to 10 minutes once TCP reaches CONNACK.
+- **Bad WSS URL.** If WSS itself fails 6 times in a row, the client goes back to TCP, so a wrong URL cannot strand the device.
+- **A new `mqtt_ws_url` never moves a working connection.** It is stored and used the next time a fallback happens; it does not restart the client and does not reset the transport. A change to the broker, port, login, channel or TLS switch still restarts the client, on TCP.
+- WSS always uses TLS 1.2 or newer, verified against the system root CAs and the host name of the WSS URL.
+- Short-lived MQTT clients (one-shot publishes) use whichever transport the main client is on.
+- The stored URL is kept across ping replies that omit `mqtt_ws_url`; a reply with `""` clears it.
+
+Timing that applies to every device, with or without a WSS URL: one connection attempt may take 10 s (it was 30 s), and the MQTT keepalive is 60 s (it was 65535 s). A dead broker link is now noticed within about a minute, so the client reconnects, and can fall back to WSS, instead of waiting on a half-open socket.
+
+The log shows the transport: `mqtt connected ... transport=tcp|wss connects=N switches=M` and `mqtt switching transport ... to=wss|tcp`. `connects` counts successful connections (reconnects are `connects-1`), `switches` counts TCP/WSS moves. Credentials are never logged. The ping body is unchanged.
+
 ## Topics
 
 | Topic | Direction | Description |
@@ -1871,8 +1897,9 @@ There is no `ota` case in the os-server MQTT router: the message is logged as `u
 |------|------|
 | `system/lib/mqtt/client.go` | MQTT client (connect, subscribe, publish) |
 | `system/lib/mqtt/config.go` | Config struct |
-| `system/lib/mqtt/options.go` | Connection options |
-| `system/lib/mqtt/factory.go` | Factory to create client with unique ID |
+| `system/lib/mqtt/options.go` | Connection options (TCP and WSS server URLs, TLS settings) |
+| `system/lib/mqtt/transport.go` | TCP/WSS fallback state machine (`Selector`), `mqtt_ws_url` validation |
+| `system/lib/mqtt/factory.go` | Factory to create client with unique ID; shares the transport state between clients |
 | `system/server/device/delivery/mqtt/handler.go` | Command dispatcher |
 | `system/server/device/delivery/mqtt/info_handler.go` | Handle `info` command |
 | `system/server/device/delivery/mqtt/add_channel_hander.go` | Handle `add_channel` command (streams pairing events for WhatsApp) |

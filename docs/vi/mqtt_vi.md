@@ -42,6 +42,32 @@ Khi bật TLS, client:
 
 Khi công tắc bật, body ping có thêm `"mqtt_tls": true`. Khi tắt, key này không có và phần còn lại của ping không đổi.
 
+### Dự phòng WSS (khi cổng broker bị chặn)
+
+Một số mạng chặn cổng TCP của broker nhưng cho phép HTTPS. Khi phản hồi ping có trường cấp cao nhất `mqtt_ws_url` (một URL `wss://`), thiết bị lưu nó thành `mqtt_ws_url` trong `config/config.json` và dùng làm đường dự phòng. Khối `mqtt` và thông tin đăng nhập không đổi: cùng tài khoản, `fa_channel` và `fd_channel` chạy được qua WSS.
+
+| Phản hồi ping | Thiết bị làm gì |
+|---------------|-----------------|
+| không có `mqtt_ws_url` | giữ giá trị đã lưu (phản hồi không có trường này vẫn chạy, không có gì đổi) |
+| `mqtt_ws_url` là URL `wss://` | lưu lại; giá trị mới được dùng ở lần dự phòng kế tiếp và không làm client khởi động lại |
+| `mqtt_ws_url` là `""` | xóa; tắt đường dự phòng |
+| scheme khác (`ws://`, `https://`, …) | bỏ qua, để thông tin đăng nhập không bao giờ đi qua WebSocket thường |
+
+Quy tắc chọn transport:
+
+- **TCP vẫn là chính.** Client kết nối như trước (thường, hoặc TLS khi `mqtt_tls` bật). Không có gì đổi khi TCP chạy được, hoặc khi chưa biết `mqtt_ws_url`.
+- **TCP sang WSS.** Sau 3 lần thử kết nối thất bại liên tiếp, không lần nào nhận được CONNACK của broker, client chuyển sang URL WSS, giữ nguyên client ID, thông tin đăng nhập và subscription. Không có thời gian mất kết nối tối thiểu. Phiên đã kết nối rồi bị rớt không tính là thất bại; broker trả CONNACK từ chối cũng không tính (broker vẫn tới được, đổi transport không giúp gì).
+- **WSS về TCP.** Khi đang ở WSS, cứ 10 phút client dial thử cổng TCP của broker (kèm bắt tay TLS nếu bật TLS) mà không ảnh hưởng phiên đang chạy. Nếu được thì kết nối lại qua TCP; nếu sau đó TCP lỗi 3 lần liên tiếp thì quay lại WSS, và khoảng kiểm tra kế tiếp tăng gấp đôi (20 phút, 40 phút, tối đa 1 giờ) để mạng nhận kết nối TCP nhưng chặn MQTT không làm thiết bị liên tục thử lỗi. Khoảng này trở về 10 phút khi TCP nhận được CONNACK.
+- **URL WSS hỏng.** Nếu chính WSS lỗi 6 lần liên tiếp, client quay về TCP, để URL sai không làm thiết bị mắc kẹt.
+- **`mqtt_ws_url` mới không bao giờ làm đổi một kết nối đang chạy tốt.** Nó được lưu và dùng ở lần dự phòng kế tiếp; không khởi động lại client và không đưa transport về TCP. Đổi broker, port, tài khoản, channel hoặc công tắc TLS vẫn khởi động lại client, ở TCP.
+- WSS luôn dùng TLS 1.2 trở lên, kiểm tra theo root CA của hệ thống và tên host của URL WSS.
+- Các MQTT client ngắn hạn (publish một lần) dùng transport mà client chính đang dùng.
+- URL đã lưu được giữ qua các phản hồi ping không có `mqtt_ws_url`; phản hồi có `""` sẽ xóa nó.
+
+Thời gian áp dụng cho mọi thiết bị, có hay không có URL WSS: một lần thử kết nối tối đa 10 giây (trước là 30 giây), và keepalive MQTT là 60 giây (trước là 65535 giây). Liên kết broker chết giờ được phát hiện trong khoảng một phút, nên client kết nối lại, và có thể chuyển sang WSS, thay vì chờ trên socket nửa chết.
+
+Log hiển thị transport: `mqtt connected ... transport=tcp|wss connects=N switches=M` và `mqtt switching transport ... to=wss|tcp`. `connects` đếm số lần kết nối thành công (số lần kết nối lại là `connects-1`), `switches` đếm số lần chuyển TCP/WSS. Không bao giờ log thông tin đăng nhập. Body ping không đổi.
+
 ## Topics
 
 | Topic | Hướng | Mô tả |
@@ -1823,8 +1849,9 @@ Router MQTT của os-server không có case `ota`: message bị log là `unknown
 |------|---------|
 | `system/lib/mqtt/client.go` | MQTT client (connect, subscribe, publish) |
 | `system/lib/mqtt/config.go` | Config struct |
-| `system/lib/mqtt/options.go` | Connection options |
-| `system/lib/mqtt/factory.go` | Factory tạo client với unique ID |
+| `system/lib/mqtt/options.go` | Tùy chọn kết nối (URL server TCP và WSS, cài đặt TLS) |
+| `system/lib/mqtt/transport.go` | State machine dự phòng TCP/WSS (`Selector`), kiểm tra `mqtt_ws_url` |
+| `system/lib/mqtt/factory.go` | Factory tạo client với unique ID; chia sẻ trạng thái transport giữa các client |
 | `system/server/device/delivery/mqtt/handler.go` | Command dispatcher |
 | `system/server/device/delivery/mqtt/info_handler.go` | Handle `info` command |
 | `system/server/device/delivery/mqtt/add_channel_hander.go` | Handle `add_channel` command (stream pairing events cho WhatsApp) |

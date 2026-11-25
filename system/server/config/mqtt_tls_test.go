@@ -56,3 +56,20 @@ func TestMQTTTLSJSONKeyOmittedWhenOff(t *testing.T) {
 		t.Fatalf("mqtt_tls must be omitted when off: %s", data)
 	}
 }
+
+func TestProvideMQTTConfigWSURL(t *testing.T) {
+	t.Setenv("MQTT_TLS", "")
+	if got := ProvideMQTTConfig(&Config{MQTTEndpoint: "b", MQTTWSURL: "wss://b.example/mqtt"}).WSURL; got != "wss://b.example/mqtt" {
+		t.Fatalf("WSURL = %q", got)
+	}
+}
+
+func TestMQTTWSURLJSONKeyOmittedWhenEmpty(t *testing.T) {
+	data, err := json.Marshal(&Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "mqtt_ws_url") {
+		t.Fatalf("mqtt_ws_url must be omitted when empty: %s", data)
+	}
+}

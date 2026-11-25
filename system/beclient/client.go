@@ -214,6 +214,10 @@ type PingResponse struct {
 	Status   string      `json:"status"`
 	DeviceID string      `json:"device_id,omitempty"`
 	MQTT     *MQTTConfig `json:"mqtt,omitempty"`
+	// MQTTWSURL is the wss:// URL to reach the broker when TCP is blocked. A
+	// pointer tells absent (nil: keep the stored value) from present-empty
+	// (clear it).
+	MQTTWSURL *string `json:"mqtt_ws_url,omitempty"`
 }
 
 // HasMQTT returns true if the response contains MQTT configuration.

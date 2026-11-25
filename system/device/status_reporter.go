@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"log/slog"
 	"strconv"
+	"strings"
 	"time"
 
 	"go.autonomous.ai/os/system/beclient"
 	"go.autonomous.ai/os/system/domain"
 	"go.autonomous.ai/os/system/lib/hal"
+	"go.autonomous.ai/os/system/lib/mqtt"
 	"go.autonomous.ai/os/system/lib/runtimereg"
 	"go.autonomous.ai/os/system/lib/syspath"
 	"go.autonomous.ai/os/system/server/config"
@@ -114,6 +116,7 @@ func (s *Service) StartStatusReporter(ctx context.Context) {
 			}
 			// Apply when the broker, port or channels change: moving to the TLS port on
 			// the same broker changes only the port.
+			changed := false
 			if resp.HasMQTT() && mqttConfigChanged(resp.GetMQTT(), s.config) {
 				mqttCfg := resp.GetMQTT()
 				slog.Info("received MQTT config from backend", "component", "status-reporter", "endpoint", mqttCfg.Endpoint)
@@ -124,12 +127,42 @@ func (s *Service) StartStatusReporter(ctx context.Context) {
 				s.config.MQTTPassword = mqttCfg.Password
 				s.config.FAChannel = mqttCfg.FaChannel
 				s.config.FDChannel = mqttCfg.FdChannel
+				changed = true
+			}
+			if applyMQTTWSURL(resp, s.config) {
+				slog.Info("received MQTT WSS fallback URL", "component", "status-reporter", "set", s.config.MQTTWSURL != "")
+				changed = true
+			}
+			if changed {
 				if err := s.config.Save(); err != nil {
 					slog.Error("save MQTT config failed", "component", "status-reporter", "error", err)
 				}
 			}
 		}
 	}
+}
+
+// applyMQTTWSURL stores the ping's wss fallback URL on the config and reports
+// whether it changed. Absent keeps the stored value, an empty string clears it,
+// and anything that is not a wss URL is ignored so credentials never travel over
+// a plain WebSocket.
+func applyMQTTWSURL(resp *beclient.PingResponse, c *config.Config) bool {
+	if resp == nil || resp.MQTTWSURL == nil {
+		return false
+	}
+	raw := strings.TrimSpace(*resp.MQTTWSURL)
+	if raw != "" {
+		var ok bool
+		if raw, ok = mqtt.NormalizeWSURL(raw); !ok {
+			slog.Warn("ignoring MQTT WSS URL that is not wss", "component", "status-reporter")
+			return false
+		}
+	}
+	if raw == c.MQTTWSURL {
+		return false
+	}
+	c.MQTTWSURL = raw
+	return true
 }
 
 // mqttConfigChanged reports whether the backend's MQTT config differs from the

@@ -4,7 +4,9 @@ import (
 	"errors"
 	"testing"
 
+	"go.autonomous.ai/os/system/beclient"
 	"go.autonomous.ai/os/system/domain"
+	"go.autonomous.ai/os/system/server/config"
 )
 
 // skillLister is a minimal AgentGateway stand-in: only ListSkills is exercised
@@ -57,6 +59,38 @@ func TestInstalledSkillsForPingIsBestEffort(t *testing.T) {
 			s := &Service{agentGateway: tc.gw}
 			if got := s.installedSkillsForPing(); got != nil {
 				t.Errorf("want nil (field omitted), got %+v", got)
+			}
+		})
+	}
+}
+
+func TestApplyMQTTWSURL(t *testing.T) {
+	str := func(s string) *string { return &s }
+	tests := []struct {
+		name        string
+		stored      string
+		resp        *beclient.PingResponse
+		wantURL     string
+		wantChanged bool
+	}{
+		{"absent keeps stored", "wss://a.example/mqtt", &beclient.PingResponse{}, "wss://a.example/mqtt", false},
+		{"nil response", "wss://a.example/mqtt", nil, "wss://a.example/mqtt", false},
+		{"set from empty", "", &beclient.PingResponse{MQTTWSURL: str("wss://a.example/mqtt")}, "wss://a.example/mqtt", true},
+		{"same value", "wss://a.example/mqtt", &beclient.PingResponse{MQTTWSURL: str(" wss://a.example/mqtt ")}, "wss://a.example/mqtt", false},
+		{"new value", "wss://a.example/mqtt", &beclient.PingResponse{MQTTWSURL: str("wss://b.example/mqtt")}, "wss://b.example/mqtt", true},
+		{"empty clears", "wss://a.example/mqtt", &beclient.PingResponse{MQTTWSURL: str("")}, "", true},
+		{"empty on empty", "", &beclient.PingResponse{MQTTWSURL: str("")}, "", false},
+		{"plain ws ignored", "wss://a.example/mqtt", &beclient.PingResponse{MQTTWSURL: str("ws://b.example/mqtt")}, "wss://a.example/mqtt", false},
+		{"garbage ignored", "", &beclient.PingResponse{MQTTWSURL: str("not a url")}, "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &config.Config{MQTTWSURL: tt.stored}
+			if got := applyMQTTWSURL(tt.resp, c); got != tt.wantChanged {
+				t.Fatalf("changed = %t, want %t", got, tt.wantChanged)
+			}
+			if c.MQTTWSURL != tt.wantURL {
+				t.Fatalf("stored = %q, want %q", c.MQTTWSURL, tt.wantURL)
 			}
 		})
 	}
