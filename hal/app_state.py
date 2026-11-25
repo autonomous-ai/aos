@@ -991,11 +991,11 @@ def _cloud_probe_target():
         from urllib.parse import urlparse
 
         from hal.config import _os_cfg_get
-        from hal.drivers.gelf_handler import _is_autonomous_host
+        from hal.cloud_hosts import is_autonomous_host
 
         base = (_os_cfg_get("llm_base_url", "") or "").strip()
         u = urlparse(base)
-        if u.scheme != "https" or not u.hostname or not _is_autonomous_host(base):
+        if u.scheme != "https" or not u.hostname or not is_autonomous_host(base):
             return None
         return u.hostname, u.port or 443
     except Exception:

@@ -9,8 +9,9 @@ import socket
 import threading
 import time
 from typing import Any, Callable, Mapping, Optional
-from urllib.parse import urlparse
 
+from hal.cloud_hosts import AUTONOMOUS_DOMAINS as _AUTONOMOUS_DOMAINS  # noqa: F401
+from hal.cloud_hosts import is_autonomous_host as _is_autonomous_host
 from hal.log_redact import gelf_record, scrub_secrets
 
 GELF_POOL_MAXSIZE = 32
@@ -44,8 +45,6 @@ _LEVEL_MAP = {
 
 _RELAY_PATH = "/logs/gelf"
 
-_AUTONOMOUS_DOMAINS = ("autonomous.ai", "autonomousdev.xyz")
-
 
 def _normalize_base(base: str) -> str:
     """Add the API version an older config.json may lack (mirrors
@@ -56,14 +55,6 @@ def _normalize_base(base: str) -> str:
     if base.endswith("/ai") and _is_autonomous_host(base):
         base += "/v1"
     return base
-
-
-def _is_autonomous_host(base: str) -> bool:
-    try:
-        host = (urlparse(base).hostname or "").lower()
-    except ValueError:
-        return False
-    return any(host == d or host.endswith("." + d) for d in _AUTONOMOUS_DOMAINS)
 
 
 def _relay_credentials(os_cfg_get: Callable[..., Any]) -> tuple[str, str]:
