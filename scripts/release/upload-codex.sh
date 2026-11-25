@@ -19,6 +19,9 @@ fi
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ota-config.sh"
 source "${RELEASE_DIR}/ota-metadata.sh"
+source "${RELEASE_DIR}/mirror-check.sh"
+mirror_require "CODEX_VERSION=${VERSION} make upload-mirror" \
+  "codex/${VERSION}/codex-aarch64-unknown-linux-musl.tar.gz" "codex/${VERSION}/codex-x86_64-unknown-linux-musl.tar.gz"
 METADATA_GCS="gs://${GCS_BUCKET}/${BUCKET_PREFIX}/ota/metadata.json"
 
 METADATA_TMP=$(mktemp)

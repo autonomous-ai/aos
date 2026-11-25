@@ -1466,7 +1466,10 @@ bản đó có pin, và cả bản trên mirror lẫn bản của vendor phải 
 `upload-mirror.sh` từ chối file tải về khác pin đang có và in ra các dòng pin
 (`--digests` chỉ in, không upload), nên lần nâng phiên bản và pin đi cùng một
 thay đổi; `scripts/release/tests/test_mirror_pins.py` lỗi khi một phiên bản
-đã ghim không có digest.
+đã ghim không có digest. `make upload-codex`, `upload-opencode`,
+`upload-picoclaw`, `upload-hermes`, `upload-device` và `upload-setup` dừng trước
+khi publish nếu file chúng ghim chưa có trên mirror CDN, và in ra lệnh
+`make upload-mirror` để chép file đó (`scripts/release/mirror-check.sh`).
 
 | Công cụ | Đường dẫn mirror | Thứ tự trên thiết bị (khi có pin) |
 |---|---|---|

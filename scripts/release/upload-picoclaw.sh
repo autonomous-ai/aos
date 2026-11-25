@@ -13,6 +13,8 @@ VERSION="$1"
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ota-config.sh"
 source "${RELEASE_DIR}/ota-metadata.sh"
+source "${RELEASE_DIR}/mirror-check.sh"
+mirror_require "PICO_VERSION=${VERSION} make upload-mirror" "picoclaw/${VERSION}/picoclaw-linux-arm64"
 METADATA_GCS="gs://${GCS_BUCKET}/${BUCKET_PREFIX}/ota/metadata.json"
 
 METADATA_TMP=$(mktemp)

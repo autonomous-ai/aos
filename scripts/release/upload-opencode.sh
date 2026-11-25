@@ -19,6 +19,9 @@ fi
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ota-config.sh"
 source "${RELEASE_DIR}/ota-metadata.sh"
+source "${RELEASE_DIR}/mirror-check.sh"
+mirror_require "OPENCODE_VERSION=${VERSION} make upload-mirror" \
+  "opencode/${VERSION}/opencode-linux-arm64.tar.gz" "opencode/${VERSION}/opencode-linux-x64.tar.gz"
 METADATA_GCS="gs://${GCS_BUCKET}/${BUCKET_PREFIX}/ota/metadata.json"
 
 METADATA_TMP=$(mktemp)

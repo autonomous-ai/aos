@@ -34,6 +34,8 @@ echo "hermes $VERSION → $REF = $COMMIT"
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ota-config.sh"
 source "${RELEASE_DIR}/ota-metadata.sh"
+source "${RELEASE_DIR}/mirror-check.sh"
+mirror_require "HERMES_COMMIT=${COMMIT} make upload-mirror" "hermes/${COMMIT}/install.sh"
 METADATA_GCS="gs://${GCS_BUCKET}/${BUCKET_PREFIX}/ota/metadata.json"
 
 METADATA_TMP=$(mktemp)

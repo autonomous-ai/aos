@@ -1509,7 +1509,10 @@ version without a pin downloads from its vendor exactly as before.
 `upload-mirror.sh` refuses a download that differs from an existing pin and
 prints the pin lines (`--digests` prints them without uploading), so a version
 bump and its pins go in the same change; `scripts/release/tests/test_mirror_pins.py`
-fails when a pinned version has no digest.
+fails when a pinned version has no digest. `make upload-codex`, `upload-opencode`,
+`upload-picoclaw`, `upload-hermes`, `upload-device` and `upload-setup` stop
+before publishing when a file they pin is not on the CDN mirror yet, and name
+the `make upload-mirror` command that copies it (`scripts/release/mirror-check.sh`).
 
 | Tool | Mirror path | Device order (with a pin) |
 |---|---|---|

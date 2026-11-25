@@ -2,6 +2,11 @@
 set -e
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ota-config.sh"
+source "${RELEASE_DIR}/mirror-check.sh"
+# The software-update shipped here pins these mirrored files; each must be on the mirror.
+MIRROR_PIN_KEYS=$(awk "/^MIRROR_PINS='/ { on = 1; next } on && /^'/ { exit } on && NF { print \$1 }" "$MIRROR_PINS_FILE")
+# shellcheck disable=SC2086
+mirror_require "make upload-mirror" $MIRROR_PIN_KEYS
 
 SETUP_FILE="${RELEASE_DIR}/../provision/setup.sh"
 
