@@ -16,11 +16,39 @@ var ErrSlackCredentialsMissing = domain.ErrChannelCredentialsMissing
 // ErrChannelNotSupported is returned when the active runtime cannot run the channel.
 var ErrChannelNotSupported = domain.ErrChannelNotSupported
 
+// ErrChannelUnavailableInRegion is returned when a channel cannot be newly set up in this region.
+var ErrChannelUnavailableInRegion = domain.ErrChannelUnavailableInRegion
+
+// ChannelUnavailableInRegion reports whether a NEW setup of channel is refused
+// in China: Telegram is blocked there and Slack and WhatsApp are unreliable.
+// A channel the owner already configured keeps working and can be edited.
+func (s *Service) ChannelUnavailableInRegion(channel string) bool {
+	return channelUnavailableInRegion(s.config, channel)
+}
+
+func channelUnavailableInRegion(c *config.Config, channel string) bool {
+	if !c.InChina() {
+		return false
+	}
+	switch channel {
+	case domain.ChannelSlack:
+		return c.SlackBotToken == ""
+	case domain.ChannelWhatsapp:
+		return c.WhatsappUserID == ""
+	case domain.ChannelTelegram:
+		return c.TelegramBotToken == ""
+	}
+	return false
+}
+
 // AddChannel adds a messaging channel without full setup. Non-WhatsApp returns a
 // nil channel; WhatsApp returns a pairing event stream the caller must drain.
 func (s *Service) AddChannel(ctx context.Context, data domain.AddChannelRequest) (<-chan domain.PairingEvent, error) {
 	channel := data.EffectiveChannel()
 
+	if s.ChannelUnavailableInRegion(channel) {
+		return nil, fmt.Errorf("%s: %w", channel, ErrChannelUnavailableInRegion)
+	}
 	// Reject before persisting so an unsupported channel leaves no dead token.
 	if !domain.ChannelSupported(s.agentGateway, channel) {
 		return nil, fmt.Errorf("%s on runtime %s: %w", channel, s.agentGateway.Name(), domain.ErrChannelNotSupported)

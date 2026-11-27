@@ -32,6 +32,21 @@ or change filler scheduling.
 
 `GET /api/system/ota-updating` returns `updating`, persisted per-component `progress`, and `bootstrap_available`. It remains readable from local snapshots when bootstrap is unavailable; see [update progress](bootstrap-ota.md#update-progress-snapshots). Progress may include optional `activity_at` (Unix seconds) for recognized HAL dependency installation activity; older snapshots without it remain valid.
 
+## Region (mainland China)
+
+The device keeps its market region from the periodic status reply (top-level `region`, for example `"CN"`); a reply without one means no region. os-server stores it as `region` in `config/config.json` (`Config.Region`, helper `Config.InChina()`, true for `CN` in any letter case). The value is read leniently: 1-8 letters, upper-cased; a missing field, `null`, a number or anything else reads as no region, and the rest of the reply is still used. CN is stored on the first reply that carries it. Leaving China takes 3 consecutive successful replies without CN (counted in memory, reset by any CN reply), so a single stray reply does not flip the device; other region changes apply at once. The config is written only when the value changes, never for a failed ping, and after a save the region subscribers (`Service.OnRegionChange`, for other features that depend on the region) are called. Entering or leaving China restarts HAL and re-runs the agent onboarding so the text below follows the region; the flip runs once. `GET /api/device/config` returns `region` and `in_china`; `GET /api/system/info` returns `inChina`; HAL reads `region` from the same config file (`hal/config.py` `in_china()`).
+
+When the region first becomes `CN` and the owner never chose a timezone (`timezone` is empty in the config), the device applies `Asia/Shanghai` through the same path as `timezone.set`. A zone the owner or the app already set is never replaced, and leaving China does not undo the zone.
+
+In China the device changes these behaviours; every other region is unchanged:
+
+- **Connector text:** the agent instruction blocks written by each runtime (`runtimes/*/onboarding.go`, filtered by `system/lib/regiontext`) leave Gmail, Google Calendar and Google Drive out of the connector list and examples, and say that Google and Facebook connectors are not available in this region. The blocks refresh the next time the runtime onboarding runs (boot or runtime switch). `skills/connectors/SKILL.md` carries the matching rule.
+- **Chat channels:** a new Telegram, Slack or WhatsApp setup is refused (`POST /api/device/channel`, MQTT `add_channel` with `channel_unavailable_in_region`, and a `channel` change in `PUT /api/device/config`). A channel the owner already configured keeps working and can be edited. Discord stays available.
+- **Skill catalog language:** the skill store request sends `zh-CN` instead of `en-US`.
+- **Music:** HAL `POST /audio/play` for a search query answers HTTP 503 `Music isn't available in this region yet.` without starting yt-dlp. Local files still play. `music_source_available()` in `hal/drivers/voice/music_service.py` is the single hook where a China music source can be added later.
+- **Voice pipeline:** HAL does not use Gemini Live in China (when the realtime provider is `gemini`, the default); it uses the normal STT, agent, TTS pipeline, the same one used when realtime is off. os-server applies the same rule (`Config.RealtimeEffective()`): chitchat intents stay on in China, and `GET /api/device/config` returns `realtime.enabled` (the saved setting, never changed by region) and `realtime.active` (what really runs). `HAL_REALTIME_ENABLED` still overrides in HAL, and another realtime provider is untouched.
+- **First-response waits:** the default realtime waits for a first response (`REALTIME_RECV_QUEUE_TIMEOUT_S`, fast-voice silent timeout) are 5/3 longer in China (the same 3 s to 5 s widening the lamp uses); explicit settings are used as given. Wake sounds, cues and the filler delay stay local and unchanged.
+
 ## Japanese language support
 
 `stt_language: "ja"` selects Japanese. Japanese regional aliases such as `ja-JP`

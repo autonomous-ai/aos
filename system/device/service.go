@@ -42,11 +42,16 @@ type Service struct {
 	cloudApply              cloudPerceptionApply
 	// foMu serializes Fo token refreshes (fo.go).
 	foMu sync.Mutex
+	// regionSubs are told when the region changes (status_reporter.go).
+	regionMu sync.Mutex
+	// leaveStreak counts consecutive successful replies without CN while CN is stored; touched only by the status reporter goroutine.
+	leaveStreak int
+	regionSubs  []func(RegionChange)
 }
 
 func ProvideService(config *config.Config, ns *network.Service, gw domain.AgentGateway, be *beclient.Client, sled *statusled.Service) *Service {
 	SeedAgentRuntimeFromGateway(config)
-	return &Service{
+	svc := &Service{
 		config:         config,
 		networkService: ns,
 		agentGateway:   gw,
@@ -54,6 +59,8 @@ func ProvideService(config *config.Config, ns *network.Service, gw domain.AgentG
 		statusLED:      sled,
 		setupState:     setupState{phase: SetupPhaseIdle},
 	}
+	svc.OnRegionChange(svc.applyRegionEffects)
+	return svc
 }
 
 // restartHAL restarts HAL in the background so it re-reads config.json, then

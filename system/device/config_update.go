@@ -35,6 +35,8 @@ func (s *Service) GetPublicConfig() domain.ConfigPublicResponse {
 	return domain.ConfigPublicResponse{
 		LLMConfigMode:            s.config.LLMMode(),
 		Environment:              s.config.EnvironmentSettings(),
+		Region:                   s.config.Region,
+		InChina:                  s.config.InChina(),
 		Channel:                  s.config.Channel,
 		TelegramUserID:           s.config.TelegramUserID,
 		SlackUserID:              s.config.SlackUserID,
@@ -103,6 +105,7 @@ func (s *Service) GetPublicConfig() domain.ConfigPublicResponse {
 func (s *Service) RealtimePublic() domain.RealtimePublic {
 	return domain.RealtimePublic{
 		Enabled:   s.config.RealtimeEnabled(),
+		Active:    s.config.RealtimeEffective(),
 		Provider:  s.config.RealtimeProvider(),
 		Model:     s.config.RealtimeModel(),
 		Voice:     s.config.RealtimeVoice(),
@@ -549,6 +552,9 @@ func (s *Service) UpdateConfig(data domain.UpdateConfigRequest) error {
 		defer s.runtimeSwitchMu.Unlock()
 	}
 
+	if data.Channel != "" && data.Channel != s.config.Channel && s.ChannelUnavailableInRegion(data.Channel) {
+		return fmt.Errorf("%s: %w", data.Channel, ErrChannelUnavailableInRegion)
+	}
 	if data.VoiceInputMode != nil {
 		if err := config.ValidateVoiceInputMode(*data.VoiceInputMode); err != nil {
 			return err

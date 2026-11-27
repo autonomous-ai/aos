@@ -211,7 +211,17 @@ def audio_play(req: MusicPlayRequest):
             503, "Music service not available -- missing sounddevice or numpy"
         )
 
-    from hal.drivers.voice.music_service import canonicalize_person
+    from hal.drivers.voice.music_service import (
+        MUSIC_UNAVAILABLE_MESSAGE,
+        canonicalize_person,
+        music_source_available,
+    )
+
+    is_local_file = req.query.startswith("/") and os.path.isfile(req.query)
+    if not is_local_file and not music_source_available():
+        # Fail fast with a sentence the agent/voice path can say, instead of a yt-dlp hang.
+        state.logger.info("POST /audio/play: no music source in this region (query='%s')", req.query[:80])
+        raise HTTPException(503, MUSIC_UNAVAILABLE_MESSAGE)
 
     raw_person = req.person.strip()
     person = canonicalize_person(raw_person) if raw_person else ""
@@ -227,7 +237,7 @@ def audio_play(req: MusicPlayRequest):
             state.animation_service.dispatch(SERVO_CMD_MUSIC_START, style)
         state._on_music_play_start()
 
-    if req.query.startswith("/") and os.path.isfile(req.query):
+    if is_local_file:
         started = state.music_service.play_file(req.query, on_started=_on_audio_started, person=person)
     else:
         started = state.music_service.play(req.query, on_started=_on_audio_started, person=person)

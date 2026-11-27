@@ -30,6 +30,21 @@ Sửa nội dung này không bật lại việc tự chọn câu theo tool và k
 
 `GET /api/system/ota-updating` trả `updating`, `progress` lưu theo component và `bootstrap_available`. Khi bootstrap không truy cập được, endpoint vẫn đọc snapshot local; xem [tiến độ cập nhật](bootstrap-ota.md#snapshot-tiến-độ-cập-nhật). Progress có thể chứa `activity_at` tùy chọn (giây Unix) cho hoạt động cài dependency HAL nhận diện được; snapshot cũ không có trường này vẫn hợp lệ.
 
+## Khu vực (Trung Quốc đại lục)
+
+Thiết bị giữ khu vực thị trường từ phản hồi trạng thái định kỳ (trường cấp cao nhất `region`, ví dụ `"CN"`); phản hồi không có trường này nghĩa là không có khu vực. os-server lưu vào `region` trong `config/config.json` (`Config.Region`, helper `Config.InChina()`, true với `CN` không phân biệt hoa thường). Giá trị được đọc linh hoạt: 1-8 chữ cái, viết hoa; thiếu trường, `null`, số hoặc bất kỳ giá trị nào khác được coi là không có khu vực, và phần còn lại của phản hồi vẫn được dùng. CN được lưu ngay ở phản hồi đầu tiên có nó. Rời Trung Quốc cần 3 phản hồi thành công liên tiếp không có CN (đếm trong bộ nhớ, bị đặt lại bởi bất kỳ phản hồi CN nào), nên một phản hồi lẻ không làm thiết bị đổi qua lại; các thay đổi khu vực khác áp dụng ngay. Config chỉ được ghi khi giá trị đổi, không bao giờ ghi khi ping thất bại, và sau khi lưu các subscriber (`Service.OnRegionChange`, cho các tính năng khác phụ thuộc khu vực) được gọi. Vào hoặc rời Trung Quốc sẽ khởi động lại HAL và chạy lại onboarding agent để nội dung dưới đây theo đúng khu vực; mỗi lần đổi chỉ chạy một lần. `GET /api/device/config` trả `region` và `in_china`; `GET /api/system/info` trả `inChina`; HAL đọc `region` từ cùng file config (`hal/config.py` `in_china()`).
+
+Khi khu vực lần đầu thành `CN` và chủ máy chưa từng chọn múi giờ (`timezone` trống trong config), thiết bị áp `Asia/Shanghai` qua cùng đường với `timezone.set`. Múi giờ do chủ máy hoặc app đã đặt không bao giờ bị thay, và rời Trung Quốc không hoàn lại múi giờ.
+
+Ở Trung Quốc thiết bị đổi các hành vi sau; các khu vực khác giữ nguyên:
+
+- **Nội dung connector:** các khối hướng dẫn agent mà mỗi runtime ghi (`runtimes/*/onboarding.go`, lọc bởi `system/lib/regiontext`) bỏ Gmail, Google Calendar và Google Drive khỏi danh sách và ví dụ connector, đồng thời nói rằng connector Google và Facebook không có ở khu vực này. Các khối được làm mới ở lần onboarding runtime kế tiếp (khởi động hoặc đổi runtime). `skills/connectors/SKILL.md` có quy tắc tương ứng.
+- **Kênh chat:** thiết lập mới Telegram, Slack hoặc WhatsApp bị từ chối (`POST /api/device/channel`, MQTT `add_channel` với `channel_unavailable_in_region`, và đổi `channel` trong `PUT /api/device/config`). Kênh chủ máy đã cấu hình vẫn chạy và sửa được. Discord vẫn dùng được.
+- **Ngôn ngữ catalog skill:** request tới skill store gửi `zh-CN` thay cho `en-US`.
+- **Nhạc:** HAL `POST /audio/play` với câu tìm kiếm trả HTTP 503 `Music isn't available in this region yet.` mà không chạy yt-dlp. File cục bộ vẫn phát được. `music_source_available()` trong `hal/drivers/voice/music_service.py` là hook duy nhất để thêm nguồn nhạc cho Trung Quốc sau này.
+- **Pipeline giọng nói:** HAL không dùng Gemini Live ở Trung Quốc (khi provider realtime là `gemini`, mặc định); dùng pipeline thường STT, agent, TTS, cùng pipeline khi realtime tắt. os-server áp dụng cùng quy tắc (`Config.RealtimeEffective()`): intent chitchat vẫn bật ở Trung Quốc, và `GET /api/device/config` trả `realtime.enabled` (cài đặt đã lưu, không bao giờ bị khu vực đổi) và `realtime.active` (thứ thực sự chạy). `HAL_REALTIME_ENABLED` vẫn ghi đè trong HAL, và provider realtime khác không bị đổi.
+- **Thời gian chờ phản hồi đầu:** các mặc định chờ phản hồi đầu của realtime (`REALTIME_RECV_QUEUE_TIMEOUT_S`, fast-voice silent timeout) dài hơn 5/3 lần ở Trung Quốc (cùng mức nới 3 s lên 5 s của lamp); cài đặt tường minh được dùng nguyên. Âm thanh đánh thức, cue và độ trễ filler vẫn cục bộ và không đổi.
+
 ## Hỗ trợ tiếng Nhật
 
 `stt_language: "ja"` chọn tiếng Nhật. Các biến thể vùng như `ja-JP` và `ja_JP`

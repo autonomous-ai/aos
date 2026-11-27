@@ -642,6 +642,8 @@ Third-party accounts the robot can use are grouped under **Settings → Connecto
 
 The page saves the credentials on the device and only the connected status is reported to the account, so the privacy line reads "Saved on this device. Only the connected status is shared with your account."
 
+In mainland China (`in_china` from `GET /api/device/config`, `inChina` from `GET /api/system/info`) the Facebook page is hidden from the sidebar and Settings. The Telegram and Slack options are hidden from the channel pickers (Settings and setup) unless the owner already configured that channel, and a note says Discord is the supported chat in this region.
+
 ### Settings readability
 
 Settings dropdowns use themed Radix menus with an amber selection, viewport-aware placement, scrolling, keyboard navigation and Escape dismissal. Empty-value Auto/default choices remain selectable. General retains its existing controls.

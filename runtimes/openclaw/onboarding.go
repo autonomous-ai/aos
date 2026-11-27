@@ -16,6 +16,7 @@ import (
 
 	"go.autonomous.ai/os/system/device"
 	"go.autonomous.ai/os/system/domain"
+	"go.autonomous.ai/os/system/lib/regiontext"
 	"go.autonomous.ai/os/system/skills"
 )
 
@@ -330,6 +331,7 @@ func (s *OpenclawService) ensureHooksRegistered(hookNames []string) (bool, error
 
 // ensureAgentsMDBlock injects the mandatory skills block into AGENTS.md.
 func (s *OpenclawService) ensureAgentsMDBlock() (bool, error) {
+	block := regiontext.ForRegion(agentsMDBlock, s.config.InChina())
 	agentsFile := filepath.Join(s.config.OpenclawConfigDir, "workspace", "AGENTS.md")
 
 	if _, err := os.Stat(agentsFile); os.IsNotExist(err) {
@@ -346,7 +348,7 @@ func (s *OpenclawService) ensureAgentsMDBlock() (bool, error) {
 
 	text := string(content)
 
-	if strings.Contains(text, agentsMDBlock) {
+	if strings.Contains(text, block) {
 		slog.Debug("AGENTS.md already has current mandatory block, skipping", "component", "onboarding")
 		return false, nil
 	}
@@ -364,14 +366,14 @@ func (s *OpenclawService) ensureAgentsMDBlock() (bool, error) {
 	for _, line := range lines {
 		result = append(result, line)
 		if !injected && strings.Contains(strings.ToLower(line), "your workspace") {
-			result = append(result, agentsMDBlock)
+			result = append(result, block)
 			injected = true
 		}
 	}
 
 	if !injected {
 		slog.Debug("'Your workspace' not found in AGENTS.md, prepending block", "component", "onboarding")
-		result = append([]string{agentsMDBlock, ""}, result...)
+		result = append([]string{block, ""}, result...)
 	}
 
 	output := strings.Join(result, "\n")

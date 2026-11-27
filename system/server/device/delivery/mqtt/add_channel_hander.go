@@ -111,6 +111,9 @@ func (h *DeviceMQTTHandler) processAddChannel(req domain.MQTTAddChannelCommand) 
 		if errors.Is(err, device.ErrChannelNotSupported) {
 			errMsg = "channel_not_supported"
 		}
+		if errors.Is(err, device.ErrChannelUnavailableInRegion) {
+			errMsg = "channel_unavailable_in_region"
+		}
 		slog.Error("add_channel: failed", "component", "mqtt", "channel", req.Channel, "code", errMsg, "error", err)
 		h.alertOps("❌ add_channel "+req.Channel+" — FAILED", errMsg)
 		return h.publishAddChannelResult(req.Channel, "failure", errMsg, nil)

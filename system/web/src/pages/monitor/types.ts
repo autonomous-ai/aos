@@ -24,6 +24,8 @@ export interface SystemInfo {
   version: string;
   deviceId: string;
   capabilities?: string[];
+  // True when the device's region is mainland China (hides Facebook).
+  inChina?: boolean;
   diskTotal: number;
   diskUsed: number;
   diskPercent: number;

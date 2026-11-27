@@ -304,6 +304,10 @@ export interface CloudPerception {
 
 export interface DeviceConfig {
   llm_config_mode?: LLMConfigMode;
+  // The device market region ("CN", ...); empty or absent when unknown.
+  region?: string;
+  // True when the device is in mainland China: Google, Facebook, Telegram and Slack are hidden.
+  in_china?: boolean;
   channel: string;
   telegram_user_id: string;
   slack_user_id: string;
@@ -349,6 +353,8 @@ export interface DeviceConfig {
   sleep_mode?: boolean;
   realtime?: {
     enabled?: boolean;
+    // False when the saved setting is on but realtime does not run here (Gemini Live in China). Save `enabled`, never this.
+    active?: boolean;
     provider?: string;
     model?: string;
     voice?: string;

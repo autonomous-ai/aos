@@ -1329,7 +1329,10 @@ type MQTTDeviceRenameData struct {
 
 // RealtimePublic is the resolved realtime config for read-back; the key is exposed only as HasAPIKey.
 type RealtimePublic struct {
+	// Enabled is the saved setting; Active is whether realtime really runs (false
+	// for Gemini Live in China). The web must save Enabled back, never Active.
 	Enabled   bool   `json:"enabled"`
+	Active    bool   `json:"active"`
 	Provider  string `json:"provider"` // "" when realtime is off
 	Model     string `json:"model"`
 	Voice     string `json:"voice"`
@@ -1351,6 +1354,11 @@ type RealtimePublic struct {
 type ConfigPublicResponse struct {
 	LLMConfigMode string            `json:"llm_config_mode"`
 	Environment   EnvironmentConfig `json:"environment"`
+
+	// Region is the device's market region ("CN", ...), empty when unknown;
+	// InChina is the same fact as a boolean for the web UI.
+	Region  string `json:"region,omitempty"`
+	InChina bool   `json:"in_china"`
 
 	Channel                  string   `json:"channel"`
 	TelegramUserID           string   `json:"telegram_user_id"`

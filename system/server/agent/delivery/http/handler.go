@@ -18,6 +18,7 @@ import (
 	"go.autonomous.ai/os/system/skillcontext/musicsuggestion"
 	"go.autonomous.ai/os/system/skillcontext/posture"
 	"go.autonomous.ai/os/system/skillcontext/wellbeing"
+	"go.autonomous.ai/os/system/skills"
 	"go.autonomous.ai/os/system/statusled"
 )
 
@@ -171,6 +172,8 @@ func (h *AgentHandler) SetDiscordRelay(r *discordrelay.Relay) { h.discordRelay =
 func ProvideAgentHandler(gw domain.AgentGateway, bus *monitor.Bus, sled *statusled.Service, cfg *config.Config) *AgentHandler {
 	// Init before StartWS so ws_connect events reach SSE.
 	flow.Init(bus, config.OSVersion)
+	// The skill catalog is served in Chinese to devices in mainland China.
+	skills.StoreInChina = cfg.InChina
 	mood.Init()
 	wellbeing.Init()
 	musicsuggestion.Init()

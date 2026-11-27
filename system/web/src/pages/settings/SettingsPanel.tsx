@@ -119,6 +119,8 @@ export function SettingsPanel({ activeSection }: { activeSection: SettingsSectio
     }
   }, []);
 
+  // Set from config.in_china: hides the Facebook connector section in mainland China.
+  const [inChina, setInChina] = useState(false);
   const [ssid, setSsid] = useState("");
   const [password, setPassword] = useState("");
   // Empty = keep the current password.
@@ -142,6 +144,8 @@ export function SettingsPanel({ activeSection }: { activeSection: SettingsSectio
   const [ttsSpeed, setTtsSpeed] = useState(1.2);
   const [ttsVoices, setTtsVoices] = useState<string[]>([]);
   const [realtimeEnabled, setRealtimeEnabled] = useState(true);
+  // The saved setting is on but realtime does not run on this device (Gemini Live in China).
+  const [realtimeNotRunning, setRealtimeNotRunning] = useState(false);
   const [voiceInputMode, setVoiceInputMode] = useState<VoiceInputMode>("automatic");
   const [wakeWord, setWakeWord] = useState(false);
   const [agentName, setAgentName] = useState("");
@@ -263,6 +267,7 @@ export function SettingsPanel({ activeSection }: { activeSection: SettingsSectio
     getDeviceConfig()
       .then((cfg: DeviceConfig) => {
         // Secrets come back as has_* flags; their inputs stay empty until typed.
+        setInChina(cfg.in_china === true);
         setSsid(cfg.network_ssid ?? "");
         setDeviceId(cfg.device_id ?? "");
         setMac(cfg.mac ?? "");
@@ -307,6 +312,7 @@ export function SettingsPanel({ activeSection }: { activeSection: SettingsSectio
         setTapLook(wakeLookFrom(cfg.tap_light));
         if (cfg.realtime) {
           setRealtimeEnabled(cfg.realtime.enabled ?? true);
+          setRealtimeNotRunning((cfg.realtime.enabled ?? true) && cfg.realtime.active === false);
           setRealtimeProvider(cfg.realtime.provider || "gemini");
           if (cfg.realtime.voice) setRealtimeVoice(cfg.realtime.voice);
           if (cfg.realtime.reasoning) setRealtimeReasoning(cfg.realtime.reasoning);
@@ -891,6 +897,7 @@ export function SettingsPanel({ activeSection }: { activeSection: SettingsSectio
             <RealtimeSection
               active={activeSection === "realtime"}
               realtimeLoaded={realtimeLoaded}
+              notRunningHere={realtimeNotRunning}
               llmLoaded={llmLoaded}
               enabled={realtimeEnabled} setEnabled={setRealtimeEnabled}
               provider={realtimeProvider} setProvider={setRealtimeProvider}
@@ -937,7 +944,7 @@ export function SettingsPanel({ activeSection }: { activeSection: SettingsSectio
               bluebubblesCallerContext={bluebubblesCallerContext} setBluebubblesCallerContext={setBluebubblesCallerContext}
             />
 
-            <FacebookSection active={activeSection === "facebook"} />
+            {!inChina && <FacebookSection active={activeSection === "facebook"} />}
             <ShopifySection active={activeSection === "shopify"} />
             <EbaySection active={activeSection === "ebay"} />
 

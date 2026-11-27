@@ -8,6 +8,9 @@ var ErrChannelNotSupported = errors.New("channel_not_supported")
 // ErrChannelCredentialsMissing is returned when config.json has no credentials for the channel.
 var ErrChannelCredentialsMissing = errors.New("channel_credentials_missing")
 
+// ErrChannelUnavailableInRegion is returned when a chat channel cannot be newly set up in the device's region.
+var ErrChannelUnavailableInRegion = errors.New("channel_unavailable_in_region")
+
 // ChannelSupported reports whether gw lists channel in its SupportedChannels().
 func ChannelSupported(gw AgentGateway, channel string) bool {
 	for _, c := range gw.SupportedChannels() {

@@ -5,6 +5,8 @@ description: "Discover and use linked third-party services (Gmail, Google Calend
 
 # Connectors
 
+**China region:** when your instructions say Google and Facebook connectors are not available in this region, Gmail, Google Calendar, Google Drive and Facebook Fan Page are unavailable on this device. Never offer, suggest or set them up, and answer a request for one by saying it is not available here. The other connectors work as described below.
+
 ## ⛔ Step −1: run Discover FIRST — never answer from memory
 
 Every question that touches connection state — "is my gmail connected?", "what

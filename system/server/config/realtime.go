@@ -133,6 +133,13 @@ func (c *Config) RealtimeEnabled() bool {
 	return true
 }
 
+// RealtimeEffective reports whether the realtime brain actually runs: the saved
+// setting, except that Gemini Live is not used in China (HAL applies the same
+// rule and falls back to the normal STT, agent, TTS pipeline).
+func (c *Config) RealtimeEffective() bool {
+	return c.RealtimeEnabled() && !(c.InChina() && c.RealtimeProvider() == "gemini")
+}
+
 // RealtimeProvider returns the normalized provider
 // ("gemini"/"openai"/"gptlive"/"pipecat_v1"), defaulting to "gemini" (mirrors
 // HAL's HAL_REALTIME_PROVIDER default).

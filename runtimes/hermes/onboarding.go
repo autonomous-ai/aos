@@ -13,6 +13,7 @@ import (
 
 	"go.autonomous.ai/os/system/device"
 	"go.autonomous.ai/os/system/domain"
+	"go.autonomous.ai/os/system/lib/regiontext"
 )
 
 const (
@@ -250,7 +251,7 @@ func (s *HermesService) ensureAgentsMDBlock() (bool, error) {
 	if err != nil && !os.IsNotExist(err) {
 		return false, fmt.Errorf("read %s: %w", path, err)
 	}
-	updated := upsertAgentsMDBlock(string(raw))
+	updated := upsertAgentsMDBlock(string(raw), s.config.InChina())
 	if updated == string(raw) {
 		return false, nil
 	}
@@ -381,12 +382,13 @@ func isManagedDefaultSoul(text string) bool {
 }
 
 // upsertAgentsMDBlock returns text with exactly one current OS rule block at the top, owner content preserved.
-func upsertAgentsMDBlock(text string) string {
+func upsertAgentsMDBlock(text string, inChina bool) string {
+	block := regiontext.ForRegion(agentsMDBlock, inChina)
 	rest := strings.TrimLeft(stripSoulMarkedBlock(text, soulOSMarker, nil), " \t\r\n")
 	if strings.TrimSpace(rest) == "" {
-		return agentsMDBlock + "\n"
+		return block + "\n"
 	}
-	return agentsMDBlock + "\n\n" + rest
+	return block + "\n\n" + rest
 }
 
 // stripSoulOSRuleBlock removes the legacy rule block from SOUL.md (own marker or sentinel-matched shared marker).

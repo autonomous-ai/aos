@@ -2,6 +2,7 @@ import { MessageSquare } from "lucide-react";
 import { ConfiguredHint, LockedField, LockedPasswordField, SectionCard, LABEL_STYLE, INPUT_STYLE, FIELD_GAP } from "./shared";
 import type { SetupChannelType } from "@/types";
 import type { ChannelLoadedState } from "@/hooks/setup/types";
+import { channelOffered, useInChina } from "@/hooks/useInChina";
 
 export function ChannelSection({
   active, channel, setChannel,
@@ -22,6 +23,7 @@ export function ChannelSection({
   discordGuildId: string; setDiscordGuildId: (v: string) => void;
   discordUserId: string; setDiscordUserId: (v: string) => void;
 }) {
+  const inChina = useInChina();
   return (
     <SectionCard id="channel" title="Messaging Channels" active={active} icon={<MessageSquare size={17} />}
       description="Optionally connect a chat app now, or configure one later in Settings.">
@@ -34,10 +36,13 @@ export function ChannelSection({
           style={{ ...INPUT_STYLE, cursor: "pointer" }}
         >
           <option value="none">Not now</option>
-          <option value="telegram">Telegram</option>
-          <option value="slack">Slack</option>
+          {channelOffered("telegram", inChina, channelLoaded, channel) && <option value="telegram">Telegram</option>}
+          {channelOffered("slack", inChina, channelLoaded, channel) && <option value="slack">Slack</option>}
           <option value="discord">Discord</option>
         </select>
+        {inChina && (
+          <p style={{ fontSize: 12, margin: "6px 0 0", opacity: 0.75 }}>Discord is the supported chat in this region.</p>
+        )}
       </div>
       {channel === "telegram" && (
         <>

@@ -16,7 +16,7 @@ import (
 func TestUserAgentsMD_InjectIdempotentAndAbsolutePaths(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "AGENTS.md")
 
-	if !ensureUserAgentsMDBlockAt(path) {
+	if !ensureUserAgentsMDBlockAt(path, false) {
 		t.Fatal("first call: expected modified=true (block written)")
 	}
 	got := readFile(t, path)
@@ -33,7 +33,7 @@ func TestUserAgentsMD_InjectIdempotentAndAbsolutePaths(t *testing.T) {
 		t.Error("no relative `skills/…` path may appear — coding sessions run in another cwd")
 	}
 
-	if ensureUserAgentsMDBlockAt(path) {
+	if ensureUserAgentsMDBlockAt(path, false) {
 		t.Error("second call: expected modified=false (block already current)")
 	}
 }
@@ -48,7 +48,7 @@ func TestUserAgentsMD_PreservesOwnerContentAndReplacesStale(t *testing.T) {
 		t.Fatalf("seed file: %v", err)
 	}
 
-	if !ensureUserAgentsMDBlockAt(path) {
+	if !ensureUserAgentsMDBlockAt(path, false) {
 		t.Fatal("expected modified=true (stale block replaced)")
 	}
 	got := readFile(t, path)

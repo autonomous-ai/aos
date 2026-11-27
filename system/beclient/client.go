@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -214,6 +215,41 @@ type PingResponse struct {
 	Status   string      `json:"status"`
 	DeviceID string      `json:"device_id,omitempty"`
 	MQTT     *MQTTConfig `json:"mqtt,omitempty"`
+	// Region is the market region from the status reply (e.g. "CN"), upper-cased
+	// and read leniently: absent, null, a number or anything that is not 1-8
+	// letters reads as "" (no region), and the rest of the reply is still used.
+	Region string `json:"-"`
+}
+
+// regionPattern is the shape of a region code: 1-8 ASCII letters.
+var regionPattern = regexp.MustCompile(`^[A-Za-z]{1,8}$`)
+
+// NormalizeRegion upper-cases a region code, or returns "" for anything that is
+// not 1-8 ASCII letters.
+func NormalizeRegion(code string) string {
+	if !regionPattern.MatchString(code) {
+		return ""
+	}
+	return strings.ToUpper(code)
+}
+
+// UnmarshalJSON reads the reply, taking region leniently (see Region): a region
+// of the wrong type or shape must never lose the rest of the reply.
+func (r *PingResponse) UnmarshalJSON(data []byte) error {
+	type plain PingResponse
+	aux := struct {
+		*plain
+		Region json.RawMessage `json:"region"`
+	}{plain: (*plain)(r)}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	var code string
+	if err := json.Unmarshal(aux.Region, &code); err != nil {
+		code = ""
+	}
+	r.Region = NormalizeRegion(code)
+	return nil
 }
 
 // HasMQTT returns true if the response contains MQTT configuration.

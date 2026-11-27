@@ -13,6 +13,7 @@ import (
 
 	"go.autonomous.ai/os/system/device"
 	"go.autonomous.ai/os/system/domain"
+	"go.autonomous.ai/os/system/lib/regiontext"
 )
 
 // knowledgeFS holds the KNOWLEDGE.md skeleton, embedded so a fresh picoclaw-only
@@ -156,6 +157,7 @@ func (s *PicoclawService) EnsureOnboarding() error {
 
 // ensureAgentsMDBlock injects/refreshes the OS-managed block in workspace/AGENTS.md.
 func (s *PicoclawService) ensureAgentsMDBlock() (bool, error) {
+	block := regiontext.ForRegion(agentsMDBlock, s.config.InChina())
 	agentsFile := filepath.Join(picoclawWorkspaceDir, "AGENTS.md")
 
 	if _, err := os.Stat(agentsFile); os.IsNotExist(err) {
@@ -171,7 +173,7 @@ func (s *PicoclawService) ensureAgentsMDBlock() (bool, error) {
 	text := string(content)
 
 	// Already has the exact current block → nothing to do.
-	if strings.Contains(text, agentsMDBlock) {
+	if strings.Contains(text, block) {
 		return false, nil
 	}
 
@@ -186,12 +188,12 @@ func (s *PicoclawService) ensureAgentsMDBlock() (bool, error) {
 	for _, line := range lines {
 		result = append(result, line)
 		if !injected && strings.Contains(strings.ToLower(line), "your workspace") {
-			result = append(result, agentsMDBlock)
+			result = append(result, block)
 			injected = true
 		}
 	}
 	if !injected {
-		result = append([]string{agentsMDBlock, ""}, result...)
+		result = append([]string{block, ""}, result...)
 	}
 
 	if err := os.WriteFile(agentsFile, []byte(strings.Join(result, "\n")), 0644); err != nil {

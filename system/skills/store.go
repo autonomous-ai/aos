@@ -17,6 +17,8 @@ const (
 
 	// storeLocation fills the `location` header every /api/v1 route requires.
 	storeLocation = "en-US"
+	// storeLocationChina is the catalog language for devices in mainland China.
+	storeLocationChina = "zh-CN"
 
 	// StoreDownloadTimeout bounds an archive download.
 	StoreDownloadTimeout = 30 * time.Second
@@ -24,6 +26,18 @@ const (
 	// StoreMaxBytes caps any single response read off the catalog.
 	StoreMaxBytes = 16 << 20
 )
+
+// StoreInChina, when set at startup, tells the catalog client whether the
+// device is in mainland China. Unset or false keeps the en-US catalog.
+var StoreInChina func() bool
+
+// storeLocationHeader picks the catalog language for this device.
+func storeLocationHeader() string {
+	if StoreInChina != nil && StoreInChina() {
+		return storeLocationChina
+	}
+	return storeLocation
+}
 
 // StoreBaseURL returns the configured catalog host without a trailing slash.
 func StoreBaseURL() string {
@@ -44,7 +58,7 @@ func StoreGet(path string, query url.Values, timeout time.Duration, maxBytes int
 	if err != nil {
 		return nil, fmt.Errorf("build request: %w", err)
 	}
-	req.Header.Set("location", storeLocation)
+	req.Header.Set("location", storeLocationHeader())
 
 	client := &http.Client{Timeout: timeout}
 	resp, err := client.Do(req)

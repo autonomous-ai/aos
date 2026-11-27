@@ -27,7 +27,7 @@ func (s *Server) runConfigChangeListener(ctx context.Context) {
 			return
 		case <-ch:
 			hal.SetAPIKey(s.config.LLMAPIKey)
-			intent.SetChitchatEnabled(!s.config.RealtimeEnabled())
+			intent.SetChitchatEnabled(!s.config.RealtimeEffective())
 			s.handleSetUpCompleteChange(s.config.SetUpCompleted)
 			s.handleDeviceIDChange(s.config.DeviceID)
 			s.handleMQTTConfigChange()
